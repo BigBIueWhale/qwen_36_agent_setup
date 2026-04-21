@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code local workspace state — never publish
+.claude/
+
+# Local model and runtime artifacts (keep out of the repo — users point vLLM
+# at their own local cache; we do not redistribute model weights)
+weights/
+*.safetensors
+*.gguf
+
+# Docker / Compose overrides with local paths or secrets
+docker-compose.override.yml
+.env.local
+
+# Logs and temporary measurement artifacts
+logs/
+*.log
+vram_log.txt
+prompt*.txt
+
+# Node (in case a JS client helper is added alongside)
+node_modules/
