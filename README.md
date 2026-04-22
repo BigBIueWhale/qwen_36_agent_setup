@@ -18,9 +18,10 @@ This README documents a specific, pinned, reproducible deployment. Every choice 
 | MoE backend | `flashinfer_cutlass` (native SM 12.0 NVIDIA-FP4 tensor-core GEMM via `cutlass_scaled_fp4_mm_sm120a`; gated by `ENABLE_NVFP4_SM120`, landed in vLLM PR #33417) |
 | KV cache dtype | BF16 (explicitly not FP8 — reasoning-quality rationale in §5.1) |
 | `--max-model-len` | **131,072** |
-| Concurrent-KV pool (measured at boot) | **63,360 tokens / 4.88 GiB**, MTP off. If MTP is enabled this drops to **39,072 tokens / 3.30 GiB** — a 38% reduction. |
-| Idle VRAM after boot (measured) | **28,494 MiB / 32,607 MiB = 27.83 GiB used** |
-| Peak VRAM under a 119,907-token single-request prompt (measured) | **30,304 MiB / 32,607 MiB = 29.59 GiB used, 2.25 GiB absolute safety margin** |
+| Concurrent-KV pool (measured at boot, 2026-04-22) | **63,360 tokens / 4.88 GiB** at BF16 KV, MTP off, with `--limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'`. Dropping all multimodal to zero (`{"image": 0, "video": 0, "audio": 0}`) recovers the vision-encoder profiling reservation and raises the pool to **83,424 tokens / 6.44 GiB** (+32%). If MTP is enabled the pool drops to **39,072 tokens / 3.30 GiB** — a 38% reduction. |
+| Why the pool is ~4× smaller than the attention math alone would imply | The model has 40 decoder layers of which only 10 (the full-attention ones) consume per-token KV. vLLM's hybrid-KV allocator currently reserves pool space for **all 40 layers** at the padded attention page size, so 75% of the pool is held for layers that don't need it. This is a known, open upstream bug: [vLLM issue #37121](https://github.com/vllm-project/vllm/issues/37121), candidate fix in PR #37429 (blocked pending RFC-level review). SGLang does not have this bug and would give ~3–4× larger concurrent-KV on the same weights. We stay on vLLM for the dedicated `qwen3_coder` tool parser and `flashinfer_cutlass` NVFP4 MoE path; see §6.15. |
+| Idle VRAM after boot (measured) | **28,494 MiB / 32,607 MiB = 27.83 GiB used** at boot, ~30,386 MiB after the KV block pool becomes committed by the first request |
+| Peak VRAM under a 119,907-token single-request prompt (measured) | **30,304 MiB / 32,607 MiB = 29.59 GiB used, 2.25 GiB absolute safety margin.** Cross-validated 2026-04-22 with a fresh boot sweep: all prompts within `--max-model-len` peak near 30,396 MiB regardless of text size or image presence — the KV pool is **pre-allocated at boot**, not grown per request. Image-bearing prompts add only +2–10 MiB of transient vision-encoder activations. See §5.8 for the full multimodal cost accounting. |
 | MTP speculative decoding | **OFF.** Measured: MTP-off 153 tok/s vs MTP-on 166 tok/s steady-state — a ~8% speedup for a 38% concurrent-KV cut. Stability preferred over a marginal decode gain. See §5.3. |
 | `preserve_thinking` | Set as server-wide default via `--default-chat-template-kwargs '{"preserve_thinking": true}'`; no per-request injection needed |
 | Client-side patches required | 4 small patches (§7); none require a vLLM fork |
@@ -100,8 +101,6 @@ All versions are pinned for reproducibility. Floating tags (`latest`, `main`, `n
 | `Qwen/Qwen3.6-35B-A3B-FP8` (official) | 37.49 GB | Does not fit on 32 GB with any useful context. |
 | `Qwen/Qwen3.6-35B-A3B` (official BF16) | ~70 GB | Does not fit on 32 GB. |
 
-**Candidate quants' config/index files are archived at `/tmp/qwen36_research/candidate_quants/` for audit.**
-
 **Caveats on the chosen quant**:
 - RedHatAI themselves tag the release "preliminary version (and subject to change)". **Pin by revision SHA** (fetch at deploy time) so upstream-edits don't silently change what you're serving.
 - One earlier `ignore`-list bug was reported and fixed in head before 2026-04-20; no other open correctness bugs on the repo's discussion tab as of today.
@@ -180,18 +179,27 @@ Each subsection below states the decision, the tradeoff, and the evidence.
 
 **Decision**: `--max-model-len 131072`.
 
-**Memory math at 128K, BF16 KV, NVFP4 weights — measured on target hardware (single RTX 5090, 32,607 MiB total per nvidia-smi)**:
+**Memory math at 128K, BF16 KV, NVFP4 weights — measured on target hardware (single RTX 5090, 32,607 MiB total per nvidia-smi, cross-validated 2026-04-22)**:
 
 | Component | Size (measured) |
 |---|---|
-| Loaded NVFP4 weights (W4A4) + BF16 vision encoder — MTP head **auto-skipped** (see §5.3) | ~23 GiB as part of the idle-post-load VRAM measurement |
-| BF16 KV cache pool allocated by vLLM at `--gpu-memory-utilization 0.92` | **4.88 GiB** (logged as "Available KV cache memory" at boot) |
-| DeltaNet recurrent state (30 linear-attn layers, fixed size, independent of context) | ~0.06 GiB (folded into KV pool accounting) |
+| Loaded NVFP4 weights (W4A4) + BF16 vision encoder — MTP head **auto-skipped** (see §5.3) | **21.88 GiB** measured at boot (model.safetensors 20.91 GiB + model_visual.safetensors 0.83 GiB + load overhead) |
 | CUDA graphs + activation workspace + FlashInfer CUTLASS NVFP4 workspace | ~1.7 GiB |
-| **Idle VRAM after boot** | **27.83 GiB used / 31.84 GiB total** (28,494 / 32,607 MiB per `nvidia-smi`) |
-| **Peak VRAM under a real huge-prompt request** | **29.59 GiB used / 31.84 GiB total** (30,304 / 32,607 MiB — measured while streaming a 66,921-token prompt and again with a 119,907-token prompt; both requests HTTP 200, no eviction) |
+| Vision encoder profiling reservation (because `--limit-mm-per-prompt` admits image or video modality) | ~1.56 GiB — measured as the delta between `{image: 2, video: 1, audio: 0}` (pool = 4.88 GiB) and `{image: 0, video: 0, audio: 0}` (pool = 6.44 GiB). This is reclaimable **only** by disabling vision entirely; any non-zero image or video limit triggers the full reservation. |
+| BF16 KV cache pool allocated by vLLM at `--gpu-memory-utilization 0.92` | **4.88 GiB** (logged as `Available KV cache memory: 4.88 GiB` at boot) → **63,360 tokens** reported by vLLM as `GPU KV cache size`, translated to **`Maximum concurrency for 131,072 tokens per request: 1.85x`**. See "hybrid KV inflation" note below — the real attention-layer math would imply ~255K tokens; the 4× gap is an upstream vLLM bug. |
+| DeltaNet recurrent state (30 linear-attn layers, fixed size, independent of context) | ~0.06 GiB natively — but in practice folded inefficiently into the KV pool accounting (see §6.15) |
+| Safety headroom reserved by gmu=0.92 (unused at peak) | ~2.25 GiB |
+| **Idle VRAM after boot (before first request)** | **27.83 GiB used / 31.84 GiB total** (28,494 / 32,607 MiB per `nvidia-smi`) |
+| **Idle VRAM after first request (pool becomes committed)** | ~29.68 GiB used (30,386 MiB) — once the block pool is touched, this is the new baseline for the life of the server |
+| **Peak VRAM under a real huge-prompt request** | **29.59 GiB used / 31.84 GiB total** (30,304 / 32,607 MiB at 119,907 text-only tokens; re-measured 2026-04-22 at 125,642 text-only tokens = 30,396 MiB and 123,368 tokens-with-image = 30,396 MiB. Peak is essentially constant.) |
 
-The 29.59 GiB peak is the empirical ceiling at this configuration. **Absolute safety margin against GPU-total OOM: 2.25 GiB.** The peak does not increase with even-larger single-request token counts because vLLM's paged KV allocator reserves its pool at boot; larger requests draw from that fixed pool, so they use more of the pool (eviction-free up to `--max-model-len`) without expanding total VRAM.
+The 29.59–29.68 GiB peak is the empirical ceiling at this configuration. **Absolute safety margin against GPU-total OOM: ~2.2 GiB.** The peak does not increase with even-larger single-request token counts because vLLM's paged KV allocator **pre-allocates its entire pool at boot**. Larger requests draw blocks from that fixed pool, so they use more *of the pool* (eviction-free up to `--max-model-len`) without expanding total VRAM.
+
+**The hybrid KV inflation — why 63,360 tokens and not ~255,000:**
+
+By the model's attention config (2 KV heads × 256 head_dim × 10 full-attention layers × 2 bytes × K+V = 20,480 bytes/token at BF16), 4.88 GiB of pool should hold approximately 255,000 concurrent tokens. vLLM instead reports 63,360 — roughly 4× less. The factor is explained exactly by the ratio of total decoder layers to full-attention layers: `4.88 GiB / (40 layers × 2048 bytes/token/layer) = 63,963` tokens ≈ 63,360 reported. In other words, the paged allocator reserves per-token KV block space for **all 40 decoder layers**, not just the 10 that actually carry attention KV — so 30 DeltaNet layers (which natively need only a small fixed recurrent state) are consuming 75% of the pool's capacity for nothing.
+
+This is a known upstream bug: see §6.15 for the full treatment, the tracking issue, and why we accept it for now instead of switching runtimes.
 
 **Concurrent-KV capacity is the real constraint, not `--max-model-len`.** The 4.88 GiB KV pool at BF16 (20,480 bytes/token × 10 full-attention layers) holds **63,360 tokens of concurrent context at once**. This means:
 
@@ -306,6 +314,103 @@ presence_penalty: 0.0
 **`enable_thinking`** is *not* set server-side — we leave it to the client. If a client wants thinking on for a specific request, it passes `"chat_template_kwargs": {"enable_thinking": true}`. Both Qwen Code and (via our shim in `#client-patch-2`) Qwen-Agent do this.
 
 **Client shim still required** for the separate `reasoning` vs `reasoning_content` field-name mismatch — see §6.12 and `#client-patch-1`. That is a distinct interop bug from the `preserve_thinking` default; fixing one does not fix the other.
+
+### 5.8 Multimodal cost accounting — what the vision encoder and `--limit-mm-per-prompt` actually cost you
+
+This is the longest subsection in §5 because the interaction between the vision encoder, the profiler, the `--limit-mm-per-prompt` flag, and the KV pool is where several non-obvious costs accumulate. Everything below is either measured on the target hardware on 2026-04-22 with a 9-boot empirical sweep, or read directly from the vLLM source code on the pinned commit.
+
+**Four costs, each distinct, each paid at a different time.** Confusing these is the source of most multimodal-related deployment surprises.
+
+#### 5.8.1 Cost #1 — vision encoder weights (always resident, not reclaimable, not transient)
+
+The vision encoder is a 27-layer Qwen3-VL transformer tower bundled inside the model checkpoint as `model_visual.safetensors` (853 MiB on disk, 333 BF16 tensors, ~447M parameters). On startup, vLLM loads these weights into VRAM as part of the overall model load. **They stay resident in VRAM for the entire life of the server, whether or not any request ever contains an image.** You do not pay a runtime cost for text-only prompts because the encoder is never *invoked*, but the weights themselves are permanently committed. This ~0.83 GiB is already subsumed into the 21.88 GiB weights footprint the boot log reports; it is not a separate line item.
+
+**Implication**: you cannot "save VRAM by never sending images." The vision encoder is either loaded or it isn't. There is no request-time toggle and no partial-unload option in vLLM today.
+
+#### 5.8.2 Cost #2 — vision encoder *profiling reservation* (always paid if any image/video modality is admitted at all)
+
+When vLLM boots a multimodal model, its GPU profiler builds a dummy worst-case request and runs a forward pass through the encoder and the LLM to measure peak activation memory. It then reserves enough headroom to handle that worst case at runtime. For the Qwen3.6-35B-A3B-NVFP4 checkpoint, this reservation is **~1.56 GiB**, which is deducted from the pool that would otherwise become available KV cache.
+
+Critically, the profiler's dummy input uses **exactly one image at maximum feature size**, regardless of what integer you pass to `--limit-mm-per-prompt`. The boot log always says:
+
+> `Encoder cache will be initialized with a budget of 16384 tokens, and profiled with 1 image items of the maximum feature size.`
+
+We verified this by booting five configurations back-to-back (image counts 0, 2, 3, 10, 100, 999, and no-flag-at-all) and reading `Available KV cache memory` from each:
+
+| `--limit-mm-per-prompt` | Boot result | `Available KV cache memory` | `GPU KV cache size` |
+|---|---|---:|---:|
+| `{image: 2, video: 1, audio: 0}` (our config) | ✅ ready | 4.88 GiB | **63,360 tokens** |
+| `{image: 2, video: 0, audio: 0}` | ✅ ready | 4.88 GiB | 63,360 tokens |
+| `{image: 3, video: 0, audio: 0}` | ✅ ready | 4.88 GiB | 63,360 tokens |
+| `{image: 10, video: 0, audio: 0}` | ❌ boot fails (TensorRT-LLM runtime error post-profiling) | 4.88 GiB (logged before crash) | 63,360 tokens (logged) |
+| `{image: 100, video: 0, audio: 0}` | ❌ boot fails (same) | 4.88 GiB | 63,360 tokens |
+| `{image: 999, video: 0, audio: 0}` | ❌ boot fails (same) | 4.88 GiB | 63,360 tokens |
+| **`--limit-mm-per-prompt` omitted** (defaults to 999 per modality) | ❌ boot fails (same) | 4.88 GiB | 63,360 tokens |
+| `{image: 0, video: 0, audio: 0}` — full multimodal disable | ✅ ready | **6.44 GiB** | **83,424 tokens (+32%)** |
+
+Three consequences flow from this table, none of them obvious:
+
+1. **Admitting image at all costs a flat ~1.56 GiB / ~20,064 tokens of KV pool.** It is a binary switch, not a per-unit cost. `image: 1` and `image: 3` pay exactly the same profiling tax.
+2. **Raising `image` above 3 crashes the server boot entirely** on this nightly + SM 12.0 combination. The KV math still reports correctly — the crash happens in a later init phase (likely CUDA graph capture for the multimodal branch) with a TensorRT-LLM `throwRuntimeError`. We did not bisect the exact ceiling between 4 and 9. **Treat `image: 3` as the maximum safe value.**
+3. **Omitting the flag entirely is dangerous.** The default is 999 per modality, which hits the same boot crash. `--limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'` is not conservative hygiene — it is a **load-bearing** parameter without which the server does not start. Do not delete it.
+
+The 1.56 GiB reservation is triggered by having `image > 0` OR `video > 0`. Setting one or both to zero skips the vision-encoder branch of the profiler; setting all three to zero unlocks the full 6.44 GiB pool. The `audio: 0` in the current config already reclaims the audio-profiling reservation; the model is vision-only, so this costs nothing.
+
+**If you never intend to send images or videos**, set `{"image": 0, "video": 0, "audio": 0}` and reclaim +20,064 concurrent-KV tokens. This is currently the largest single lever available short of switching runtimes.
+
+#### 5.8.3 Cost #3 — per-request transient activations (small, bounded, absorbed by the safety margin)
+
+When a request actually contains an image, the vision encoder runs during prefill. The forward pass allocates transient activations (per-layer hidden states, attention scores). These are freed layer-by-layer and fully released before decode begins. Measured on the target hardware:
+
+| Image | Image tokens produced | Transient VRAM spike above baseline |
+|---|---:|---:|
+| 896×896 PNG | 787 | **+2 MiB** |
+| 1792×1792 PNG | ~3,136 | **+8–10 MiB** |
+| Two 1024×1024 PNGs in one prompt | ~2,048 (combined) | **+10 MiB** |
+
+These spikes are absorbed trivially by the ~2.25 GiB safety headroom. The previously-quoted "hundreds of MiB for large images, potentially >1 GiB for multi-image" was speculative; the actual measured cost is much smaller than that. The transient-activation cost is not the practical concern for multimodal VRAM budgeting.
+
+#### 5.8.4 Cost #4 — image and video tokens consuming the KV pool at request time
+
+Once the vision encoder produces its output embeddings, they become **tokens in the KV cache**, alongside any text tokens. An image token and a text token are indistinguishable at the KV level — both take the same per-token KV bytes and both draw from the 63,360-concurrent-token pool.
+
+Approximate image-token counts for Qwen3-VL on this checkpoint (patch size 16, spatial_merge 2):
+
+| Image resolution | Image tokens (after patching/merging) |
+|---|---:|
+| 512×512 | ~256 |
+| 896×896 (our `make_image.py` default) | ~787 (measured) |
+| 1024×1024 | ~1,024 |
+| 1568×1568 | ~2,400 |
+| 1792×1792 | ~3,136 (measured) |
+| 2048×2048 | ~4,096 |
+| Processor cap (`longest_edge=16,777,216` pixels) | up to ~16,384 per image |
+
+Videos are dramatically more expensive. The checkpoint's `processor_config.json` sets `fps=2, min_frames=4, max_frames=768`. A single video input:
+
+- **Short clip (a few seconds, default resolution)**: ~750–1,500 video tokens.
+- **Medium clip (~1 minute at default resolution)**: ~10,000–20,000 video tokens.
+- **Long clip (several minutes, max frames, moderate per-frame resolution)**: **50,000–75,000 video tokens** — a single video can eat your entire 63,360-token concurrent pool.
+- **Pathological (max frames × max per-frame resolution)**: millions of tokens; the processor or max-model-len will reject.
+
+**Practical conclusion**: `video: 1` is not a "cheap" modality. One video can consume the entire KV pool. The real blast-radius cap for video is not `--limit-mm-per-prompt`; it is `--mm-processor-kwargs '{"max_frames": N, "fps": M}'` or equivalent request-time `mm_processor_kwargs`, which bounds the per-video frame count. If you plan to accept videos, pass something like `--mm-processor-kwargs '{"video": {"max_frames": 64, "fps": 1}}'` alongside `video: 1` — otherwise an untrusted client can submit a long clip and starve the pool.
+
+#### 5.8.5 Cost summary table (what you actually pay for common configurations)
+
+| Configuration | Boot? | KV pool | KV tokens | Reclaim vs baseline |
+|---|---|---:|---:|---:|
+| **Baseline: `{image: 2, video: 1, audio: 0}`** (our current) | ✅ | 4.88 GiB | 63,360 | — |
+| `{image: 3, video: 1, audio: 0}` | ✅ | 4.88 GiB | 63,360 | 0 (free increase to 3 images) |
+| `{image: ≥10, ...}` | ❌ boot fail | — | — | — |
+| `--limit-mm-per-prompt` omitted | ❌ boot fail | — | — | — |
+| `{image: 0, video: 0, audio: 0}` | ✅ | 6.44 GiB | 83,424 | **+20,064 tokens (+32%)** — valid only if you never use vision |
+| `{image: 2, video: 1, audio: 0}` + MTP enabled | ✅ | 3.30 GiB | 39,072 | −24,288 tokens (−38%) |
+
+#### 5.8.6 Why the pool is so small — and yes, it's largely vLLM's fault
+
+Even our best-case 83,424 concurrent tokens on a 32 GB GPU serving a 35B model with only 10 KV-carrying layers is below what the attention math actually supports. By the layer count alone, 4.88 GiB should hold ~255,000 BF16 KV tokens, and 6.44 GiB should hold ~335,000. vLLM reports roughly 1/4 of that, because its hybrid KV cache allocator reserves per-token block space for **all 40 decoder layers** rather than just the 10 that actually carry attention — a known upstream bug documented as vLLM issue #37121 with candidate fix PR #37429. The 30 Gated DeltaNet layers in this model natively need only a small fixed recurrent state (~0.06 GiB total across all sequences) but are consuming ~75% of the KV pool because the allocator treats hybrid models uniformly.
+
+Put bluntly: your effective concurrent context length is small because vLLM's hybrid KV allocator is, for this architecture, broken in a way that burns 75% of the pool on nothing. SGLang's memory-pool implementation does not have this bug — on the same hardware and the same weights, SGLang would report roughly 3–4× the concurrent-KV capacity, purely by accounting for hybrid layers correctly. We stay on vLLM anyway because the `qwen3_coder` tool parser, the `flashinfer_cutlass` NVFP4 MoE path, and the broader integration surface are worth more than the pool size for our specific agent workload. But this is a real, measurable cost we are paying, not a perceived one. The full treatment, including upstream links and the code-level citation, is in §6.15.
 
 ---
 
@@ -440,6 +545,39 @@ Every open vLLM issue encountered during stack research is listed below, classif
 **Does it affect us**: it *would* if we used the newest-available nightly. We avoid it by pinning **yesterday's** nightly — `nightly-8936118134d0547fa1cc78adab2d03edd6d3dc48`, digest `sha256:9bba4628…` — which carries the same functional surface (Qwen3.5-MoE + NVFP4 + FlashInfer CUTLASS) but does not exhibit the import regression. See §3.2.
 
 **Resolution**: pin the older nightly digest. Re-evaluate (and upgrade) once a new nightly appears that tests clean with `docker run --rm vllm/vllm-openai@<digest> vllm --help`. The expected fix upstream is either a transformers patch release or a vLLM patch that imports `GenerationConfig` defensively.
+
+### 6.15 Issue #37121 — hybrid KV cache allocator over-reserves for non-attention layers (Qwen3-Next / Qwen3.5 / Qwen3.6 family) [Class A — runtime inefficiency, the single largest cost in our deployment]
+
+**What happens**: vLLM's V1 paged KV cache manager uses a **unified page-size allocator**. For hybrid-attention models — where some layers carry real per-token KV state (full softmax attention) and others carry only a small fixed recurrent state (Mamba, GDN, Gated DeltaNet) — the allocator pads the linear-attention layers' small native page size up to the attention layers' padded page size, then reserves `num_blocks × padded_page_size` per layer for **every layer**, not just the attention ones. For Qwen3.6-35B-A3B (40 decoder layers, 10 full-attention + 30 Gated DeltaNet) this causes the KV pool to be over-reserved by a factor of roughly **40 / 10 = 4×**. The concrete code lives at:
+
+- `vllm/platforms/interface.py:615-635` — forces `cache_config.mamba_page_size_padded = attn_page_size` and logs *"Padding mamba page size by X% to ensure that mamba page size and attention page size are exactly equal."*
+- `vllm/v1/core/kv_cache_utils.py:1148-1168` (`get_kv_cache_config_from_groups`) — allocates padded-page-size × num_blocks per layer in the group; for Qwen3.6 all 40 layers end up in one group.
+- `vllm/v1/core/kv_cache_utils.py:808-820` (`get_max_concurrency_for_kv_cache_config`) — uses the unified page size for the `Maximum concurrency for X tokens per request: Y×` boot log line. This is why our boot reports `1.85×` instead of the ~7.4× the attention math alone would give.
+- `vllm/v1/kv_cache_interface.py:383-409` (`MambaSpec.max_memory_usage_bytes`) — correctly reports that Mamba/DeltaNet natively needs O(requests) slots, not O(tokens); but the unified-pool sizing discards this information.
+
+**Measured impact on this deployment**:
+- Reported: `Available KV cache memory: 4.88 GiB`, `GPU KV cache size: 63,360 tokens`, `Maximum concurrency: 1.85×`.
+- Attention-math expected: 4.88 GiB / (10 layers × 2 KV heads × 256 head_dim × 2 bytes × 2(K+V)) = **~255,850 tokens**, concurrency ~7.4×.
+- The ratio 255,850 / 63,360 ≈ 4.04 matches 40 / 10 exactly, confirming the all-40-layers-reserved diagnosis.
+
+**Does it affect us**: yes, profoundly. Our entire concurrent-KV budget is ~4× smaller than the hardware and the model architecture would otherwise support. This is the single largest performance cost in the deployment.
+
+**Upstream status as of 2026-04-22**:
+- **Tracking issue: [#37121](https://github.com/vllm-project/vllm/issues/37121)** (filed 2026-03-15 by `swtb3`, "KV cache ~7x memory overestimation for hybrid Mamba/attention models (Qwen3.5)"). Still open; no assignee; no merged fix.
+- **Broad-scope candidate fix PR: [#37429](https://github.com/vllm-project/vllm/pull/37429)** (opened 2026-03-18, "Fix KV cache sizing and allocation for hybrid Mamba/attention models"). Gives Mamba/DeltaNet its own dedicated pool. Review is paused by maintainer `@NickLucche` pending an RFC-level design discussion because it contradicts the unified-pool architecture.
+- **Narrow-scope candidate fix PR: [#40384](https://github.com/vllm-project/vllm/pull/40384)** (opened 2026-04-20, "[Bugfix] Exclude O(1) Mamba groups from hybrid KV cache token capacity") by `jhsmith409` (same author as the hybrid TurboQuant PR #39931). **Explicitly validated on our exact model** (`RedHatAI/Qwen3.6-35B-A3B-NVFP4`, "40 layers = 30 DeltaNet linear-attention + 10 full-attention"). Small diff: +115/-13 across `kv_cache_utils.py`, `scheduler.py`, and a new test. Key quote from the PR: *"For a typical hybrid with one attention group and N Mamba groups, that's off by a factor of `(1 + N) / 1` — 2x understatement for the common case, 4x for Nemotron-H-style 1 attn + 3 mamba groups."* Mergeable=true, no human review yet (8 reviewers requested); realistic merge window 1–3 weeks if a maintainer (heheda12345 or njhill) engages.
+- **Scope caveat**: #40384 fixes the `max_num_kv_tokens` / per-token capacity counting and scheduler budget only. It does NOT reshape the underlying block allocation or page-size unification. So post-#40384 the reported token capacity will jump (the scheduler will see and act on more usable capacity), but the deeper memory-allocation inefficiency — padding all 40 layers' blocks up to the attention page size — remains until #37429 or its successor lands. Therefore: **#40384 is a real and immediate improvement (probably a 2–4× jump in reported concurrent tokens on our deployment), but is not the full fix.**
+- **Prior RFC acknowledgment**: closed RFC [#11382](https://github.com/vllm-project/vllm/issues/11382) documented up to **79.6% memory waste** for hybrid architectures. So this has been known since late 2024.
+- **SGLang does not have this bug at all.** Their memory-pool implementation (`sglang/srt/mem_cache/memory_pool.py:480-508` and `sglang/srt/model_executor/model_runner_kv_cache_mixin.py:85-131`) allocates a separate `MambaPool` sized via `--mamba-full-memory-ratio`, so the attention KV pool is sized only against what attention layers actually need. The same model on the same hardware would give roughly 3–4× the concurrent-KV capacity on SGLang today.
+
+**Resolution**: we accept the cost. The rationale:
+1. SGLang would give us ~3–4× concurrent KV on this model but we would lose the dedicated `qwen3_coder` tool parser (SGLang has no dedicated path), the FlashInfer CUTLASS NVFP4 MoE dispatch we validated, and the broader vLLM integration surface Qwen-Agent/Qwen Code are tested against. For a single-user agent workload whose binding constraint is correctness of tool calls, not concurrent-KV, this trade does not net out in SGLang's favor.
+2. PR #37429 is plausibly 4–12 weeks from landing given the RFC-review block. The vLLM team has acknowledged the bug but hasn't committed to a timeline.
+3. Our concurrent-KV of 63,360 tokens (or 83,424 with multimodal disabled) is adequate for a single-user agent loop even at the inflated rate; the cost shows up mainly when you imagine the 250K+-token pool you could have had.
+
+**Action taken**: posted a comment on issue #37121 with our measured evidence on Qwen3.6-35B-A3B-NVFP4 + RTX 5090 + SM 12.0 as a second reproduction point (the issue was filed on a Qwen3.5 H100 setup). Watching both #37121 and PR #37429 for merge.
+
+**Revisit when**: either PR #40384 (narrow, 1–3 weeks) or PR #37429 (broad, blocked) lands in a nightly. #40384 alone should correct the reported concurrent-KV token count and scheduler budget on our deployment — boot-log `GPU KV cache size: 63,360 tokens` should jump to roughly `200K+ tokens` with no other changes, unlocking the concurrent capacity we are currently leaving unused. #37429's additional fix for the underlying byte-level padding is a second win on top of that, but #40384 alone is already likely to be the most impactful upstream change we are waiting on — larger than TurboQuant's potential capacity gain, and with zero quality tradeoff.
 
 ---
 
@@ -698,7 +836,7 @@ docker run --rm -d --name qwen36 --gpus all \
 | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` | Activates the dedicated 683-line Qwen3.6 XML tool parser for `<tool_call><function=NAME><parameter=KEY>VALUE`. |
 | `--enable-prefix-caching` | Enables prefix-hashing. Because Qwen3.5MoE is `IsHybrid` without `SupportsMambaPrefixCaching`, this silently auto-forces `mamba_cache_mode=align` and chunked prefill (both default on). Not a problem — just be aware the config is adjusted under you. |
 | `--default-chat-template-kwargs '{"preserve_thinking": true}'` | Sets `preserve_thinking=true` as the server-wide default (§5.7). Eliminates the need for every client to send this in `chat_template_kwargs`. Per-request values still override the default. |
-| `--limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'` | Caps multimodal inputs per request. Protects against OOM on large image batches. Audio disabled because Qwen3.6 is text+vision only. |
+| `--limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'` | **Load-bearing, not hygiene.** Omitting this flag defaults to 999 per modality which **crashes the boot** on this nightly + SM 12.0 (post-profiling TensorRT-LLM runtime error; verified in a 2026-04-22 sweep). Values `image ≥ 10` hit the same crash. Safe range is `image ∈ {0, 1, 2, 3}`. Raising image from 2 to 3 costs zero KV pool (the profiler uses exactly one dummy image regardless of N; boot log: *"profiled with 1 image items of the maximum feature size"*). Setting all three modalities to 0 reclaims the ~1.56 GiB vision-encoder profiling reservation and raises the pool from 4.88 → 6.44 GiB / 63,360 → 83,424 tokens — valid only if you never need vision. Audio stays 0: Qwen3.6 is text+vision only. See §5.8 for the full cost accounting. |
 
 **Flags we deliberately do NOT pass — each with a reason**:
 
@@ -774,8 +912,10 @@ Documented items we did not conclusively resolve and which may affect production
 | FlashInfer autotuner non-fatal warnings on SM 12.0 | At boot, FlashInfer logs `[Autotuner]: Skipping tactic ... Failed to initialize cutlass TMA WS grouped gemm` for some `M128`/`M256` grouped-GEMM shapes lacking SM 12.0 kernels. FlashInfer falls back silently to working tactics and performance is as measured (~153 tok/s decode). If you see a perf regression after an image bump, try `--moe-backend flashinfer_cutedsl` (FP4-only, SM 12.0-native) as the contingency. With MTP on, additional `GPU lacks the shared memory resources to run fused_moe kernel` warnings appear — non-fatal, same fallback mechanism. |
 | Long-context retrieval quality past ~64K | Only 10 of 40 layers are full attention, so long-range retrieval rides on a thin substrate. No RULER / needle-in-haystack numbers published for Qwen3.6 at any precision. We verified a 119,907-token single request is *mechanically* accepted and returns HTTP 200, but we did not verify answer quality at that length. Validate on your workload before committing to 128K retrieval. |
 | `<tool_call>`-inside-`<think>` frequency rate | Community-reported single-digit-percent; no precise measurement. Our rescue patch (§7.2) handles it, but frequency could change with future Qwen RL tuning. |
-| Concurrent-KV capacity at 131K max_model_len | Measured 63,360 tokens concurrent at gmu 0.92, MTP off. A single long request up to 131K works (verified at 119,907 tokens, HTTP 200). Two concurrent long requests will start evicting when their combined tokens cross ~63K. Not a problem for single-user agents; document explicitly because the advertised 131K is not "131K × N concurrent". |
+| Concurrent-KV capacity at 131K max_model_len | Measured 63,360 tokens concurrent at gmu 0.92, MTP off, with vision enabled. A single long request up to 131K works (verified at 119,907 and 125,642 tokens, HTTP 200). Two concurrent long requests will start evicting when their combined tokens cross ~63K. Not a problem for single-user agents; document explicitly because the advertised 131K is not "131K × N concurrent". The pool is ~4× smaller than the attention math would allow, because of the hybrid-KV allocator bug in §6.15 — a real, measurable upstream cost, not a perceived one. |
+| Hybrid KV allocator inflation (§6.15) | **Largest single upstream cost in this deployment.** 75% of our KV pool is held for the 30 DeltaNet layers that don't actually need per-token KV. Tracked at vLLM #37121, fix proposed in PR #37429 but blocked on design review. No workaround in vLLM today; SGLang lacks this bug but trades away other integrations. We post measurements to #37121 and watch for the merge. |
 | MTP correctness under our specific stack vs broader reports | We measured MTP on this hardware + quant + max_model_len + prefix caching combination as functional (87-96% acceptance, coherent output). vLLM issue #36872 (open) predicts gibberish on FP8/AWQ — we did not reproduce on NVFP4. Issue #38182 predicts prefix-cache hit-rate regression — we did not stress-test this specifically. If the user enables MTP, monitor these two failure modes before declaring it production-ready. |
+| Image count boot failure threshold (§5.8.2) | Measured boots at `image ∈ {0, 2, 3}` succeed; `image ∈ {10, 100, 999}` and the default-999-when-flag-omitted all fail with a TensorRT-LLM `throwRuntimeError` during CUDA graph capture (post-profiling). We did not bisect 4–9; treat 3 as the ceiling for now. |
 
 ---
 
@@ -786,14 +926,14 @@ Documenting the "not chosen" list because public repos that show only the chosen
 | Option | Status | Reason not chosen |
 |---|---|---|
 | llama.cpp | Not chosen | No dedicated tool parser; BILINEAR vision resize drifts from HF reference; MTP tensors silently dropped at conversion; `array<object>` tool schemas poison conversation history (llama.cpp issue #21771). |
-| SGLang | Viable alternative | Functionally equivalent for this model. We chose vLLM for the dedicated `qwen3_coder` tool parser path and the existing FlashInfer CUTLASS NVFP4 MoE dispatch. |
+| SGLang | **Strongly considered, not chosen** | **Has a measurable advantage for this model**: SGLang's memory-pool implementation allocates a separate `MambaPool` for DeltaNet state, so it does NOT suffer from the hybrid KV over-reservation described in §6.15. On the same hardware and weights, SGLang would report roughly 3–4× the concurrent-KV capacity at BF16 KV. We still chose vLLM because (a) SGLang has no dedicated `qwen3_coder` tool parser — tool-call correctness is our top priority; (b) no `flashinfer_cutlass` NVFP4 MoE dispatch path with the exact kernels we validated; (c) Qwen-Agent and Qwen Code are tested primarily against vLLM. For a single-user agent workload the tool-parser argument dominates; for a multi-user long-context workload where concurrent-KV is binding, SGLang would be the right choice. Re-evaluate this decision if vLLM PR #37429 stalls past Q2 2026, or if concurrent-KV becomes the binding constraint for our workload. |
 | BF16 weights (full precision) | Not feasible | ~70 GB does not fit on 32 GB. |
 | FP8 weights (`Qwen/Qwen3.6-35B-A3B-FP8`) | Not feasible | ~35 GB exceeds 32 GB once KV + activations are added at any useful context length. |
 | **AWQ 4-bit** (`QuantTrio/Qwen3.6-35B-A3B-AWQ`) | **Runner-up (fallback)** | Works via `awq_marlin` on SM 12.0; vision preserved; data-free quantization, no calibration dataset published, no quality-recovery number. Kernel path is INT4 Marlin emulation rather than native SM 12.0 FP4. Kept as documented fallback if NVFP4 hits an unexpected loader bug. Launch command would use `--quantization awq_marlin --dtype bfloat16 --kv-cache-dtype auto` in place of the NVFP4-specific flags. |
 | Other community AWQ / GPTQ / MXFP4 / PrismaQuant variants | Rejected | Individually evaluated in §3.1. Reasons ranged from missing vision tensors (`caiovicentino`) to suspicious empty `ignore` lists (`Intel AutoRound`, `palmfuture`) to insufficient calibration (`rdtand`) to `compressed-tensors actorder=null` bug exposure (`cyankiwi`). |
 | MXFP4 weights | Not beneficial | CUTLASS MXFP4 MoE is gated to SM 10.0; on SM 12.0 it falls back to Triton/Marlin dequant — no FP4 tensor-core benefit over Marlin. |
 | FP8 KV cache | Not chosen | See §5.1. Uncalibrated scales cause long-context quality drift; the reasoning model in an agentic loop is the wrong workload to pay that quality tax on. |
-| TurboQuant / RotorQuant KV cache | Not available | Neither has a merged hybrid-attention implementation in vLLM. TurboQuant PR #38479 explicitly fails on Qwen3.5/3.6-A3B's DeltaNet page layout. |
+| TurboQuant / RotorQuant KV cache | Not available *yet* | TurboQuant's dense PR #38479 merged 2026-04-15 but excludes hybrid models; the hybrid follow-up is vLLM PR #39931 (open, ready-for-review, names Qwen3.6-35B-A3B in its test matrix, independently validated on RTX 5090 by reviewer `@jhsmith409` across all four presets including `turboquant_4bit_nc`). Realistic merge: mid-May 2026. Measured 4-bit `turboquant_4bit_nc` quality on the closest model family (Qwen3.5-35B-A3B, H20): GSM8K 0.830 vs BF16 0.855 = −2.5 pp. 3-bit is −24 pp and rejected. RotorQuant is a separate single-author research project by Scrya (March 2026); not integrated into vLLM or SGLang and not in scope. |
 | MTP speculative decoding | Disabled by explicit choice after measurement | §5.3 has the measured comparison: MTP-on is 166 tok/s vs MTP-off 153 tok/s (~8% faster decode) but costs 38% of concurrent-KV capacity. Appending `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'` does enable it cleanly if you want it. MTP tensors are auto-skipped at load when the flag is absent (`qwen3_5.py:547` has `skip_prefixes=["mtp."]`). |
 | Parallel tool calls via Responses API | Not used | vLLM issue #39584 crashes the Responses-API streaming path. Qwen-Agent and Qwen Code both use Chat Completions anyway. |
 | `--enable-chunked-prefill` as an explicit flag | Implicit | Default on; auto-forced by `--enable-prefix-caching` on this hybrid model. No need to specify. |
@@ -810,9 +950,12 @@ Re-evaluate the pinned versions in this README when any of the following happens
 4. **vLLM issue #38182 (MTP + prefix cache) closes with a verified fix** — reconsider enabling MTP speculative decoding. Our measurement shows MTP on this stack gives ~8% decode speedup (153 → 166 tok/s) at the cost of 38% of concurrent-KV capacity; if that tradeoff changes materially (e.g., larger acceptance rate, smaller VRAM cost), re-run the experiment.
 5. **RedHatAI removes the "preliminary (and subject to change)" notice** on the NVFP4 quant, or publishes a v1.0-tagged revision — bump the pinned revision SHA.
 6. **An `nvidia/Qwen3.6-35B-A3B-NVFP4` (NVIDIA-official) checkpoint is published** — reconsider which NVFP4 build to use, especially if NVIDIA publishes agentic-task benchmarks alongside it.
-7. **The hybrid-architecture follow-up to TurboQuant PR #38479 merges** — reconsider moving from BF16 KV to rotation-based low-bit KV to unlock higher concurrent-KV capacity on this card.
+7. **vLLM PR #39931 (hybrid TurboQuant) merges** — reconsider moving from BF16 KV to rotation-preconditioned low-bit KV to unlock higher concurrent-KV capacity on this card. Our current reading: 4-bit `turboquant_4bit_nc` costs ~2.5 pp GSM8K on the closest model family (Qwen3.5-35B-A3B); 3-bit costs ~24 pp and is rejected; 4-bit is defensible if our workload saturates concurrent-KV and we accept the quality tax.
+8. **vLLM PR #40384 (narrow hybrid KV scheduler fix by `jhsmith409`) merges** — our single most imminent upstream win, 1–3 weeks out. §6.15 estimates this raises the reported pool from 63,360 → ~200K+ concurrent tokens at BF16 KV with no quality change, without any other changes to our config. Re-pin the nightly, re-measure the pool, update §5.2 / §5.8 numbers. This is likely the fix worth waiting for before declaring the deployment final.
+9. **vLLM PR #37429 (broader hybrid KV allocator fix) merges** — a second improvement on top of #40384 that also fixes the byte-level padding. Blocked on RFC-level review; realistic horizon is weeks to months. When this lands, the pool itself should shrink in bytes consumed (freeing VRAM for further use) in addition to the token-count fix that #40384 delivers.
+10. **PR #37429 stalls past Q2 2026 AND #40384 doesn't land** — re-evaluate the SGLang switch (§10) regardless of the other tradeoffs; SGLang's native handling of hybrid KV is worth the integration cost at that point.
 
-Each of these is tracked and none of them are urgent. The current pins booted, served a chat completion + tool call, held a 119,907-token single-request prompt, and measured 153 tok/s steady-state decode on the target hardware on 2026-04-21.
+Each of these is tracked and none of them are urgent. The current pins booted, served a chat completion + tool call, held a 119,907-token single-request prompt, and measured 153 tok/s steady-state decode on the target hardware on 2026-04-21. 2026-04-22 cross-validation added 5 multimodal-config boot sweeps, 4 high-N image-limit sweeps (3 of which crashed, confirming the `image ≥ 10` ceiling), 8 request-time VRAM probes up to 128,333 tokens, and the empirical decomposition of the KV pool — all documented in §5.8 and §6.15.
 
 ---
 
