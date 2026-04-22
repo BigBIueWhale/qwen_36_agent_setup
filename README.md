@@ -574,14 +574,16 @@ Third-party clients (Qwen-Agent reads only `reasoning_content` on ingest; Qwen C
 - **Prior RFC acknowledgment**: closed RFC [#11382](https://github.com/vllm-project/vllm/issues/11382) documented up to **79.6% memory waste** for hybrid architectures. So this has been known since late 2024.
 - **SGLang does not have this bug at all.** Their memory-pool implementation (`sglang/srt/mem_cache/memory_pool.py:480-508` and `sglang/srt/model_executor/model_runner_kv_cache_mixin.py:85-131`) allocates a separate `MambaPool` sized via `--mamba-full-memory-ratio`, so the attention KV pool is sized only against what attention layers actually need. The same model on the same hardware would give roughly 3–4× the concurrent-KV capacity on SGLang today.
 
-**Resolution**: we accept the cost. The rationale:
-1. SGLang would give us ~3–4× concurrent KV on this model but we would lose the dedicated `qwen3_coder` tool parser (SGLang has no dedicated path) and the FlashInfer CUTLASS NVFP4 MoE dispatch we validated. For a single-user agent workload whose binding constraint is correctness of tool calls, not concurrent-KV, this trade does not net out in SGLang's favor. (The four §7 patches are runtime-targeted at vLLM's wire format; switching to SGLang would require re-validating each against the SGLang surface.)
-2. PR #37429 is plausibly 4–12 weeks from landing given the RFC-review block. The vLLM team has acknowledged the bug but hasn't committed to a timeline.
-3. Our concurrent-KV of 63,360 tokens (or 83,424 with multimodal disabled) is adequate for a single-user agent loop even at the inflated rate; the cost shows up mainly when you imagine the 250K+-token pool you could have had.
+**Resolution**: backported in this repo as `monkey_patch_hybrid_kv_allocator.py` (§7.5). The patch mirrors PR #40384's intent — exclude O(1) Mamba/DeltaNet groups from per-token KV-capacity counting in both `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config`. The `GPU KV cache size: 63,360 tokens / Maximum concurrency: 1.85x` boot line should become roughly `~200K+ tokens / ~7x` with no other changes. SGLang remains a documented alternative if vLLM ever stops being viable, but with the patch applied the concurrent-KV gap closes and the trade-off no longer favors switching.
+
+**Caveats this patch does NOT eliminate**:
+1. Scheduler-budget fix only. The pool's actual byte footprint is still over-reserved (75% of bytes go to DeltaNet layers) — that's PR #37429's territory and remains un-addressed in our deployment. The bytes are sitting there unused; the patch credits the scheduler with capacity that already exists physically. No new memory is conjured.
+2. Patch must be removed when either PR #40384 or PR #37429 lands. The patch's source landmarks refuse to apply against a fixed function automatically; PR #37429 specifically would change the underlying pool byte size and the patch's scheduler view would no longer be coherent with what the pool can actually hold.
+3. **Live smoke test required before declaring validated** — the patch's blast radius is the request-admission path. Boot the patched server, confirm the boot log reports the higher `GPU KV cache size` value, then run a workload that admits >63K concurrent tokens and confirm no OOM. The static landmark validation cannot prove this dynamically.
 
 **Action taken**: posted a comment on issue #37121 with our measured evidence on Qwen3.6-35B-A3B-NVFP4 + RTX 5090 + SM 12.0 as a second reproduction point (the issue was filed on a Qwen3.5 H100 setup). Watching both #37121 and PR #37429 for merge.
 
-**Revisit when**: either PR #40384 (narrow, 1–3 weeks) or PR #37429 (broad, blocked) lands in a nightly. #40384 alone should correct the reported concurrent-KV token count and scheduler budget on our deployment — boot-log `GPU KV cache size: 63,360 tokens` should jump to roughly `200K+ tokens` with no other changes, unlocking the concurrent capacity we are currently leaving unused. #37429's additional fix for the underlying byte-level padding is a second win on top of that, but #40384 alone is already likely to be the most impactful upstream change we are waiting on — larger than TurboQuant's potential capacity gain, and with zero quality tradeoff.
+**Revisit when**: either PR #40384 or PR #37429 lands in a nightly — at that point delete the patch file. PR #37429's additional fix for the underlying byte-level padding is a second win on top of #40384; if it lands while our backport is still in place, remove the backport before adopting the new image (composing them risks pool-size / scheduler-view mismatch).
 
 ---
 
@@ -597,6 +599,9 @@ The patch is the source of truth. This section is a contract index, not a re-sta
 | 2 | [`client/rescue_tool_calls.py`](client/rescue_tool_calls.py) | Library-agnostic helpers | §6.1 — rescue `<tool_call>` blocks emitted inside `<think>` |
 | 3 | [`client/validate_response.py`](client/validate_response.py) | Library-agnostic helpers | §6.13 — strict shape validation + tolerant `ToolCallIssue` reporting of every silent `qwen3_coder` parser failure mode |
 | 4 | [`monkey_patch_qwen3_coder.py`](monkey_patch_qwen3_coder.py) | Runtime monkey-patch (loaded before `vllm serve`) | §6.4 / #39771 — `_parse_xml_function_call` crash on truncated `<parameter=` tag |
+| 5 | [`monkey_patch_hybrid_kv_allocator.py`](monkey_patch_hybrid_kv_allocator.py) | Runtime monkey-patch | §6.15 / #37121 (PR #40384 backport) — exclude O(1) Mamba groups from per-token KV-capacity counting; raises reported concurrent-KV from ~63K → ~200K+ tokens at our config with zero quality tradeoff |
+| 6 | [`monkey_patch_extract_tool_calls_metrics.py`](monkey_patch_extract_tool_calls_metrics.py) | Runtime monkey-patch (observation-only wrapper) | §6.13 — server-side Prometheus counter + structured warning log for the silent `markup_leak` failure mode that patch 3 also detects client-side |
+| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint replacement | Loads patches 4 / 5 / 6 into the vLLM Python process (the original `PYTHONSTARTUP` mechanism in §8.2 was non-functional under non-interactive `vllm serve`); per-patch post-install verifier refuses to hand off to vLLM if any patch's effect is not visible from the launcher's vantage point |
 
 ### 7.1 Patch 1 — `client/reasoning_field_shim.py`
 
@@ -694,9 +699,69 @@ for call in result.tool_calls:
 
 Any landmark failure raises `MonkeyPatchRefusedError` and the interpreter does not continue. There is no `SystemExit(0)` or `try/except Exception: pass` on any path.
 
-**Loading caveat**: README §8.2 sets `PYTHONSTARTUP=/opt/patches/monkey_patch.py`. CPython honours `PYTHONSTARTUP` only in *interactive* mode, so a plain `vllm serve` entrypoint may not execute this file. The module docstring documents a wrapper-script load mechanism that does fire correctly. This is a deployment-command concern, not a patch-file concern.
+**Loading**: addressed by `launch_with_patches.py` (§7.L below). The original `PYTHONSTARTUP` mechanism in earlier README revisions did not fire under non-interactive `vllm serve`; the launcher imports this patch (and patches 5, 6) before handing off to vLLM's CLI via `runpy`.
 
 **Removal**: delete this file the moment upstream PR #39772 lands in the pinned nightly. The patch's landmark #4 will refuse to apply against a fixed function and tell you to do exactly this.
+
+### 7.5 Patch 5 — `monkey_patch_hybrid_kv_allocator.py`
+
+**What it patches**: replaces two top-level functions in `vllm.v1.core.kv_cache_utils`:
+
+* `get_max_concurrency_for_kv_cache_config` — was summing `MambaSpec.max_memory_usage_bytes` (correctly O(1) per request) into the per-request memory budget as if it scaled with tokens, then dividing pool size by the inflated budget. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` subclasses always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`) before computing.
+* `_report_kv_cache_config` — emits the user-visible `GPU KV cache size: X tokens` boot line. Was computing `num_blocks // len(kv_cache_groups) * min_block_size`. For Qwen3.6 (1 attention group + 1 Mamba group) this divided the reported number by 2 even though only the attention group consumes a block per token. Patched to divide by the count of token-capacity-contributing groups.
+
+**Backport semantics, not literal port**: this is PR #40384's intent translated to the pinned vLLM commit's actual function shapes. The PR's literal diff targets master and references function signatures (`MambaSpec.max_memory_usage_bytes(num_running_requests, num_total_tokens)`) that do not exist at the pinned commit (real signature is `(self, vllm_config)`; the O(1) vs O(tokens) branch is selected internally via `cache_config.mamba_cache_mode`). The patch follows the source, not the upstream PR text.
+
+**Scope**: scheduler-budget side only. PR #40384's narrow scope; PR #37429's broader byte-level over-allocation fix is explicitly out of scope. The pool's actual byte footprint at the pinned commit remains over-reserved — those bytes are sitting there, the scheduler just was not crediting them. After this patch the scheduler admits more concurrent tokens because the attention-only capacity is reported honestly; the bytes the patch credits the scheduler with are bytes that already exist.
+
+**Strictness — nine import-time landmarks**:
+
+1. `vllm` is importable.
+2. `AttentionSpec` and `MambaSpec` are classes; `FullAttentionSpec` is an `AttentionSpec` subclass; `MambaSpec` is **not** an `AttentionSpec` subclass (load-bearing — if upstream ever made it one, the `isinstance(spec, AttentionSpec)` check in the replacement body would silently misclassify Mamba groups as token-scaling and over-credit the pool, risking OOM).
+3. `KVCacheConfig`/`KVCacheGroupSpec` are dataclasses with the exact fields the replacement reads (`kv_cache_groups`, `num_blocks`, `kv_cache_spec`, `layer_names`); verified via `dataclasses.fields()`, not via type hints up the MRO.
+4. `MambaSpec.max_memory_usage_bytes` and `FullAttentionSpec.max_memory_usage_bytes` exist with the exact `(self, vllm_config)` signature the replacement calls them with.
+5. `vllm.config.cache.MambaCacheMode` is importable and contains both `"all"` and `"none"` (the literals the replacement gates on).
+6. `SchedulerConfig.max_num_seqs` is a declared field (not load-bearing for #40384's narrow scope, but its absence indicates a SchedulerConfig refactor large enough to warrant a re-audit).
+7. `get_max_concurrency_for_kv_cache_config` exists with the expected signature and its source contains the exact buggy landmark string `num_layer_per_group = max(...)` proving the bug is present.
+8. `_report_kv_cache_config` exists with the expected signature and its source contains the exact buggy landmark `num_tokens = (... // len(kv_cache_groups) * min_block_size)` AND still calls `get_max_concurrency_for_kv_cache_config` (so the two coordinated replacements stay coordinated).
+9. After installation, both replacements are tagged with `__qwen36_patch__`, resolvable via both `getattr` and `inspect.getattr_static`.
+
+**Per-call defensive guards** (`_validate_kv_cache_config_shape`, called from both replacements): `kv_cache_config` is the expected `KVCacheConfig`; `kv_cache_groups` is a list; `num_blocks` is a non-negative int; every group is a `KVCacheGroupSpec` with the expected sub-attributes. Any contract violation raises `TypeError` rather than computing a wrong-but-plausible number.
+
+**Risk acknowledgment**: this patch is on the request-admission accounting path. A wrong value here either under-counts capacity (no harm beyond the current bug) or **over-counts capacity** (scheduler admits more concurrent tokens than the pool can hold → OOM at runtime). The landmark-validation discipline mitigates this risk but does not eliminate it. **A live smoke test confirming the patched server admits requests within the post-patch reported pool size without OOM is mandatory before declaring this validated.**
+
+**Removal**: delete this file the moment upstream PR #40384 lands in the pinned nightly — the patch's source landmarks will refuse to apply against a fixed function and tell you to do exactly this. Also remove if PR #37429 (broader byte-level fix) lands first; the two should not compose, since #37429 changes the underlying pool byte size and this patch's scheduler view would no longer match.
+
+### 7.6 Patch 6 — `monkey_patch_extract_tool_calls_metrics.py`
+
+**What it patches**: wraps (does not replace) `Qwen3CoderToolParser.extract_tool_calls`. Calls upstream first, captures the result, fires server-side observability iff the result has the silent-failure shape (`tools_called is False` AND `model_output` contains `<tool_call>` / `<function=` / `<parameter=`), returns the captured result **unchanged**.
+
+**What gets emitted**:
+
+* Prometheus counter `vllm_qwen3_coder_silent_tool_call_failures_total{failure_kind, model}`. The `failure_kind` label is always `"markup_leak"` from this wrapper, but kept as a label (not baked into the metric name) so future kinds can be added without renaming.
+* Structured WARNING log: `silent_tool_call_failure kind=markup_leak content_len=%d marker_count=%d model=%s`. Stable, greppable, ELK-friendly.
+
+**Companion to patch 3, not replacement.** Patch 3 catches this client-side after the response crosses the wire and lets the agent loop dispatch a recovery; this patch lets an operator monitor frequency centrally on the vLLM server's existing metrics endpoint without parsing application logs.
+
+**Scope discipline**: only `markup_leak` is detected. `truncated_tool_call` requires `finish_reason` (added downstream of `extract_tool_calls`) and `invalid_tool_arguments_json` requires JSON parsing the tool call's `arguments` (also downstream). Both are deliberately out of scope and documented as such; patch 3 covers them client-side. The streaming path (`extract_tool_calls_streaming`) has a different return shape and silent-failure across deltas requires per-stream state — also deliberately out of scope.
+
+**The one place this stack catches `Exception`**: the instrumentation block inside the wrapper. Documented at the site. Observability MUST NOT take down request handling, so a counter-increment failure or a logging-formatter regression around an unexpected `request` shape may not convert a successful response into a 500. The cost of this concession is local to the instrumentation; the call to the original method is **outside** the guard so real parser exceptions propagate as they would without this patch.
+
+**Cardinality caveat**: the `model` Prometheus label has unbounded cardinality. Real deployments pin a small set of model names (this one pins exactly `Qwen3.6-35B-A3B-NVFP4`), so it is fine in practice; multi-tenant deployments serving arbitrary client-supplied model strings would explode the time-series count and should either drop the label or hash it.
+
+**Removal**: this patch has no upstream equivalent; it stays until vLLM ships first-class metrics for tool-parser silent failures. No removal trigger landmark.
+
+### 7.L Launcher — `launch_with_patches.py`
+
+**What it is**: the new container entrypoint, replacing `["vllm", "serve"]` with `["python", "/opt/patches/launch.py", "serve", ...]` (full docker-run command in §8.2). It loads server-side patches into the Python process before handing off to vLLM's CLI via `runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__", alter_sys=True)`.
+
+**Why it exists**: earlier README revisions used `PYTHONSTARTUP=/opt/patches/monkey_patch.py` to load patch 4. CPython honours `PYTHONSTARTUP` **only in interactive mode**; the container's `vllm serve` entrypoint is non-interactive, so the patch never fired. This was a real, embarrassing deployment-config gap — the server was booting with the unpatched parser regardless of the bind-mount. The launcher closes that gap.
+
+**Per-patch verification**: after each patch's import, the launcher re-imports the relevant vLLM target *from scratch* (rather than trusting the patch module's cached references) and verifies via both `getattr` AND `inspect.getattr_static` that the patched attribute carries the expected `__qwen36_patch__` tag plus a `__wrapped_original__` marker. If verification fails for any patch, the launcher raises `PatchVerificationError` and the container exits non-zero — defense in depth above each patch's own internal post-install check.
+
+**Adding a new server-side patch**: append the module name to `_PATCH_MODULES` and add a verifier callable to `_PATCH_VERIFICATION`. The verifier should call `_verify_target_carries_tag` for each `(target, attribute)` the patch claims to have modified. Order in `_PATCH_MODULES` is functionally irrelevant for the current set (each patches a disjoint surface) but a future patch with dependencies should be ordered after its dependencies.
+
+**Known limitation**: the launcher closes the load-mechanism gap but cannot close a hypothetical *plugin-snapshot* gap. If vLLM's tool-parser registry is built off a snapshot of a class taken before the patch ran (via plugin manifest, entry-point load, or `copy.deepcopy` of method dicts during engine init), the verifier would pass and the served parser would still be the unpatched one. Python's late binding means existing instances see patched methods, but a snapshot taken before patch import would not. **Mitigation: live smoke test (POST a deliberately truncated `<parameter=` to the booted server, confirm `tools_called=True` with sibling tool calls preserved) before declaring fully validated.** Same caveat for patches 5 and 6 — verifying the install took effect statically does not prove the served code path uses the patched version.
 
 ---
 
@@ -732,11 +797,16 @@ docker run --rm -d --name qwen36 --gpus all \
   --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
   -p 8000:8000 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch.py:ro" \
+  -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \
+  -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \
+  -v "$PWD/monkey_patch_extract_tool_calls_metrics.py:/opt/patches/monkey_patch_extract_tool_calls_metrics.py:ro" \
+  -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
   -e VLLM_USE_V1=1 \
-  -e PYTHONSTARTUP=/opt/patches/monkey_patch.py \
+  -e PYTHONPATH=/opt/patches \
+  --entrypoint python \
   vllm/vllm-openai@sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c \
+  /opt/patches/launch.py serve \
   --model RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
   --revision e850c696e6d75f965367e816c16bc7dacd955ffa \
   --served-model-name Qwen3.6-35B-A3B-NVFP4 \
@@ -759,7 +829,7 @@ docker run --rm -d --name qwen36 --gpus all \
 |---|---|
 | `--ipc=host --ulimit memlock=-1 --ulimit stack=67108864` | Required by PyTorch multiprocessing and NCCL even on single-GPU. Without `memlock=-1` and stack headroom, CUDA graph capture can fail. |
 | `-v ~/.cache/huggingface:/root/.cache/huggingface` | Persists the 24 GB model download across container restarts. |
-| `-v $PWD/monkey_patch_qwen3_coder.py:...:ro` + `-e PYTHONSTARTUP=...` | Applies client-patch 4 (§7.4) before `vllm serve` imports the parser. Read-only mount prevents container mutation. |
+| Three `-v $PWD/monkey_patch_*.py:/opt/patches/...:ro` mounts + `-v $PWD/launch_with_patches.py:/opt/patches/launch.py:ro` + `-e PYTHONPATH=/opt/patches` + `--entrypoint python /opt/patches/launch.py serve` | Mounts patches 4 / 5 / 6 (§7.4 / 7.5 / 7.6) and the launcher (§7.L) read-only into the container, makes the patches importable from the launcher's `PYTHONPATH`, replaces the image's default `["vllm", "serve"]` ENTRYPOINT with the launcher (which imports each patch in order, post-verifies each one's tag, then `runpy`s vLLM's CLI). Earlier README revisions used `PYTHONSTARTUP` for this; that mechanism is non-functional under non-interactive `vllm serve` and is replaced. |
 | `HF_HUB_ENABLE_HF_TRANSFER=1` | Enables the `hf-transfer` Rust downloader baked into the image — roughly 3–5× faster for large shards. |
 | `VLLM_USE_V1=1` | Pins the V1 engine (default at this vLLM commit, but explicit pin defends against future defaults). |
 | `--model RedHatAI/Qwen3.6-35B-A3B-NVFP4 --revision e850c696e6d75f965367e816c16bc7dacd955ffa` | Pins the NVFP4 checkpoint by revision SHA (RedHatAI marks it "preliminary (and subject to change)"; SHA pin prevents silent upgrades). |
@@ -786,9 +856,16 @@ docker run --rm -d --name qwen36 --gpus all \
 | `--attention-backend` | Default Triton/FlashInfer dispatch is correct on SM 12.0. `FLASH_ATTN_V3` has no Blackwell release. |
 | `--tensor-parallel-size` / `--enable-expert-parallel` | Single-GPU deployment. TP and EP require multi-GPU. |
 
-### 8.3 The monkey-patch file referenced above
+### 8.3 The patch files referenced above
 
-See §7.4 for the full patch source (`monkey_patch_qwen3_coder.py`). The `PYTHONSTARTUP` environment variable ensures it runs before `vllm serve` imports the parser. Remove this patch and the mount once upstream PR #39772 lands and is present in a pinned nightly.
+The four files mounted by §8.2 are documented in §7:
+
+* §7.4 — `monkey_patch_qwen3_coder.py` (parser crash fix)
+* §7.5 — `monkey_patch_hybrid_kv_allocator.py` (KV scheduler-budget fix)
+* §7.6 — `monkey_patch_extract_tool_calls_metrics.py` (server-side observability)
+* §7.L — `launch_with_patches.py` (entrypoint that imports the three patches before `vllm serve`)
+
+Remove individual patches as their upstream fixes land — each patch's import-time landmark check refuses to apply against an already-fixed function and tells the operator exactly what to do.
 
 ### 8.4 Smoke tests
 
@@ -882,14 +959,15 @@ Re-evaluate the pinned versions in this README when any of the following happens
 
 1. **vLLM tags a `v0.19.2` final** or later, at which point we migrate from the nightly image to a semver-tagged image.
 2. **A newer nightly image passes the `docker run --rm <image> vllm --help` smoke test** (i.e., does not exhibit the §6.14 transformers import regression). Upgrade the pinned digest.
-3. **Upstream PR #39772 merges** — remove the monkey-patch shim from patch 4.
+3. **Upstream PR #39772 merges** — remove `monkey_patch_qwen3_coder.py` (patch 4) and its bind-mount; remove the launcher's `monkey_patch_qwen3_coder` entry in `_PATCH_MODULES` and the corresponding verifier in `_PATCH_VERIFICATION`. The patch's source-landmark check refuses against a fixed function and tells the operator exactly this.
 4. **vLLM issue #38182 (MTP + prefix cache) closes with a verified fix** — reconsider enabling MTP speculative decoding. Our measurement shows MTP on this stack gives ~8% decode speedup (153 → 166 tok/s) at the cost of 38% of concurrent-KV capacity; if that tradeoff changes materially (e.g., larger acceptance rate, smaller VRAM cost), re-run the experiment.
 5. **RedHatAI removes the "preliminary (and subject to change)" notice** on the NVFP4 quant, or publishes a v1.0-tagged revision — bump the pinned revision SHA.
 6. **An `nvidia/Qwen3.6-35B-A3B-NVFP4` (NVIDIA-official) checkpoint is published** — reconsider which NVFP4 build to use, especially if NVIDIA publishes agentic-task benchmarks alongside it.
 7. **vLLM PR #39931 (hybrid TurboQuant) merges** — reconsider moving from BF16 KV to rotation-preconditioned low-bit KV to unlock higher concurrent-KV capacity on this card. Our current reading: 4-bit `turboquant_4bit_nc` costs ~2.5 pp GSM8K on the closest model family (Qwen3.5-35B-A3B); 3-bit costs ~24 pp and is rejected; 4-bit is defensible if our workload saturates concurrent-KV and we accept the quality tax.
-8. **vLLM PR #40384 (narrow hybrid KV scheduler fix by `jhsmith409`) merges** — our single most imminent upstream win, 1–3 weeks out. §6.15 estimates this raises the reported pool from 63,360 → ~200K+ concurrent tokens at BF16 KV with no quality change, without any other changes to our config. Re-pin the nightly, re-measure the pool, update §5.2 / §5.8 numbers. This is likely the fix worth waiting for before declaring the deployment final.
-9. **vLLM PR #37429 (broader hybrid KV allocator fix) merges** — a second improvement on top of #40384 that also fixes the byte-level padding. Blocked on RFC-level review; realistic horizon is weeks to months. When this lands, the pool itself should shrink in bytes consumed (freeing VRAM for further use) in addition to the token-count fix that #40384 delivers.
-10. **PR #37429 stalls past Q2 2026 AND #40384 doesn't land** — re-evaluate the SGLang switch (§10) regardless of the other tradeoffs; SGLang's native handling of hybrid KV is worth the integration cost at that point.
+8. **vLLM PR #40384 (narrow hybrid KV scheduler fix) merges** — remove `monkey_patch_hybrid_kv_allocator.py` (patch 5) and its bind-mount; remove the launcher's `monkey_patch_hybrid_kv_allocator` entry in `_PATCH_MODULES` and the corresponding verifier. The patch's source-landmark check refuses against a fixed function and tells the operator exactly this. We are no longer waiting for this PR — the in-repo backport delivers its substance today; the upstream merge is a cleanup step.
+9. **vLLM PR #37429 (broader hybrid KV allocator fix) merges** — fixes the underlying byte-level pool over-reservation that PR #40384 / patch 5 do NOT address. **Critical sequencing**: remove patch 5 BEFORE pulling an image that contains PR #37429 — the broader fix changes the underlying pool byte size, and patch 5's scheduler view would no longer match. The patch's landmark refuses on its own buggy-source check, but `vllm.v1.core.kv_cache_utils._report_kv_cache_config` may still carry the buggy substring even after #37429 changes the pool's physical layout (the two functions are related but distinct). Audit before bumping.
+10. **PR #37429 lands and patch 5 has been removed** — the pool itself shrinks in bytes consumed (freeing VRAM for further use). Re-measure §5.2 / §5.8 numbers; the post-#37429 pool may be smaller in bytes but admit similar concurrent tokens (the inflation is moved out of the pool entirely rather than counted-around).
+11. **vLLM ships first-class metrics for tool-parser silent failures** — remove `monkey_patch_extract_tool_calls_metrics.py` (patch 6) and its bind-mount; remove the launcher entries. No source landmark refuses for this patch since there's no upstream bug landmark to check against — operator must notice the upstream metric and decide.
 
 Each of these is tracked and none of them are urgent. The current pins booted, served a chat completion + tool call, held a 119,907-token single-request prompt, and measured 153 tok/s steady-state decode on the target hardware on 2026-04-21. 2026-04-22 cross-validation added 5 multimodal-config boot sweeps, 4 high-N image-limit sweeps (3 of which crashed, confirming the `image ≥ 10` ceiling), 8 request-time VRAM probes up to 128,333 tokens, and the empirical decomposition of the KV pool — all documented in §5.8 and §6.15.
 
@@ -899,12 +977,15 @@ Each of these is tracked and none of them are urgent. The current pins booted, s
 
 ```
 .
-├── README.md                       # this document
-├── monkey_patch_qwen3_coder.py     # patch 4 — runtime parser crash fix (loaded into vLLM)
-└── client/                         # library-agnostic helpers, callable from any Python OpenAI-SDK code
-    ├── reasoning_field_shim.py     # patch 1 — bidirectional reasoning ↔ reasoning_content rename
-    ├── rescue_tool_calls.py        # patch 2 — <tool_call>-in-reasoning rescue
-    └── validate_response.py        # patch 3 — strict shape validation + tolerant ToolCallIssue reporting
+├── README.md                                       # this document
+├── launch_with_patches.py                          # §7.L — container entrypoint; loads patches 4/5/6 then runpys vLLM
+├── monkey_patch_qwen3_coder.py                     # §7.4 — runtime parser crash fix
+├── monkey_patch_hybrid_kv_allocator.py             # §7.5 — runtime hybrid-KV scheduler-budget fix (PR #40384 backport)
+├── monkey_patch_extract_tool_calls_metrics.py      # §7.6 — runtime observability wrapper
+└── client/                                         # library-agnostic helpers, callable from any Python OpenAI-SDK code
+    ├── reasoning_field_shim.py                     # §7.1 — bidirectional reasoning ↔ reasoning_content rename
+    ├── rescue_tool_calls.py                        # §7.2 — <tool_call>-in-reasoning rescue
+    └── validate_response.py                        # §7.3 — strict shape validation + tolerant ToolCallIssue reporting
 ```
 
-The four files in this tree are the entire client-side surface this project ships. There is no `docker/` or `tests/` subtree; the docker run command (§8.2) and smoke tests (§8.4) live inline in this README. Any additional artifacts are created alongside as the deployment evolves.
+These seven files are the entire surface this project ships: three runtime monkey-patches into vLLM (§7.4 / 7.5 / 7.6), one container entrypoint that loads them (§7.L), and three library-agnostic helpers the operator's Python client glue imports at the wire boundary (§7.1 / 7.2 / 7.3). There is no `docker/` or `tests/` subtree; the docker run command (§8.2) and smoke tests (§8.4) live inline in this README. Any additional artifacts are created alongside as the deployment evolves.
