@@ -67,6 +67,12 @@ is identical to the existing command)::
       -p 8000:8000 \\
       -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\
       -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \\
+      -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \\
+      -v "$PWD/monkey_patch_extract_tool_calls_metrics.py:/opt/patches/monkey_patch_extract_tool_calls_metrics.py:ro" \\
+      -v "$PWD/monkey_patch_extract_tool_calls_streaming_metrics.py:/opt/patches/monkey_patch_extract_tool_calls_streaming_metrics.py:ro" \\
+      -v "$PWD/monkey_patch_reasoning_field_egress.py:/opt/patches/monkey_patch_reasoning_field_egress.py:ro" \\
+      -v "$PWD/monkey_patch_reasoning_field_ingest.py:/opt/patches/monkey_patch_reasoning_field_ingest.py:ro" \\
+      -v "$PWD/monkey_patch_tool_call_in_think_rescue.py:/opt/patches/monkey_patch_tool_call_in_think_rescue.py:ro" \\
       -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \\
       -e HF_HUB_ENABLE_HF_TRANSFER=1 \\
       -e VLLM_USE_V1=1 \\
@@ -78,15 +84,16 @@ is identical to the existing command)::
       --revision e850c696e6d75f965367e816c16bc7dacd955ffa \\
       ...  # remaining --served-model-name / --host / ... flags unchanged
 
-Two structural changes from the old command:
+Two structural changes from the pre-launcher docker command:
 
-* The bind-mount for ``monkey_patch_qwen3_coder.py`` keeps its
-  filename (so ``import monkey_patch_qwen3_coder`` resolves under
-  ``PYTHONPATH=/opt/patches``) instead of being renamed to
-  ``monkey_patch.py``.
+* Each patch module is bind-mounted into ``/opt/patches/`` by its
+  real filename so ``import monkey_patch_<n>`` resolves under
+  ``PYTHONPATH=/opt/patches``. Do NOT rename them in the bind-mount.
 * ``PYTHONSTARTUP`` is dropped entirely. The ``PYTHONPATH``
   prepend and the ``--entrypoint python /opt/patches/launch.py``
-  override replace it.
+  override replace it. (CPython only honors ``PYTHONSTARTUP`` in
+  interactive mode; the container's non-interactive entrypoint
+  never reads it. That is this launcher's reason for existing.)
 
 Adding a new server-side patch
 ------------------------------
@@ -339,7 +346,7 @@ def _verify_hybrid_kv_allocator(patch_module: ModuleType) -> None:
 
 def _verify_extract_tool_calls_metrics(patch_module: ModuleType) -> None:
     """Verify ``monkey_patch_extract_tool_calls_metrics`` wrapped the
-    parser's ``extract_tool_calls`` method."""
+    parser's ``extract_tool_calls`` method (non-streaming entry)."""
     expected_tag = _expected_tag_from(patch_module)
     try:
         from vllm.tool_parsers.qwen3coder_tool_parser import (
@@ -360,6 +367,163 @@ def _verify_extract_tool_calls_metrics(patch_module: ModuleType) -> None:
     )
 
 
+def _verify_extract_tool_calls_streaming_metrics(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_extract_tool_calls_streaming_metrics``
+    wrapped the parser's ``extract_tool_calls_streaming`` method
+    (streaming entry — the one the serving layer calls per-chunk under
+    ``stream=True``).
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.tool_parsers.qwen3coder_tool_parser import (
+            Qwen3CoderToolParser,
+        )
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import "
+            f"vllm.tool_parsers.qwen3coder_tool_parser.Qwen3CoderToolParser "
+            f"for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        Qwen3CoderToolParser,
+        "extract_tool_calls_streaming",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="Qwen3CoderToolParser",
+    )
+
+
+def _verify_reasoning_field_egress(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_reasoning_field_egress`` applied the
+    Pydantic serialization alias on both target classes.
+
+    The verifier does two things, both independent of the patch's own
+    post-install checks:
+
+    1. Re-imports ``ChatMessage`` and ``DeltaMessage`` from vLLM and
+       confirms each carries the class-level ``__qwen36_egress_patch__``
+       tag (stamped by the patch) via both ``getattr`` and
+       ``inspect.getattr_static``.
+    2. Constructs a throwaway instance of each class and asserts that
+       ``model_dump()`` emits the alias ``reasoning_content`` and does
+       NOT emit the bare ``reasoning`` key. This is a behavioural check
+       that catches a "patch tag present but serializer rebuild did
+       not take effect" regression that a tag-only check would miss.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatMessage
+        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import ChatMessage / DeltaMessage "
+            f"for verification: {exc!r}"
+        ) from exc
+
+    _probe_value = "__qwen36_launcher_egress_probe__"
+    for target_cls, target_name in (
+        (ChatMessage, "vllm.entrypoints.openai.chat_completion.protocol.ChatMessage"),
+        (DeltaMessage, "vllm.entrypoints.openai.engine.protocol.DeltaMessage"),
+    ):
+        # Tag check (class-level sentinel the patch stamped in Phase 4).
+        dynamic = getattr(target_cls, "__qwen36_egress_patch__", None)
+        if dynamic != expected_tag:
+            raise PatchVerificationError(
+                f"[{_LAUNCHER_TAG}] post-install verification failed for "
+                f"{patch_module.__name__!r}: {target_name} carries "
+                f"__qwen36_egress_patch__={dynamic!r}, expected "
+                f"{expected_tag!r}."
+            )
+        static = inspect.getattr_static(target_cls, "__qwen36_egress_patch__", None)
+        if static != expected_tag:
+            raise PatchVerificationError(
+                f"[{_LAUNCHER_TAG}] static-lookup verification failed "
+                f"for {patch_module.__name__!r}: "
+                f"inspect.getattr_static({target_name}, "
+                f"'__qwen36_egress_patch__')={static!r}, expected "
+                f"{expected_tag!r}."
+            )
+
+        # Behavioural check — the rename must actually take effect.
+        # This catches the class of regressions where the tag was
+        # stamped but the Pydantic schema was not regenerated.
+        if "role" in target_cls.model_fields and target_cls.model_fields[
+            "role"
+        ].is_required():
+            instance = target_cls(role="assistant", reasoning=_probe_value)
+        else:
+            instance = target_cls(reasoning=_probe_value)
+        dumped = instance.model_dump()
+        if dumped.get("reasoning_content") != _probe_value:
+            raise PatchVerificationError(
+                f"[{_LAUNCHER_TAG}] egress rename verification failed "
+                f"for {target_name}: model_dump()['reasoning_content'] "
+                f"is {dumped.get('reasoning_content')!r}, expected the "
+                f"probe value. Full dump: {dumped!r}"
+            )
+        if "reasoning" in dumped:
+            raise PatchVerificationError(
+                f"[{_LAUNCHER_TAG}] egress rename verification failed "
+                f"for {target_name}: model_dump() still contains the "
+                f"bare 'reasoning' key; the alias and the unaliased "
+                f"name are being emitted together. Full dump: {dumped!r}"
+            )
+
+
+def _verify_reasoning_field_ingest(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_reasoning_field_ingest`` wrapped
+    ``vllm.entrypoints.chat_utils._parse_chat_message_content``.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.entrypoints import chat_utils as _chat_utils_mod
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import vllm.entrypoints.chat_utils "
+            f"for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        _chat_utils_mod,
+        "_parse_chat_message_content",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="vllm.entrypoints.chat_utils",
+    )
+
+
+def _verify_tool_call_in_think_rescue(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_tool_call_in_think_rescue`` wrapped BOTH
+    the non-streaming ``extract_reasoning`` and the streaming
+    ``extract_reasoning_streaming`` methods on ``Qwen3ReasoningParser``.
+    Both must bear the tag; a half-applied rescue (only one wrapped)
+    would leave one code path silently vulnerable to the §6.1 failure
+    mode this patch exists to eliminate.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import "
+            f"vllm.reasoning.qwen3_reasoning_parser.Qwen3ReasoningParser "
+            f"for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        Qwen3ReasoningParser,
+        "extract_reasoning",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="Qwen3ReasoningParser",
+    )
+    _verify_target_carries_tag(
+        Qwen3ReasoningParser,
+        "extract_reasoning_streaming",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="Qwen3ReasoningParser",
+    )
+
+
 # --------------------------------------------------------------------
 # Registry. Order matters — see module docstring.
 # --------------------------------------------------------------------
@@ -372,15 +536,34 @@ def _verify_extract_tool_calls_metrics(patch_module: ModuleType) -> None:
 _PatchVerifier = Callable[[ModuleType], None]
 
 _PATCH_MODULES: tuple[str, ...] = (
-    # Order matters. qwen3_coder first because it owns the
-    # tool-parser surface; the metrics wrapper composes on top of it.
-    # hybrid_kv_allocator touches a disjoint surface
-    # (vllm.v1.core.kv_cache_utils) so its position is functionally
-    # arbitrary, but conventionally we group server-side patches
-    # by the area they touch.
+    # Order notes:
+    #
+    # * qwen3_coder first because it owns the tool-parser surface; the
+    #   metrics wrappers compose on top of it.
+    # * hybrid_kv_allocator touches a disjoint surface
+    #   (vllm.v1.core.kv_cache_utils) so its position is functionally
+    #   arbitrary, grouped here with the other tool-parser-adjacent patches.
+    # * extract_tool_calls_metrics then extract_tool_calls_streaming_metrics:
+    #   both wrap methods on Qwen3CoderToolParser (disjoint methods);
+    #   either order works. The non-streaming one is listed first only
+    #   so that when it registers the shared Prometheus counter, the
+    #   streaming one discovers and reuses it on the second pass.
+    # * reasoning_field_egress and reasoning_field_ingest are
+    #   independent of the tool-parser patches (different surfaces:
+    #   Pydantic model + chat_utils function). Order between them is
+    #   arbitrary.
+    # * tool_call_in_think_rescue wraps the reasoning parser. It must
+    #   come AFTER the reasoning_field_egress patch because the egress
+    #   patch calls `model_rebuild(force=True)` on DeltaMessage, and
+    #   the rescue patch constructs DeltaMessage instances — the
+    #   Pydantic schema must be stable by that point.
     "monkey_patch_qwen3_coder",
     "monkey_patch_hybrid_kv_allocator",
     "monkey_patch_extract_tool_calls_metrics",
+    "monkey_patch_extract_tool_calls_streaming_metrics",
+    "monkey_patch_reasoning_field_egress",
+    "monkey_patch_reasoning_field_ingest",
+    "monkey_patch_tool_call_in_think_rescue",
     # Append future entries here; do not re-order existing entries
     # without re-auditing the dependency graph between patches.
 )
@@ -389,6 +572,10 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_qwen3_coder": _verify_qwen3_coder,
     "monkey_patch_hybrid_kv_allocator": _verify_hybrid_kv_allocator,
     "monkey_patch_extract_tool_calls_metrics": _verify_extract_tool_calls_metrics,
+    "monkey_patch_extract_tool_calls_streaming_metrics": _verify_extract_tool_calls_streaming_metrics,
+    "monkey_patch_reasoning_field_egress": _verify_reasoning_field_egress,
+    "monkey_patch_reasoning_field_ingest": _verify_reasoning_field_ingest,
+    "monkey_patch_tool_call_in_think_rescue": _verify_tool_call_in_think_rescue,
 }
 
 
