@@ -133,7 +133,7 @@ from typing import Any, Callable, TypeAlias
 
 
 _PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
-_PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-metrics-v1"
+_PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-metrics-v2"
 
 # Markers whose presence in ``model_output`` constitutes a markup
 # leak when paired with an empty ``tool_calls`` result. Mirrors the
@@ -291,8 +291,43 @@ for _landmark in _SILENT_FAILURE_LANDMARKS:
 # would silently undercut that purpose for an operator who scrapes the
 # Prometheus endpoint. Both an ImportError on prometheus_client and a
 # ValueError on registration (collision) are refused loudly.
+#
+# Counter name MUST NOT contain "vllm" (case-sensitive substring).
+# vLLM's ``vllm/v1/metrics/prometheus.py:unregister_vllm_metrics()`` is
+# called from ``vllm/v1/metrics/loggers.py:420`` during
+# ``PrometheusStatLogger.__init__``, and it iterates every collector
+# whose ``_name`` contains ``"vllm"`` and unregisters it from the
+# default REGISTRY:
+#
+#     for collector in list(registry._collector_to_names):
+#         if hasattr(collector, "_name") and "vllm" in collector._name:
+#             registry.unregister(collector)
+#
+# A counter registered before ``PrometheusStatLogger`` initialises (which
+# is what happens during boot — patches load first, then vLLM CLI does
+# its setup) gets *deregistered* by that loop if its name happens to
+# match. Empirically verified: a counter named
+# ``vllm_qwen3_coder_silent_tool_call_failures_total`` registers cleanly,
+# survives the launcher's verifier, and then disappears from /metrics
+# the moment the API server's PrometheusStatLogger runs. Renaming the
+# counter to ``qwen3_coder_silent_tool_call_failures_total`` (no "vllm"
+# substring) keeps it visible end-to-end.
+#
+# We assert this invariant at install time so a future maintainer who
+# innocently re-prefixes the counter back to "vllm_..." sees a hard
+# refusal at boot instead of a silently-broken metric.
 
-_COUNTER_NAME: str = "vllm_qwen3_coder_silent_tool_call_failures_total"
+_COUNTER_NAME: str = "qwen3_coder_silent_tool_call_failures_total"
+
+if "vllm" in _COUNTER_NAME:
+    raise MetricsPatchRefusedError(
+        f"[{_PATCH_TAG}] counter name {_COUNTER_NAME!r} contains "
+        f"'vllm', which would be deregistered by "
+        f"vllm.v1.metrics.prometheus.unregister_vllm_metrics() during "
+        f"PrometheusStatLogger.__init__. The counter would be invisible "
+        f"on /metrics. Choose a name without 'vllm' as a substring."
+    )
+
 _COUNTER_DESCRIPTION: str = (
     "Responses where the qwen3_coder tool parser returned no tool "
     "calls but the model output contained <tool_call>/<function=/"
@@ -302,6 +337,7 @@ _COUNTER_LABELS: tuple[str, ...] = ("failure_kind", "model")
 
 try:
     from prometheus_client import Counter as _PromCounter
+    from prometheus_client import REGISTRY as _PromRegistry
 except ImportError as _exc:
     raise MetricsPatchRefusedError(
         f"[{_PATCH_TAG}] prometheus_client is not importable "
@@ -336,9 +372,25 @@ except ValueError as _exc:
         f"falling back to logs-only — the operator must investigate."
     ) from _exc
 
+# Post-registration: confirm the counter is actually in the default
+# REGISTRY's name → collector mapping. ``Counter()`` returning a usable
+# object without registering it (e.g., a future prometheus_client release
+# that changes default behavior) would be a silent observability failure.
+_REGISTERED_NAMES = set(_PromRegistry._names_to_collectors)
+_COUNTER_NAME_SANS_TOTAL = _COUNTER_NAME.removesuffix("_total")
+_require(
+    _COUNTER_NAME in _REGISTERED_NAMES
+    or _COUNTER_NAME_SANS_TOTAL in _REGISTERED_NAMES,
+    f"Prometheus counter {_COUNTER_NAME!r} was constructed but is not "
+    f"discoverable in REGISTRY._names_to_collectors (probed both "
+    f"{_COUNTER_NAME!r} and {_COUNTER_NAME_SANS_TOTAL!r}). "
+    f"prometheus_client's default registration semantics may have "
+    f"changed; the counter would be invisible on /metrics. Refusing.",
+)
+
 _logger.info(
-    "[%s] registered Prometheus counter %s (first registrant); "
-    "labelnames=%r.",
+    "[%s] registered Prometheus counter %s in default REGISTRY "
+    "(first registrant); labelnames=%r.",
     _PATCH_TAG,
     _COUNTER_NAME,
     _COUNTER_LABELS,

@@ -253,7 +253,7 @@ Any client following the OpenAI standard silently loses reasoning in **both dire
 
 The `qwen3_coder` tool parser has 8 non-streaming and 6 streaming code paths where it returns `tools_called=False` with the raw `<tool_call>…` markup as `content`, or returns `tools_called=True` with invalid / truncated JSON arguments. All produce HTTP 200 with no error surfaced. vLLM emits no server-side metrics. Community evidence puts baseline frequency at 1–5% of tool-calling responses, rising to 10–20% under long context, reasoning, or speculative decoding.
 
-**Affects us**: yes — silent failures in agent loops manifest as mysterious behavioral drift. **Resolution**: §7.6 (non-streaming) and §7.7 (streaming) turn the silent-failure class into a Prometheus counter `vllm_qwen3_coder_silent_tool_call_failures_total{failure_kind, model}`.
+**Affects us**: yes — silent failures in agent loops manifest as mysterious behavioral drift. **Resolution**: §7.6 (non-streaming) and §7.7 (streaming) turn the silent-failure class into a Prometheus counter `qwen3_coder_silent_tool_call_failures_total{failure_kind, model}`.
 
 ### 6.6 `transformers==5.5.4` broken `GenerationConfig` import in latest nightly [Class C]
 
@@ -316,7 +316,7 @@ The streaming path is architecturally load-bearing: `parse_delta` gates the tool
 
 ### 7.6 Patch 6 — `monkey_patch_extract_tool_calls_metrics.py`
 
-Wraps `Qwen3CoderToolParser.extract_tool_calls` (non-streaming). Fires server-side observability iff the result has the silent-failure shape (`tools_called is False` AND `model_output` contains `<tool_call>` / `<function=` / `<parameter=`); returns the upstream result unchanged. Emits Prometheus counter `vllm_qwen3_coder_silent_tool_call_failures_total{failure_kind="markup_leak", model=...}` plus a structured WARNING. Observation-only — upstream call is OUTSIDE the instrumentation `try/except`. **Removal trigger**: vLLM ships first-class metrics for tool-parser silent failures.
+Wraps `Qwen3CoderToolParser.extract_tool_calls` (non-streaming). Fires server-side observability iff the result has the silent-failure shape (`tools_called is False` AND `model_output` contains `<tool_call>` / `<function=` / `<parameter=`); returns the upstream result unchanged. Emits Prometheus counter `qwen3_coder_silent_tool_call_failures_total{failure_kind="markup_leak", model=...}` plus a structured WARNING. Observation-only — upstream call is OUTSIDE the instrumentation `try/except`. **Removal trigger**: vLLM ships first-class metrics for tool-parser silent failures.
 
 ### 7.7 Patch 7 — `monkey_patch_extract_tool_calls_streaming_metrics.py`
 
@@ -426,7 +426,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 Expected (after the §7.3 egress patch is installed): `choices[0].message.reasoning_content` contains the `<think>` content; `choices[0].message.tool_calls[0].function.name == "calculator"` with valid JSON `arguments`; `finish_reason == "tool_calls"`.
 
-**Operator visibility for silent tool-parser failures**: scrape `vllm_qwen3_coder_silent_tool_call_failures_total{failure_kind, model}` from the server's Prometheus endpoint. Non-zero rate indicates a residual parser silent-failure rate; investigate at the model-prompt level.
+**Operator visibility for silent tool-parser failures**: scrape `qwen3_coder_silent_tool_call_failures_total{failure_kind, model}` from the server's Prometheus endpoint. Non-zero rate indicates a residual parser silent-failure rate; investigate at the model-prompt level.
 
 ---
 
@@ -435,7 +435,7 @@ Expected (after the §7.3 egress patch is installed): `choices[0].message.reason
 | Item | Evidence status |
 |---|---|
 | Long-context retrieval quality past ~32K | Only 16 of 64 layers are full attention; long-range retrieval rides on a thin substrate. No RULER / needle-in-haystack numbers published for Qwen3.6-27B at any precision. Validate on your workload before committing. |
-| `<tool_call>`-inside-`<think>` frequency, and thinking-mode loop rate under our specific AWQ config | `<tool_call>`-inside-`<think>` is community-reported at single-digit-percent. Patch §7.5 handles it; watch the `vllm_qwen3_coder_silent_tool_call_failures_total` series for residual rate. **Thinking-mode loop rate** is measured at 17.4% on Qwen3.5-35B-A3B unquantized (issue #88 on `QwenLM/Qwen3.6`); we have not measured it under our AWQ + BF16-linear-attn + BF16-KV config against a BF16-weights baseline. |
+| `<tool_call>`-inside-`<think>` frequency, and thinking-mode loop rate under our specific AWQ config | `<tool_call>`-inside-`<think>` is community-reported at single-digit-percent. Patch §7.5 handles it; watch the `qwen3_coder_silent_tool_call_failures_total` series for residual rate. **Thinking-mode loop rate** is measured at 17.4% on Qwen3.5-35B-A3B unquantized (issue #88 on `QwenLM/Qwen3.6`); we have not measured it under our AWQ + BF16-linear-attn + BF16-KV config against a BF16-weights baseline. |
 | Hybrid KV scheduler-reporting bug (§6.7) | Boot log under-reports concurrent-KV capacity by ~4×. Patch 2 corrects the log; admission behavior is identical with or without it. Tracked at vLLM #37121. |
 | Image count boot failure threshold (§5.8) | `image ∈ {0, 1, 2, 3}` boots; `image ∈ {10, 100, 999}` (and the default-999 when flag omitted) crash with TensorRT-LLM `throwRuntimeError`. We did not bisect 4–9; treat 3 as the ceiling. |
 

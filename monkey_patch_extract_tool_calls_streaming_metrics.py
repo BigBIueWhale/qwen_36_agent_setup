@@ -19,7 +19,7 @@ streamed ``DeltaMessage`` carries leaked tool-call markup in
 equivalent of the same silent-failure shape.
 
 The two patches SHARE a single Prometheus counter
-(``vllm_qwen3_coder_silent_tool_call_failures_total``) with labels
+(``qwen3_coder_silent_tool_call_failures_total``) with labels
 ``(failure_kind, model)``; this patch uses
 ``failure_kind="markup_leak_streaming"`` so operators can query the
 combined rate across both code paths or split them as needed.
@@ -159,7 +159,7 @@ from typing import Any, Callable, TypeAlias
 
 
 _PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
-_PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-streaming-metrics-v1"
+_PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-streaming-metrics-v2"
 
 # Markers whose presence, as a COMPLETE substring, inside a single
 # delta's ``content`` constitutes a streaming markup leak when paired
@@ -338,7 +338,25 @@ _require(
 #     falling back to logs-only would silently undercut the
 #     observability surface this whole patch is for.
 
-_COUNTER_NAME: str = "vllm_qwen3_coder_silent_tool_call_failures_total"
+_COUNTER_NAME: str = "qwen3_coder_silent_tool_call_failures_total"
+
+# Counter name MUST NOT contain "vllm" (case-sensitive substring).
+# vLLM's ``vllm/v1/metrics/prometheus.py:unregister_vllm_metrics()`` is
+# called during ``PrometheusStatLogger.__init__`` and unregisters every
+# collector with "vllm" in ``_name``. See the matching note in the
+# non-streaming patch (monkey_patch_extract_tool_calls_metrics.py).
+# Empirically verified: a "vllm_*" counter survives the launcher's
+# verifier and then disappears from /metrics the moment the API
+# server's PrometheusStatLogger runs. Refuse at install time so a
+# future re-prefix is caught loudly.
+if "vllm" in _COUNTER_NAME:
+    raise StreamingMetricsPatchRefusedError(
+        f"[{_PATCH_TAG}] counter name {_COUNTER_NAME!r} contains "
+        f"'vllm', which would be deregistered by "
+        f"vllm.v1.metrics.prometheus.unregister_vllm_metrics() during "
+        f"PrometheusStatLogger.__init__. Choose a name without 'vllm'."
+    )
+
 _COUNTER_DESCRIPTION: str = (
     "Responses where the qwen3_coder tool parser returned no tool "
     "calls but the model output contained <tool_call>/<function=/"

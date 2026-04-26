@@ -880,10 +880,34 @@ def section_5_rescue() -> None:
 def section_6_metrics() -> None:
     run.section("6. monkey_patch_extract_tool_calls_metrics.py")
     patch_path = PATCH_DIR / "monkey_patch_extract_tool_calls_metrics.py"
+    patch_src = patch_path.read_text()
     target_src = (
         VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py"
     ).read_text()
     engine_src = (VLLM_DIR / "vllm/entrypoints/openai/engine/protocol.py").read_text()
+    prom_src = (
+        VLLM_DIR / "vllm/v1/metrics/prometheus.py"
+    ).read_text()
+
+    # Counter name MUST NOT contain "vllm" — vLLM's
+    # unregister_vllm_metrics() in vllm/v1/metrics/prometheus.py would
+    # deregister it at PrometheusStatLogger init.
+    counter_name = patch_constant(patch_path, "_COUNTER_NAME")
+    run.expect(
+        f"counter name does NOT contain 'vllm' (substring) "
+        f"(name={counter_name!r})",
+        "vllm" not in counter_name,
+        "would be deregistered by unregister_vllm_metrics() — see the "
+        "in-patch note. Choose a name without 'vllm' as a substring.",
+    )
+    # Confirm the upstream filter still has the "vllm" substring check
+    # — if it changes, our defensive rename may be unnecessary.
+    run.expect(
+        "upstream unregister_vllm_metrics still filters on 'vllm' substring",
+        '"vllm" in collector._name' in prom_src,
+        "vLLM's filter has changed; re-audit whether the rename is "
+        "still needed.",
+    )
 
     # Signature.
     sig = vllm_function_signature(
@@ -930,6 +954,22 @@ def section_7_streaming_metrics() -> None:
     target_src = (
         VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py"
     ).read_text()
+
+    # Counter-name guard (mirror of section 6's check; both patches
+    # must agree on the same non-vllm-prefixed name).
+    counter_name = patch_constant(patch_path, "_COUNTER_NAME")
+    run.expect(
+        f"streaming patch counter name agrees with non-streaming "
+        f"(name={counter_name!r})",
+        counter_name == "qwen3_coder_silent_tool_call_failures_total",
+        "the two metrics patches must register the same counter name "
+        "for the cooperative-discovery-on-collision path to work.",
+    )
+    run.expect(
+        "streaming patch counter name does NOT contain 'vllm'",
+        "vllm" not in counter_name,
+        "would be deregistered by unregister_vllm_metrics().",
+    )
 
     sig = vllm_function_signature(
         "vllm/tool_parsers/qwen3coder_tool_parser.py",
