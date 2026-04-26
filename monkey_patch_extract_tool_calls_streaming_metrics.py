@@ -1,6 +1,6 @@
 """Server-side observability patch for vLLM ``qwen3_coder`` silent streaming tool-parser failures.
 
-Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
+Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce`` (README §3.2).
 Streaming counterpart to ``monkey_patch_extract_tool_calls_metrics.py``
 (§7.6, non-streaming). This file is §7.7. Same fail-loud import-time
 discipline as every other patch in this repo.
@@ -158,7 +158,7 @@ import inspect
 from typing import Any, Callable, TypeAlias
 
 
-_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
+_PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 _PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-streaming-metrics-v1"
 
 # Markers whose presence, as a COMPLETE substring, inside a single

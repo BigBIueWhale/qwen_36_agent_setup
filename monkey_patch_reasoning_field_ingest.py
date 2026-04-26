@@ -1,6 +1,6 @@
 """Strict, fail-loud ingest patch for the ``reasoning`` / ``reasoning_content`` split.
 
-Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
+Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce`` (README §3.2).
 Companion to ``monkey_patch_reasoning_field_egress.py`` (§7.3); this file
 is §7.4. Same fail-loud import-time discipline as every other patch in
 this repo.
@@ -118,7 +118,7 @@ import inspect
 from typing import Any
 
 
-_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
+_PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 _PATCH_TAG: str = "qwen36-agent-setup-reasoning-ingest-v1"
 
 

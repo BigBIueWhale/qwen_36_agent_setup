@@ -35,7 +35,7 @@ from typing import Any, Callable
 
 PATCH_DIR = Path("/home/user/Desktop/qwen_36_agent_setup")
 VLLM_DIR = Path("/tmp/qwen36_research/vllm")
-EXPECTED_COMMIT = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
+EXPECTED_COMMIT = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 
 # ANSI color codes for output. Only output to a tty would render these,
 # but they are harmless in plain text.

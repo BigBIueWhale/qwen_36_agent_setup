@@ -1,6 +1,6 @@
 """Strict, fail-loud runtime patch for vLLM hybrid-KV scheduler-budget bug #37121.
 
-Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2,
+Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce`` (README §3.2,
 §6.7). Mirrors upstream PR #40384 ("[Bugfix] Exclude O(1) Mamba groups from
 hybrid KV cache token capacity") semantically. Remove this file the moment
 #40384 (or the broader #37429) is present in the pinned image (README §12
@@ -162,7 +162,7 @@ import inspect
 from typing import Any
 
 
-_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
+_PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 _PATCH_TAG: str = "qwen36-agent-setup-pr40384-backport"
 
 # Source-level landmarks. Each must be present in the targeted function's

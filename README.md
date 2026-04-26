@@ -21,7 +21,7 @@ Previous target was `RedHatAI/Qwen3.6-35B-A3B-NVFP4`. New target: **`QuantTrio/Q
 |---|---|
 | Model | `QuantTrio/Qwen3.6-27B-AWQ` at revision `9b507bdc9afafb87b7898700cc2a591aa6639461` |
 | Quantization format | AWQ INT4 (gemm, group_size=128, zero_point=true), data-free calibration. Vision encoder, `linear_attn.in_proj_a/b`, all `self_attn.{q,k,v}_proj`, layer 0, embeddings, `lm_head`, MTP, norms/conv1d kept BF16 |
-| Runtime | vLLM Docker image `vllm/vllm-openai@sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c` (build `0.19.2rc1.dev21+g893611813`, commit `8936118134d0547fa1cc78adab2d03edd6d3dc48`, container CUDA 12.9, PyTorch `2.11.0+cu129`, FlashInfer `0.6.7`) |
+| Runtime | vLLM Docker image `vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba` (build `0.19.2rc1.dev212+g8cd174fa3`, commit `8cd174fa358326d5cc4195446be2ebcd65c481ce`, container CUDA 13.0.2, PyTorch `2.11.0+cu130`, FlashInfer `0.6.8.post1`, transformers `5.6.2`, pydantic `2.13.3`, image built 2026-04-26 05:19 UTC) |
 | KV cache dtype | BF16 (FP8 KV scales are not shipped with this checkpoint; rationale §5.1) |
 | `--max-model-len` | **65,536** |
 | Disk size | 20.36 GiB |
@@ -92,15 +92,18 @@ Keeping `linear_attn.in_proj_{a,b}` in BF16 is likely load-bearing for thinking-
 | Field | Value |
 |---|---|
 | Runtime | vLLM |
-| Docker image (published) | `vllm/vllm-openai:nightly-8936118134d0547fa1cc78adab2d03edd6d3dc48` |
-| Image digest (amd64) | `sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c` |
-| Underlying vLLM commit | `8936118134d0547fa1cc78adab2d03edd6d3dc48` (`0.19.2rc1.dev21+g893611813`) |
-| CUDA toolkit inside image | 12.9.86 |
-| Image PyTorch | `2.11.0+cu129` |
-| Image FlashInfer | `0.6.7` |
-| `transformers` pinned inside image | 5.5.4 (this nightly does not exhibit the §6.6 import regression) |
+| Docker image (published) | `vllm/vllm-openai:nightly-8cd174fa358326d5cc4195446be2ebcd65c481ce` |
+| Image digest (amd64) | `sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba` |
+| Underlying vLLM commit | `8cd174fa358326d5cc4195446be2ebcd65c481ce` (`0.19.2rc1.dev212+g8cd174fa3`) |
+| Image build timestamp | 2026-04-26 05:19:53 UTC |
+| CUDA toolkit inside image | 13.0.2 |
+| Image PyTorch | `2.11.0+cu130` |
+| Image FlashInfer | `0.6.8.post1` |
+| `transformers` pinned inside image | `5.6.2` (no §6.6 import regression — root cause PR #40331 was reverted in `3975eb6de6`) |
+| `pydantic` pinned inside image | `2.13.3` (matches the version the §7.3 egress patch's mechanism was empirically validated against) |
+| `prometheus_client` pinned inside image | `0.24.1` (required by §7.6 / §7.7) |
 
-This is **yesterday's** nightly relative to the original deployment date. The most recent nightly on 2026-04-21 (`nightly-b47840019e61a3983c8144066a99c843d177947d`) ships a broken `transformers==5.5.4` import that blocks `vllm serve` at boot — see §6.6. Image digest is volatile; nightly tags may be re-pushed in place, so we pin by digest.
+This image's underlying commit is the `:nightly` tag pointer at the moment of pinning; vLLM's CI publishes a commit-tagged variant for every nightly build, so `nightly-<commit>` is digest-pinnable. The amd64 digest above is what `:nightly` resolved to on 2026-04-26; nightly tags can be re-pushed in place, so we pin by digest. Master HEAD when this pin was selected was `32e45636e3` (3 commits ahead, all in `vllm/compilation/`, `vllm/distributed/`, and `vllm/v1/worker/utils.py` — no patched surface touched). The §6.6 boot-import regression that blocked the 2026-04-21 nightly `b47840019e…` was reverted upstream in commit `3975eb6de6` (PR #40438) and is not present in this image.
 
 ### 3.3 Client
 
@@ -254,9 +257,9 @@ The `qwen3_coder` tool parser has 8 non-streaming and 6 streaming code paths whe
 
 ### 6.6 `transformers==5.5.4` broken `GenerationConfig` import in latest nightly [Class C]
 
-The most recent published nightly Docker image on 2026-04-21, `vllm/vllm-openai:nightly-b47840019e61a3983c8144066a99c843d177947d` (digest `sha256:d39d4b0f…`), ships `transformers==5.5.4`. The statement `from transformers import GenerationConfig, PretrainedConfig` at `vllm/transformers_utils/config.py:18` raises `ImportError` at CLI boot, because `transformers._LazyModule` has not initialized the top-level `GenerationConfig` export by the time vLLM's CLI loader imports it. Downgrading `transformers` in-container to `4.57.6` lets the APIServer start, but the spawned `EngineCore` subprocess re-hits the same ImportError because of stale `sys.modules` state.
+The 2026-04-21 nightly `vllm/vllm-openai:nightly-b47840019e61a3983c8144066a99c843d177947d` (digest `sha256:d39d4b0f…`) shipped a broken boot path: the statement `from transformers import GenerationConfig, PretrainedConfig` at `vllm/transformers_utils/config.py:18` raised `ImportError` at CLI boot because `transformers._LazyModule` had not initialized the top-level `GenerationConfig` export by the time vLLM's CLI loader imported it. The root cause was vLLM PR #40331 ("Parallelize torch/transformers import + weight prefetch + forkserver prewarm", commit `8256833fe6`, 2026-04-20), which restructured CLI startup such that `_LazyModule` saw a partial transformers state.
 
-**Affects us**: avoided by pinning yesterday's nightly. **Resolution**: pin the older nightly digest. Re-evaluate when a new nightly tests clean with `docker run --rm vllm/vllm-openai@<digest> vllm --help`.
+**Affects us**: no longer. **Status**: closed upstream by commit `3975eb6de6` (PR #40438, 2026-04-21), which reverted #40331. The currently-pinned image (built 2026-04-26 05:19 UTC, 5 days past the revert) is on the lazy-imports path again — `vllm/entrypoints/cli/main.py:1-30` is back to deferred imports inside `main()`.
 
 ### 6.7 Issue #37121 — hybrid-KV scheduler/log under-reports concurrent capacity [Class D — observability bug]
 
@@ -336,9 +339,9 @@ The Pydantic-schema patch (egress) adds a behavioural verification — construct
 ### 8.1 Fetch and pin the Docker image digest
 
 ```bash
-docker pull vllm/vllm-openai@sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c
+docker pull vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba
 
-docker inspect vllm/vllm-openai@sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c \
+docker inspect vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
   --format '{{.Id}} {{.Architecture}}'
 ```
 
@@ -361,7 +364,7 @@ docker run --rm -d --name qwen36 --gpus all \
   -e VLLM_USE_V1=1 \
   -e PYTHONPATH=/opt/patches \
   --entrypoint python \
-  vllm/vllm-openai@sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c \
+  vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
   /opt/patches/launch.py serve \
   --model QuantTrio/Qwen3.6-27B-AWQ \
   --revision 9b507bdc9afafb87b7898700cc2a591aa6639461 \
@@ -462,13 +465,7 @@ The 27B-AWQ deployment booted and served a 210-prompt corpus on 2026-04-25 (Hebr
 
 Fix scope: add `serialize_by_alias = True` to `ChatCompletionResponseChoice` and `ChatCompletionStreamResponse` (and any other wrapper that contains `ChatMessage` or `DeltaMessage`); audit the pinned commit for any other wrapper classes; extend the patch's verification phase (currently only constructs a standalone `ChatMessage` and asserts `model_dump()['reasoning_content']` is set) to construct a full nested response and assert the same property end-to-end. Estimated time: ~30–60 min including verifier extension. The bug is currently masked by Qwen Code CLI's `reasoning_content ?? reasoning` fallback, but any strict OpenAI-spec client (including official Python SDK in some configurations) sees the wrong field name.
 
-**A2 — Decide on `monkey_patch_qwen3_coder.py` (currently disabled).** The launcher's test variant `launch_no_p1.py` disables this patch because the upstream `Qwen3CoderToolParser._parse_xml_function_call` signature drifted between the version the patch targeted and the version in our pinned image (`vllm/vllm-openai@sha256:baaf5fc76b…`). The patch's import-time landmark check refuses on signature mismatch. Three options:
-
-1. **Verify upstream silently fixed #39771 in our pinned image.** Read `vllm/tool_parsers/qwen3coder_tool_parser.py:_parse_xml_function_call` at the pinned commit. If the unsafe `str.index(">")` was replaced with `str.find(">")`/sentinel handling (PR #39772 semantics), the patch is unnecessary and should be deleted from the launcher's `_PATCH_MODULES`.
-2. **Rewrite the patch for the new signature.** If the bug is still present at our pinned image but the surrounding API shape changed, update the landmark set and method signature in the patch, re-test against the new shape.
-3. **Leave disabled** with a documented rationale — accept the residual silent-failure rate when generation truncates mid-`<parameter=NAME` (worst case: all tool calls in the affected response are silently dropped). Acceptable only if `max_tokens=16384` truly prevents truncation in practice on this model — which we have not measured.
-
-Option 1 is the cheapest first step. Estimated time: ~15 min to read the source and decide.
+**A2 — RESOLVED (2026-04-26 audit).** A prior README revision suspected `monkey_patch_qwen3_coder.py` was disabled in a `launch_no_p1.py` variant. That variant does not exist as a launcher in this repo — `launch_no_p1.py` is an empty root-owned directory leftover from a discarded experiment. The active `launch_with_patches.py:560` imports patch 1 normally, and `tests/test_patches_against_master.py` confirms the buggy `match_text.index(">")` landmark is byte-identical at the pinned commit (`qwen3coder_tool_parser.py:236`), so the patch installs cleanly. PR #39772 has not landed upstream.
 
 ### 11.2 Validation gaps for the 27B-AWQ deployment
 

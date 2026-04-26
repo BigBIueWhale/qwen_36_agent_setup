@@ -78,10 +78,10 @@ is identical to the existing command)::
       -e VLLM_USE_V1=1 \\
       -e PYTHONPATH=/opt/patches \\
       --entrypoint python \\
-      vllm/vllm-openai@sha256:baaf5fc76b2f203f17bd1934d9c26740b00e67a2f9b030922cf3aac880c7ba8c \\
+      vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \\
       /opt/patches/launch.py serve \\
-      --model RedHatAI/Qwen3.6-35B-A3B-NVFP4 \\
-      --revision e850c696e6d75f965367e816c16bc7dacd955ffa \\
+      --model QuantTrio/Qwen3.6-27B-AWQ \\
+      --revision 9b507bdc9afafb87b7898700cc2a591aa6639461 \\
       ...  # remaining --served-model-name / --host / ... flags unchanged
 
 Two structural changes from the pre-launcher docker command:

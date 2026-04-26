@@ -1,6 +1,6 @@
 """Strict, fail-loud runtime patch for vLLM tool-parser bug #39771.
 
-Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
+Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce`` (README §3.2).
 Mirrors upstream PR #39772 semantically.
 Remove this file the moment #39772 is present in the pinned nightly
 (README §11 step 3).
@@ -114,7 +114,7 @@ import json
 from typing import Any, Callable, TypeAlias
 
 
-_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
+_PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 _BUGGY_SENTINEL: str = 'match_text.index(">")'
 _EXPECTED_REGEX_ATTR: str = "tool_call_parameter_regex"
 _UPSTREAM_REGEX_LANDMARK: str = "<parameter=(.*?)(?:</parameter>"

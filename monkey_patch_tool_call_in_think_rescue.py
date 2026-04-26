@@ -1,7 +1,7 @@
 """Strict, fail-loud runtime patch: rescue ``<tool_call>`` blocks emitted
 inside ``<think>`` for the Qwen3.6 reasoning parser.
 
-Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
+Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce`` (README §3.2).
 
 NOTE on PR #35687 (commit ``92762edc53``, merged 2026-04-23, present in
 master): upstream's ``Qwen3ReasoningParser`` now treats ``<tool_call>`` as
@@ -213,7 +213,7 @@ from collections.abc import Sequence
 from typing import Any, Callable, TypeAlias
 
 
-_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
+_PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 _PATCH_TAG: str = "qwen36-agent-setup-tool-call-in-think-rescue-v1"
 
 # The literal markers we rescue. Kept as module-level constants so the
