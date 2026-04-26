@@ -63,9 +63,10 @@ the env line, and the entrypoint override change — every other flag
 is identical to the existing command)::
 
     docker run --rm -d --name qwen36 --gpus all \\
+      --network host \\
       --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
-      -p 8000:8000 \\
       -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\
+      -v "$PWD/sitecustomize.py:/opt/patches/sitecustomize.py:ro" \\
       -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \\
       -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \\
       -v "$PWD/monkey_patch_extract_tool_calls_metrics.py:/opt/patches/monkey_patch_extract_tool_calls_metrics.py:ro" \\
@@ -77,23 +78,42 @@ is identical to the existing command)::
       -e HF_HUB_ENABLE_HF_TRANSFER=1 \\
       -e VLLM_USE_V1=1 \\
       -e PYTHONPATH=/opt/patches \\
-      --entrypoint python \\
+      --entrypoint python3 \\
       vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \\
       /opt/patches/launch.py serve \\
       --model QuantTrio/Qwen3.6-27B-AWQ \\
       --revision 9b507bdc9afafb87b7898700cc2a591aa6639461 \\
-      ...  # remaining --served-model-name / --host / ... flags unchanged
+      --host 127.0.0.1 \\
+      ...  # remaining --port / --served-model-name / ... flags unchanged
 
-Two structural changes from the pre-launcher docker command:
+Three structural changes from the pre-launcher docker command:
 
 * Each patch module is bind-mounted into ``/opt/patches/`` by its
   real filename so ``import monkey_patch_<n>`` resolves under
   ``PYTHONPATH=/opt/patches``. Do NOT rename them in the bind-mount.
+* ``sitecustomize.py`` is bind-mounted at the same location. CPython's
+  ``site.py`` auto-imports ``sitecustomize`` from ``sys.path`` at
+  every interpreter startup, including the spawned EngineCore
+  subprocess. This is load-bearing for ``monkey_patch_hybrid_kv_allocator``
+  (patch 2), whose target functions are called only by EngineCore;
+  without sitecustomize, patch 2's launcher install in PID 1 has no
+  effect on EngineCore and the boot-log "GPU KV cache size" line
+  shows the unpatched (~4× under-counted) value. See
+  ``sitecustomize.py``'s docstring for the full rationale.
 * ``PYTHONSTARTUP`` is dropped entirely. The ``PYTHONPATH``
-  prepend and the ``--entrypoint python /opt/patches/launch.py``
+  prepend and the ``--entrypoint python3 /opt/patches/launch.py``
   override replace it. (CPython only honors ``PYTHONSTARTUP`` in
   interactive mode; the container's non-interactive entrypoint
   never reads it. That is this launcher's reason for existing.)
+* ``--network host`` plus ``--host 127.0.0.1`` binds vLLM to the
+  host's loopback interface only. The previous ``-p 8000:8000`` shape
+  defaults to ``0.0.0.0:8000`` on the host side, which on a
+  publicly-routable IPv4 host with no firewall would expose the
+  /v1/* endpoints (and the /metrics endpoint) to the internet. The
+  loopback-only binding is the safe default; deployments that want
+  remote access should add an authenticating reverse proxy (nginx,
+  Caddy, ingress) bound to a controlled interface, NOT bind vLLM
+  itself to a public IP.
 
 Adding a new server-side patch
 ------------------------------

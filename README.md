@@ -36,7 +36,7 @@ Previous target was `RedHatAI/Qwen3.6-35B-A3B-NVFP4`. New target: **`QuantTrio/Q
 
 ## 1. What this project is
 
-A production deployment of **`QuantTrio/Qwen3.6-27B-AWQ`** (a 27-billion-parameter dense vision-language model from Alibaba, AWQ INT4 quantized) served via **vLLM** behind an OpenAI-compatible HTTP API at `http://localhost:8000/v1/chat/completions`, intended for agentic coding via the Qwen Code CLI on a single RTX 5090.
+A production deployment of **`QuantTrio/Qwen3.6-27B-AWQ`** (a 27-billion-parameter dense vision-language model from Alibaba, AWQ INT4 quantized) served via **vLLM** behind an OpenAI-compatible HTTP API at `http://127.0.0.1:8000/v1/chat/completions`, intended for agentic coding via the Qwen Code CLI on a single RTX 5090.
 
 Five non-negotiable correctness requirements:
 
@@ -349,9 +349,10 @@ docker inspect vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29
 
 ```bash
 docker run --rm -d --name qwen36 --gpus all \
+  --network host \
   --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
-  -p 8000:8000 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$PWD/sitecustomize.py:/opt/patches/sitecustomize.py:ro" \
   -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \
   -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \
   -v "$PWD/monkey_patch_reasoning_field_egress.py:/opt/patches/monkey_patch_reasoning_field_egress.py:ro" \
@@ -363,13 +364,13 @@ docker run --rm -d --name qwen36 --gpus all \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
   -e VLLM_USE_V1=1 \
   -e PYTHONPATH=/opt/patches \
-  --entrypoint python \
+  --entrypoint python3 \
   vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
   /opt/patches/launch.py serve \
   --model QuantTrio/Qwen3.6-27B-AWQ \
   --revision 9b507bdc9afafb87b7898700cc2a591aa6639461 \
   --served-model-name Qwen3.6-27B-AWQ \
-  --host 0.0.0.0 --port 8000 \
+  --host 127.0.0.1 --port 8000 \
   --max-model-len 65536 \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 4 \
@@ -387,18 +388,20 @@ Each flag's rationale lives in §5. Load-bearing items:
 - `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` — tool calling.
 - `--reasoning-parser qwen3` — server-side `<think>` extraction.
 - `--default-chat-template-kwargs '{"preserve_thinking": true}'` — preserves thinking across turns (§5.7).
+- `--host 127.0.0.1` — loopback-only binding. Combined with `--network host` (which removes Docker's port-forwarding indirection), vLLM listens only on the host's loopback interface. Do **not** change to `--host 0.0.0.0` on a publicly-routable host without an authenticating reverse proxy in front — vLLM has no built-in auth and the /v1/* and /metrics endpoints would be world-accessible.
+- `sitecustomize.py` bind-mount — load-bearing for patch 2 (`monkey_patch_hybrid_kv_allocator`). vLLM v1 spawns its EngineCore as a fresh Python interpreter (CUDA forbids `fork` after init); without sitecustomize, patch 2's launcher install in PID 1 has no effect on EngineCore, and the boot-log "GPU KV cache size" line shows the unpatched (~4× under-counted) value. See `sitecustomize.py`'s docstring for the full rationale and `tier3_enginecore_install_audit.py` for the strict assertion.
 
 ### 8.3 Smoke tests
 
 **Liveness**:
 ```bash
-curl -fs http://localhost:8000/health
+curl -fs http://127.0.0.1:8000/health
 # expects: HTTP 200, empty body
 ```
 
 **Chat with thinking and tool schema**:
 ```bash
-curl -s http://localhost:8000/v1/chat/completions \
+curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "Qwen3.6-27B-AWQ",
