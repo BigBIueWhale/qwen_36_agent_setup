@@ -394,80 +394,198 @@ def _verify_extract_tool_calls_streaming_metrics(patch_module: ModuleType) -> No
 
 
 def _verify_reasoning_field_egress(patch_module: ModuleType) -> None:
-    """Verify ``monkey_patch_reasoning_field_egress`` applied the
-    Pydantic serialization alias on both target classes.
+    """Verify ``monkey_patch_reasoning_field_egress`` applied the alias
+    end-to-end across every dump path vLLM actually serialises.
 
-    The verifier does two things, both independent of the patch's own
-    post-install checks:
+    Independent of the patch's own post-install checks. Three layers of
+    verification, each catching a regression class the others would miss:
 
-    1. Re-imports ``ChatMessage`` and ``DeltaMessage`` from vLLM and
-       confirms each carries the class-level ``__qwen36_egress_patch__``
-       tag (stamped by the patch) via both ``getattr`` and
-       ``inspect.getattr_static``.
-    2. Constructs a throwaway instance of each class and asserts that
-       ``model_dump()`` emits the alias ``reasoning_content`` and does
-       NOT emit the bare ``reasoning`` key. This is a behavioural check
-       that catches a "patch tag present but serializer rebuild did
-       not take effect" regression that a tag-only check would miss.
+    1. **Tag presence on every target class.** The patch stamps
+       ``__qwen36_egress_patch__`` on six classes:
+
+       * ``ChatMessage``, ``DeltaMessage`` (leaves)
+       * ``ChatCompletionResponseChoice``, ``ChatCompletionResponseStreamChoice``
+       * ``ChatCompletionResponse``, ``ChatCompletionStreamResponse``
+
+       Each must resolve via both ``getattr`` and
+       ``inspect.getattr_static`` (defending against metaclass
+       ``__getattribute__`` overrides).
+
+    2. **Standalone leaf dump.** Constructs ``ChatMessage`` and
+       ``DeltaMessage`` instances directly and asserts ``model_dump()``
+       emits ``"reasoning_content"`` and not ``"reasoning"``. This was
+       the only check v1's verifier ran; it passes even when the
+       wrapper-rebuild step is missing, which is why v1's patch
+       silently failed in production despite v1's verifier reporting
+       success.
+
+    3. **Nested wire dump.** Constructs a real
+       ``ChatCompletionResponse`` (the non-streaming wire shape from
+       ``api_router.py:70``) and a real ``ChatCompletionStreamResponse``
+       (the streaming wire shape from
+       ``serving.py:685/721/1208/1233``), serialises each via the
+       exact API call vLLM uses (``model_dump_json()`` for
+       non-streaming, ``model_dump_json(exclude_unset=True)`` for
+       streaming), and substring-checks the wire bytes for
+       ``"reasoning_content":"<probe>"`` presence and
+       ``"reasoning":`` absence. THIS IS THE LOAD-BEARING CHECK
+       v1's verifier missed.
     """
     expected_tag = _expected_tag_from(patch_module)
     try:
-        from vllm.entrypoints.openai.chat_completion.protocol import ChatMessage
-        from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionResponse,
+            ChatCompletionResponseChoice,
+            ChatCompletionResponseStreamChoice,
+            ChatCompletionStreamResponse,
+            ChatMessage,
+        )
+        from vllm.entrypoints.openai.engine.protocol import (
+            DeltaMessage,
+            UsageInfo,
+        )
     except ImportError as exc:
         raise PatchVerificationError(
-            f"[{_LAUNCHER_TAG}] cannot import ChatMessage / DeltaMessage "
+            f"[{_LAUNCHER_TAG}] cannot import egress patch's six target "
+            f"classes (ChatMessage, DeltaMessage, "
+            f"ChatCompletionResponseChoice, "
+            f"ChatCompletionResponseStreamChoice, "
+            f"ChatCompletionResponse, ChatCompletionStreamResponse) "
             f"for verification: {exc!r}"
         ) from exc
 
     _probe_value = "__qwen36_launcher_egress_probe__"
-    for target_cls, target_name in (
-        (ChatMessage, "vllm.entrypoints.openai.chat_completion.protocol.ChatMessage"),
-        (DeltaMessage, "vllm.entrypoints.openai.engine.protocol.DeltaMessage"),
-    ):
-        # Tag check (class-level sentinel the patch stamped in Phase 4).
+
+    # --- Layer 1: tag presence on every target class.
+    targets_with_names: tuple[tuple[type, str], ...] = (
+        (ChatMessage, "ChatMessage"),
+        (DeltaMessage, "DeltaMessage"),
+        (ChatCompletionResponseChoice, "ChatCompletionResponseChoice"),
+        (
+            ChatCompletionResponseStreamChoice,
+            "ChatCompletionResponseStreamChoice",
+        ),
+        (ChatCompletionResponse, "ChatCompletionResponse"),
+        (ChatCompletionStreamResponse, "ChatCompletionStreamResponse"),
+    )
+    for target_cls, target_name in targets_with_names:
         dynamic = getattr(target_cls, "__qwen36_egress_patch__", None)
         if dynamic != expected_tag:
             raise PatchVerificationError(
-                f"[{_LAUNCHER_TAG}] post-install verification failed for "
-                f"{patch_module.__name__!r}: {target_name} carries "
-                f"__qwen36_egress_patch__={dynamic!r}, expected "
-                f"{expected_tag!r}."
+                f"[{_LAUNCHER_TAG}] post-install tag verification "
+                f"failed for {patch_module.__name__!r}: {target_name} "
+                f"carries __qwen36_egress_patch__={dynamic!r}, expected "
+                f"{expected_tag!r}. The egress patch did not stamp this "
+                f"target — check that {target_name} is in its target list."
             )
-        static = inspect.getattr_static(target_cls, "__qwen36_egress_patch__", None)
+        static = inspect.getattr_static(
+            target_cls, "__qwen36_egress_patch__", None
+        )
         if static != expected_tag:
             raise PatchVerificationError(
-                f"[{_LAUNCHER_TAG}] static-lookup verification failed "
-                f"for {patch_module.__name__!r}: "
+                f"[{_LAUNCHER_TAG}] static-lookup tag verification "
+                f"failed for {patch_module.__name__!r}: "
                 f"inspect.getattr_static({target_name}, "
                 f"'__qwen36_egress_patch__')={static!r}, expected "
-                f"{expected_tag!r}."
+                f"{expected_tag!r}. Normal attribute lookup and static "
+                f"lookup disagree — a metaclass-level shim is shadowing "
+                f"the install."
             )
 
-        # Behavioural check — the rename must actually take effect.
-        # This catches the class of regressions where the tag was
-        # stamped but the Pydantic schema was not regenerated.
-        if "role" in target_cls.model_fields and target_cls.model_fields[
+    # --- Layer 2: standalone leaf dump (the v1-style check, kept).
+    for leaf_cls, leaf_name in (
+        (ChatMessage, "ChatMessage"),
+        (DeltaMessage, "DeltaMessage"),
+    ):
+        if "role" in leaf_cls.model_fields and leaf_cls.model_fields[
             "role"
         ].is_required():
-            instance = target_cls(role="assistant", reasoning=_probe_value)
+            instance = leaf_cls(role="assistant", reasoning=_probe_value)
         else:
-            instance = target_cls(reasoning=_probe_value)
+            instance = leaf_cls(reasoning=_probe_value)
         dumped = instance.model_dump()
         if dumped.get("reasoning_content") != _probe_value:
             raise PatchVerificationError(
-                f"[{_LAUNCHER_TAG}] egress rename verification failed "
-                f"for {target_name}: model_dump()['reasoning_content'] "
-                f"is {dumped.get('reasoning_content')!r}, expected the "
-                f"probe value. Full dump: {dumped!r}"
+                f"[{_LAUNCHER_TAG}] standalone-leaf egress verification "
+                f"failed for {leaf_name}: model_dump()['reasoning_content']"
+                f"={dumped.get('reasoning_content')!r}, expected probe. "
+                f"Full dump: {dumped!r}"
             )
         if "reasoning" in dumped:
             raise PatchVerificationError(
-                f"[{_LAUNCHER_TAG}] egress rename verification failed "
-                f"for {target_name}: model_dump() still contains the "
-                f"bare 'reasoning' key; the alias and the unaliased "
+                f"[{_LAUNCHER_TAG}] standalone-leaf egress verification "
+                f"failed for {leaf_name}: model_dump() still contains "
+                f"the bare 'reasoning' key; the alias and the unaliased "
                 f"name are being emitted together. Full dump: {dumped!r}"
             )
+
+    # --- Layer 3: nested wire-shape dump. This is the load-bearing
+    # addition — the production wire path is not the leaf, it is the
+    # wrapper, and v1's verifier never tested the wrapper.
+    nested_response = ChatCompletionResponse(
+        id="probe-id",
+        model="probe-model",
+        usage=UsageInfo(
+            prompt_tokens=0,
+            total_tokens=0,
+            completion_tokens=0,
+        ),
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(
+                    role="assistant",
+                    reasoning=_probe_value,
+                ),
+            ),
+        ],
+    )
+    nested_wire = nested_response.model_dump_json()
+    expected_nested_substr = f'"reasoning_content":"{_probe_value}"'
+    if expected_nested_substr not in nested_wire:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] nested-egress verification failed for "
+            f"ChatCompletionResponse: wire JSON does not contain "
+            f"{expected_nested_substr!r}. This is the production "
+            f"non-streaming wire path (api_router.py:70) — clients "
+            f"would silently lose reasoning. Full wire: {nested_wire!r}"
+        )
+    if '"reasoning":' in nested_wire:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] nested-egress verification failed for "
+            f"ChatCompletionResponse: wire JSON still contains the "
+            f'bare "reasoning": key. Full wire: {nested_wire!r}'
+        )
+
+    nested_stream = ChatCompletionStreamResponse(
+        id="probe-id",
+        model="probe-model",
+        choices=[
+            ChatCompletionResponseStreamChoice(
+                index=0,
+                delta=DeltaMessage(reasoning=_probe_value),
+            ),
+        ],
+    )
+    # serving.py:685/721/1208/1233 all use exclude_unset=True.
+    nested_stream_wire = nested_stream.model_dump_json(exclude_unset=True)
+    if expected_nested_substr not in nested_stream_wire:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] nested-egress verification failed for "
+            f"ChatCompletionStreamResponse: wire JSON does not "
+            f"contain {expected_nested_substr!r}. This is the "
+            f"production streaming wire path "
+            f"(serving.py:685/721/1208/1233) — streaming clients "
+            f"would silently lose reasoning per chunk. Full wire: "
+            f"{nested_stream_wire!r}"
+        )
+    if '"reasoning":' in nested_stream_wire:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] nested-egress verification failed for "
+            f"ChatCompletionStreamResponse: wire JSON still contains "
+            f'the bare "reasoning": key. Full wire: '
+            f"{nested_stream_wire!r}"
+        )
 
 
 def _verify_reasoning_field_ingest(patch_module: ModuleType) -> None:

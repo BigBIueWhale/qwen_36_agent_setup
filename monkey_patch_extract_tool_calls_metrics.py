@@ -1,6 +1,6 @@
 """Server-side observability patch for vLLM ``qwen3_coder`` silent tool-parser failures.
 
-Target: vLLM commit ``8936118134d0547fa1cc78adab2d03edd6d3dc48`` (README §3.2).
+Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
 Companion to (not replacement for) ``client/validate_response.py`` (patch 3).
 Same fail-loud import-time discipline as ``monkey_patch_qwen3_coder.py`` (patch 4).
 
@@ -71,25 +71,38 @@ This file is a patch, not a library. At import it:
    ``tools_called=False`` and ``content=model_output`` — is present.
    Confirms our model of the function and refuses to wrap a
    contract-changed function blindly.
-6. Optionally validates ``prometheus_client``. **Degradation is
-   acceptable here**: this patch is observation-only and not safety-
-   critical. If ``prometheus_client`` is unavailable the wrapper
-   installs anyway and fires only the structured log line; a single
-   INFO line names that fact at install time so the operator is not
-   surprised.
+6. Imports ``prometheus_client.Counter`` and registers the counter.
+   Both are HARD requirements — refuse loudly on either:
+
+   * ``ImportError`` from ``prometheus_client`` → refuse. The patch's
+     entire purpose is to surface silent tool-parser failures via
+     Prometheus; a logs-only fallback would silently degrade exactly
+     the visibility this patch was written to provide. ``vLLM``'s
+     ``requirements/common.txt`` pins ``prometheus_client >= 0.18.0``,
+     so missing this dependency means the deployment image is
+     misconfigured — operator must know.
+   * ``ValueError`` from ``Counter(name=…)`` (metric already
+     registered) → refuse. Patch 6 is the FIRST registrant
+     (``_PATCH_MODULES`` order in the launcher); a collision means
+     patch 6 was imported twice OR another module registered our
+     metric name OR the registry is in an inconsistent state. Each
+     case is unexpected and demands operator attention.
+
 7. Installs the wrapper, tags it with ``__qwen36_patch__``, and
    verifies both ``getattr`` and ``inspect.getattr_static`` resolve
    to the wrapped function bearing the tag.
 8. Logs a single INFO line via ``vllm.logger.init_logger`` naming the
-   class, the wrapped method, the Prometheus counter status
-   (``active`` / ``unavailable``), and the pinned commit.
+   class, the wrapped method, the Prometheus counter name, and the
+   pinned commit.
 
-Any of 1-5 or 7 failing raises :class:`MetricsPatchRefusedError` and
-the interpreter does not continue. There is **no** ``SystemExit(0)``
-or ``try/except Exception: pass`` on any install path. The single
-exception is the per-call instrumentation block inside the wrapper —
-documented at its site — which catches ``Exception`` so that a fault
-in observability never takes down a real request.
+Any of 1-7 failing raises :class:`MetricsPatchRefusedError` and the
+interpreter does not continue. There is **no** ``SystemExit(0)``,
+``try/except Exception: pass``, fallback to logs-only, or any other
+silent-degradation path on any install path. The single exception is
+the per-call instrumentation block inside the wrapper — documented at
+its site — which catches ``Exception`` and logs at **WARNING** (not
+DEBUG) so an instrumentation regression at request time is visible to
+the operator without crashing the request.
 
 Critical correctness invariants
 -------------------------------
@@ -119,7 +132,7 @@ import inspect
 from typing import Any, Callable, TypeAlias
 
 
-_PINNED_VLLM_COMMIT: str = "8936118134d0547fa1cc78adab2d03edd6d3dc48"
+_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
 _PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-metrics-v1"
 
 # Markers whose presence in ``model_output`` constitutes a markup
@@ -270,8 +283,14 @@ for _landmark in _SILENT_FAILURE_LANDMARKS:
 
 
 # --------------------------------------------------------------------
-# Phase 5: Optional Prometheus counter. Degrades cleanly if absent.
+# Phase 5: Prometheus counter — REQUIRED. No silent fallback.
 # --------------------------------------------------------------------
+#
+# The patch's entire reason for existing is server-side observability
+# of qwen3_coder silent tool-parser failures. A logs-only degradation
+# would silently undercut that purpose for an operator who scrapes the
+# Prometheus endpoint. Both an ImportError on prometheus_client and a
+# ValueError on registration (collision) are refused loudly.
 
 _COUNTER_NAME: str = "vllm_qwen3_coder_silent_tool_call_failures_total"
 _COUNTER_DESCRIPTION: str = (
@@ -281,43 +300,49 @@ _COUNTER_DESCRIPTION: str = (
 )
 _COUNTER_LABELS: tuple[str, ...] = ("failure_kind", "model")
 
-_silent_failure_counter: Any | None
 try:
     from prometheus_client import Counter as _PromCounter
-except ImportError:
-    _silent_failure_counter = None
-    _prometheus_status: str = "unavailable"
-    _logger.info(
-        "[%s] prometheus_client not importable; the wrapper will "
-        "install and emit structured log lines only. Counter %s "
-        "will not be exposed.",
-        _PATCH_TAG,
+except ImportError as _exc:
+    raise MetricsPatchRefusedError(
+        f"[{_PATCH_TAG}] prometheus_client is not importable "
+        f"({_exc!r}). vLLM's requirements/common.txt pins "
+        f"prometheus_client >= 0.18.0, so this should not happen in a "
+        f"vllm/vllm-openai container. The patch's entire purpose is to "
+        f"expose silent tool-parser failures as a Prometheus counter; "
+        f"there is no acceptable logs-only degradation. Refusing."
+    ) from _exc
+
+try:
+    _silent_failure_counter: Any = _PromCounter(
         _COUNTER_NAME,
+        _COUNTER_DESCRIPTION,
+        labelnames=_COUNTER_LABELS,
     )
-else:
-    try:
-        _silent_failure_counter = _PromCounter(
-            _COUNTER_NAME,
-            _COUNTER_DESCRIPTION,
-            labelnames=_COUNTER_LABELS,
-        )
-        _prometheus_status = "active"
-    except ValueError as _exc:
-        # Counter already registered — most likely this module was
-        # imported twice, or another patch beat us to the name. The
-        # observation surface still works (the existing counter is
-        # presumably ours from a prior import), but we cannot use it
-        # without a handle. Fall back to logs only and name the cause.
-        _silent_failure_counter = None
-        _prometheus_status = "unavailable"
-        _logger.info(
-            "[%s] could not register Prometheus counter %s "
-            "(likely already registered): %r. Falling back to "
-            "structured-log-only observability.",
-            _PATCH_TAG,
-            _COUNTER_NAME,
-            _exc,
-        )
+except ValueError as _exc:
+    # Counter name already registered. Patch 6 is the FIRST registrant
+    # in launch_with_patches.py:_PATCH_MODULES order; a collision here
+    # means either (a) this module was imported twice (deployment
+    # misconfiguration), (b) another piece of code registered our exact
+    # metric name (collision with a future vLLM release that adds the
+    # same metric — see README §12 trigger 9), or (c) the registry is
+    # in an inconsistent state. None of these are acceptable silent
+    # degradations.
+    raise MetricsPatchRefusedError(
+        f"[{_PATCH_TAG}] could not register Prometheus counter "
+        f"{_COUNTER_NAME!r} ({_exc!r}). This patch is the first "
+        f"registrant of this metric name; a collision means the patch "
+        f"was imported twice, another component registered the same "
+        f"name, or the registry is corrupt. Refusing rather than "
+        f"falling back to logs-only — the operator must investigate."
+    ) from _exc
+
+_logger.info(
+    "[%s] registered Prometheus counter %s (first registrant); "
+    "labelnames=%r.",
+    _PATCH_TAG,
+    _COUNTER_NAME,
+    _COUNTER_LABELS,
+)
 
 
 # --------------------------------------------------------------------
@@ -376,9 +401,11 @@ def extract_tool_calls_observed(
     counter registration, a logging formatter regression, an
     unexpected ``request`` shape (e.g. with no ``model``) — none of
     these may be allowed to convert a successful response into a 500.
-    The cost of this concession is local to instrumentation; the real
-    parser exceptions are unaffected because the call to ``_original``
-    is outside the guard.
+    The exception is logged at **WARNING** level (visible by default,
+    not DEBUG) so an instrumentation regression at request time
+    surfaces to the operator immediately. The cost of this concession
+    is local to instrumentation; the real parser exceptions are
+    unaffected because the call to ``_original`` is outside the guard.
     """
     result = _original(self, model_output, request)  # type: ignore[misc]
 
@@ -388,11 +415,10 @@ def extract_tool_calls_observed(
             marker_count = _count_markers(model_output)
             model_label = getattr(request, "model", None) or "unknown"
 
-            if _silent_failure_counter is not None:
-                _silent_failure_counter.labels(
-                    failure_kind="markup_leak",
-                    model=model_label,
-                ).inc()
+            _silent_failure_counter.labels(
+                failure_kind="markup_leak",
+                model=model_label,
+            ).inc()
 
             # Stable, greppable, ELK-friendly format. Keys without
             # quotes; values numeric or simple strings; one line.
@@ -404,14 +430,18 @@ def extract_tool_calls_observed(
                 model_label,
             )
     except Exception as _exc:  # noqa: BLE001 — see docstring
-        # Last-resort safety net. We log at DEBUG (not WARNING) to
-        # avoid log-storm amplification if the failure is in the
-        # logger itself; the surrounding except will catch a logger
-        # exception too.
+        # Last-resort safety net. WARNING (not DEBUG) so the operator
+        # sees instrumentation regressions immediately. The inner
+        # try/except guards against the logger itself being broken;
+        # if logging fails too there is nowhere to report from, and
+        # we silently drop only that single exception report — never
+        # the underlying request, which has already been served.
         try:
-            _logger.debug(
-                "[%s] instrumentation suppressed exception: %r",
+            _logger.warning(
+                "[%s] instrumentation raised %s during markup-leak "
+                "observation: %r",
                 _PATCH_TAG,
+                type(_exc).__name__,
                 _exc,
             )
         except Exception:  # noqa: BLE001
@@ -458,12 +488,11 @@ _require(
 
 _logger.info(
     "[%s] applied: wrapped %s.%s for vLLM commit %s "
-    "(observation-only; prometheus=%s; counter=%s; "
+    "(observation-only; counter=%s; "
     "fires on tools_called=False with leaked tool-call markup).",
     _PATCH_TAG,
     _ParserCls.__module__,
     _ParserCls.__qualname__,
     _PINNED_VLLM_COMMIT,
-    _prometheus_status,
     _COUNTER_NAME,
 )

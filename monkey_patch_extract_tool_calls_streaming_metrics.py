@@ -1,6 +1,6 @@
 """Server-side observability patch for vLLM ``qwen3_coder`` silent streaming tool-parser failures.
 
-Target: vLLM commit ``8936118134d0547fa1cc78adab2d03edd6d3dc48`` (README §3.2).
+Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
 Streaming counterpart to ``monkey_patch_extract_tool_calls_metrics.py``
 (§7.6, non-streaming). This file is §7.7. Same fail-loud import-time
 discipline as every other patch in this repo.
@@ -80,26 +80,47 @@ This file is a patch, not a library. At import it:
 5. Reads the method's source and verifies the landmark
    ``return DeltaMessage(content=`` (proves the leaking emit shape
    still exists, line 416 in the pinned source) is present.
-6. Optionally validates ``prometheus_client``. Degradation is
-   acceptable: this patch is observation-only. On collision with an
-   already-registered counter (the common case — the non-streaming
-   patch beat us to registration), DISCOVER and REUSE the existing
-   collector via ``prometheus_client.REGISTRY._names_to_collectors``
-   so both patches increment the same series.
+6. Imports ``prometheus_client.Counter``. ``ImportError`` is a hard
+   refusal — same reasoning as patch 6: the deployment image must
+   ship prometheus_client.
+
+   Counter REGISTRATION expects to collide with patch 6 (the
+   non-streaming patch) which is the first registrant per the
+   launcher's ``_PATCH_MODULES`` order. The collision is the
+   designed cooperative path: this patch DISCOVERS and REUSES the
+   existing collector via
+   ``prometheus_client.REGISTRY._names_to_collectors`` so both
+   patches increment the same time series. THE DISCOVERY MUST
+   SUCCEED. If it fails, this patch refuses loudly — falling back
+   to logs-only would silently undercut the observability surface
+   the operator depends on.
+
+   Two outcomes are accepted at install:
+
+   * Counter not yet registered (this module imported standalone or
+     before patch 6) — register fresh, become the first registrant.
+   * Counter already registered (patch 6 ran first, normal path) —
+     ``ValueError`` from ``Counter(name=…)``, then look up the
+     existing collector via
+     ``REGISTRY._names_to_collectors``. Lookup MUST find it; if not,
+     refuse loudly.
+
 7. Installs the wrapper, tags it with ``__qwen36_patch__``, and
    verifies both ``getattr`` and ``inspect.getattr_static`` resolve
    to the wrapped function bearing the tag.
 8. Logs a single INFO line via ``vllm.logger.init_logger`` naming the
-   class, the wrapped method, the Prometheus counter status, and the
-   pinned commit.
+   class, the wrapped method, the Prometheus counter name, the
+   registrant status (``first`` or ``shared``), and the pinned commit.
 
-Any of 1-5 or 7 failing raises
+Any of 1-7 failing raises
 :class:`StreamingMetricsPatchRefusedError` and the interpreter does
-not continue. There is **no** ``SystemExit(0)`` or
-``try/except Exception: pass`` on any install path. The single
-exception is the per-delta instrumentation block inside the wrapper —
-documented at its site — which catches ``Exception`` so that a fault
-in observability never takes down a real request.
+not continue. There is **no** ``SystemExit(0)``,
+``try/except Exception: pass``, fallback to logs-only, or any other
+silent-degradation path on any install path. The single exception is
+the per-delta instrumentation block inside the wrapper — documented at
+its site — which catches ``Exception`` and logs at **WARNING** so a
+runtime instrumentation regression surfaces to the operator without
+crashing the request.
 
 Critical correctness invariants
 -------------------------------
@@ -137,7 +158,7 @@ import inspect
 from typing import Any, Callable, TypeAlias
 
 
-_PINNED_VLLM_COMMIT: str = "8936118134d0547fa1cc78adab2d03edd6d3dc48"
+_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
 _PATCH_TAG: str = "qwen36-agent-setup-extract-tool-calls-streaming-metrics-v1"
 
 # Markers whose presence, as a COMPLETE substring, inside a single
@@ -302,10 +323,20 @@ _require(
 
 
 # --------------------------------------------------------------------
-# Phase 5: Optional Prometheus counter. Shared with the non-streaming
-# patch; degrades cleanly if absent; reuses an existing registration on
-# collision.
+# Phase 5: Prometheus counter — REQUIRED. Shared with the non-streaming
+# patch via REGISTRY discovery on collision. No silent fallback.
 # --------------------------------------------------------------------
+#
+# Two install paths, both fully strict:
+#
+# (a) Counter not yet registered: register it fresh.
+# (b) Counter already registered (the expected path — patch 6 in the
+#     launcher's _PATCH_MODULES order is the first registrant): the
+#     ``Counter(name=…)`` call raises ValueError. We then look up the
+#     existing collector via ``REGISTRY._names_to_collectors`` so both
+#     patches increment the same series. If lookup fails, refuse —
+#     falling back to logs-only would silently undercut the
+#     observability surface this whole patch is for.
 
 _COUNTER_NAME: str = "vllm_qwen3_coder_silent_tool_call_failures_total"
 _COUNTER_DESCRIPTION: str = (
@@ -328,91 +359,80 @@ _COUNTER_LOOKUP_KEYS: tuple[str, ...] = (
     _COUNTER_NAME.removesuffix("_total"),
 )
 
-_silent_failure_counter: Any | None
 try:
     from prometheus_client import Counter as _PromCounter
     from prometheus_client import REGISTRY as _PromRegistry
-except ImportError:
-    _silent_failure_counter = None
-    _prometheus_status: str = "unavailable"
+except ImportError as _exc:
+    raise StreamingMetricsPatchRefusedError(
+        f"[{_PATCH_TAG}] prometheus_client is not importable "
+        f"({_exc!r}). vLLM's requirements/common.txt pins "
+        f"prometheus_client >= 0.18.0, so this should not happen in a "
+        f"vllm/vllm-openai container. The patch's entire purpose is to "
+        f"expose silent streaming tool-parser failures as a Prometheus "
+        f"counter; there is no acceptable logs-only degradation. "
+        f"Refusing."
+    ) from _exc
+
+_silent_failure_counter: Any
+_registrant_status: str
+try:
+    _silent_failure_counter = _PromCounter(
+        _COUNTER_NAME,
+        _COUNTER_DESCRIPTION,
+        labelnames=_COUNTER_LABELS,
+    )
+    _registrant_status = "first"
     _logger.info(
-        "[%s] prometheus_client not importable; the wrapper will "
-        "install and emit structured log lines only. Counter %s "
-        "will not be incremented by this patch.",
+        "[%s] registered Prometheus counter %s (first registrant); "
+        "labelnames=%r.",
+        _PATCH_TAG,
+        _COUNTER_NAME,
+        _COUNTER_LABELS,
+    )
+except ValueError as _register_exc:
+    # Counter already registered — the EXPECTED cooperative path. The
+    # non-streaming sibling patch
+    # (monkey_patch_extract_tool_calls_metrics.py) is the first
+    # registrant per launch_with_patches.py:_PATCH_MODULES ordering.
+    # Discover the existing collector so both patches increment the
+    # same time series with different failure_kind labels.
+    _names_to_collectors = getattr(
+        _PromRegistry, "_names_to_collectors", None
+    )
+    _require(
+        isinstance(_names_to_collectors, dict),
+        f"prometheus_client.REGISTRY._names_to_collectors is "
+        f"{type(_names_to_collectors).__name__!r}, expected dict. "
+        f"prometheus_client's internal API has changed; the cooperative "
+        f"shared-counter discovery this patch depends on no longer "
+        f"works. Original collision: {_register_exc!r}",
+    )
+    _found: Any = None
+    for _key in _COUNTER_LOOKUP_KEYS:
+        _candidate = _names_to_collectors.get(_key)
+        if _candidate is not None:
+            _found = _candidate
+            break
+    _require(
+        _found is not None,
+        f"Prometheus counter {_COUNTER_NAME!r} registration collided "
+        f"({_register_exc!r}) but no collector was recoverable via "
+        f"REGISTRY._names_to_collectors (probed keys: "
+        f"{_COUNTER_LOOKUP_KEYS!r}). The collision proves a registrant "
+        f"exists, the lookup miss proves the registry is in an "
+        f"unexpected shape — the non-streaming patch's collector is "
+        f"either gone or under a different name. Refusing to fall back "
+        f"to logs-only.",
+    )
+    _silent_failure_counter = _found
+    _registrant_status = "shared"
+    _logger.info(
+        "[%s] reused already-registered Prometheus counter %s via "
+        "REGISTRY._names_to_collectors after the expected "
+        "cooperative collision with the non-streaming patch.",
         _PATCH_TAG,
         _COUNTER_NAME,
     )
-else:
-    try:
-        _silent_failure_counter = _PromCounter(
-            _COUNTER_NAME,
-            _COUNTER_DESCRIPTION,
-            labelnames=_COUNTER_LABELS,
-        )
-        _prometheus_status = "active"
-        _logger.info(
-            "[%s] registered Prometheus counter %s "
-            "(first registrant); labelnames=%r.",
-            _PATCH_TAG,
-            _COUNTER_NAME,
-            _COUNTER_LABELS,
-        )
-    except ValueError as _exc:
-        # Counter already registered — the expected case when the
-        # non-streaming sibling patch
-        # (monkey_patch_extract_tool_calls_metrics.py) was imported
-        # first. Look up the existing collector by name so both patches
-        # increment the same time series. The lookup is explicit and
-        # load-bearing: if we cannot find the collector we registered
-        # with, we must NOT silently fabricate a second ``Counter`` or
-        # fall all the way back to logs-only, because both the operator
-        # and the non-streaming patch's dashboards expect a live
-        # counter with both ``failure_kind`` values observable.
-        #
-        # Lookup method: ``prometheus_client.REGISTRY._names_to_collectors``
-        # is the documented (though underscore-prefixed) mapping of
-        # metric-family names to collector instances used by the
-        # default registry. The mapping is keyed by the metric name
-        # WITHOUT the ``_total`` suffix that Counter appends. We probe
-        # both forms (``_COUNTER_LOOKUP_KEYS``) to tolerate version
-        # drift in prometheus_client's naming normalisation.
-        _names_to_collectors = getattr(
-            _PromRegistry, "_names_to_collectors", None
-        )
-        _found: Any | None = None
-        if isinstance(_names_to_collectors, dict):
-            for _key in _COUNTER_LOOKUP_KEYS:
-                _candidate = _names_to_collectors.get(_key)
-                if _candidate is not None:
-                    _found = _candidate
-                    break
-
-        if _found is not None:
-            _silent_failure_counter = _found
-            _prometheus_status = "active_shared"
-            _logger.info(
-                "[%s] reused already-registered Prometheus counter %s "
-                "discovered via REGISTRY._names_to_collectors after "
-                "registration collided (%r); the non-streaming patch "
-                "most likely registered it first.",
-                _PATCH_TAG,
-                _COUNTER_NAME,
-                _exc,
-            )
-        else:
-            _silent_failure_counter = None
-            _prometheus_status = "unavailable"
-            _logger.info(
-                "[%s] Prometheus counter %s registration collided "
-                "(%r) but the existing collector could not be "
-                "recovered via REGISTRY._names_to_collectors "
-                "(keys probed: %r). Falling back to structured-log-"
-                "only observability for the streaming path.",
-                _PATCH_TAG,
-                _COUNTER_NAME,
-                _exc,
-                _COUNTER_LOOKUP_KEYS,
-            )
 
 
 # --------------------------------------------------------------------
@@ -512,9 +532,11 @@ def extract_tool_calls_streaming_observed(
     counter lookup, a logging formatter regression, an unexpected
     ``request`` shape (e.g. with no ``model``) — none of these may be
     allowed to convert a successful streamed chunk into a 500. The
-    cost of this concession is local to instrumentation; the real
-    parser exceptions are unaffected because the call to ``_original``
-    is outside the guard.
+    exception is logged at **WARNING** level (visible by default, not
+    DEBUG) so an instrumentation regression at request time surfaces
+    to the operator immediately. The cost of this concession is local
+    to instrumentation; the real parser exceptions are unaffected
+    because the call to ``_original`` is outside the guard.
     """
     result = _original(  # type: ignore[misc]
         self,
@@ -535,11 +557,10 @@ def extract_tool_calls_streaming_observed(
             marker_count = _count_markers(content)
             model_label = getattr(request, "model", None) or "unknown"
 
-            if _silent_failure_counter is not None:
-                _silent_failure_counter.labels(
-                    failure_kind="markup_leak_streaming",
-                    model=model_label,
-                ).inc()
+            _silent_failure_counter.labels(
+                failure_kind="markup_leak_streaming",
+                model=model_label,
+            ).inc()
 
             # Stable, greppable, ELK-friendly format. Keys without
             # quotes; values numeric or simple strings; one line.
@@ -554,14 +575,18 @@ def extract_tool_calls_streaming_observed(
                 model_label,
             )
     except Exception as _exc:  # noqa: BLE001 — see docstring
-        # Last-resort safety net. We log at DEBUG (not WARNING) to
-        # avoid log-storm amplification if the failure is in the
-        # logger itself; the surrounding except will catch a logger
-        # exception too.
+        # Last-resort safety net. WARNING (not DEBUG) so the operator
+        # sees instrumentation regressions immediately. The inner
+        # try/except guards against the logger itself being broken;
+        # if logging fails too there is nowhere to report from, and
+        # we silently drop only that single exception report — never
+        # the underlying chunk, which has already been served.
         try:
-            _logger.debug(
-                "[%s] instrumentation suppressed exception: %r",
+            _logger.warning(
+                "[%s] instrumentation raised %s during streaming "
+                "markup-leak observation: %r",
                 _PATCH_TAG,
+                type(_exc).__name__,
                 _exc,
             )
         except Exception:  # noqa: BLE001
@@ -610,7 +635,7 @@ _require(
 
 _logger.info(
     "[%s] applied: wrapped %s.%s for vLLM commit %s "
-    "(observation-only; prometheus=%s; counter=%s; "
+    "(observation-only; counter=%s; registrant=%s; "
     "failure_kind=markup_leak_streaming; fires per-delta on "
     "DeltaMessage with non-empty content containing a complete "
     "tool-call marker and empty tool_calls).",
@@ -618,6 +643,6 @@ _logger.info(
     _ParserCls.__module__,
     _ParserCls.__qualname__,
     _PINNED_VLLM_COMMIT,
-    _prometheus_status,
     _COUNTER_NAME,
+    _registrant_status,
 )

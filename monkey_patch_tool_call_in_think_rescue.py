@@ -1,7 +1,18 @@
 """Strict, fail-loud runtime patch: rescue ``<tool_call>`` blocks emitted
 inside ``<think>`` for the Qwen3.6 reasoning parser.
 
-Target: vLLM commit ``8936118134d0547fa1cc78adab2d03edd6d3dc48`` (README §3.2).
+Target: vLLM commit ``32e45636e3d7e02615facc8c63645ce4ac1d7e11`` (README §3.2).
+
+NOTE on PR #35687 (commit ``92762edc53``, merged 2026-04-23, present in
+master): upstream's ``Qwen3ReasoningParser`` now treats ``<tool_call>`` as
+an *implicit reasoning end* — but ONLY when ``</think>`` is absent
+entirely (truncation case). The §6.1 / #39056 failure mode this patch
+exists for is the ``<think>...<tool_call>...</tool_call>...</think>``
+shape: both tokens emitted, with the tool call mid-thought. Master's
+``extract_reasoning`` partitions on ``</think>`` first
+(``qwen3_reasoning_parser.py:142-144``), so the ``<tool_call>`` markup
+still lands in ``reasoning``. This patch's deferred-flush state machine
+is therefore still load-bearing on master.
 Patch class: ``vllm.reasoning.qwen3_reasoning_parser.Qwen3ReasoningParser``.
 Companion to (not a replacement for) ``monkey_patch_qwen3_coder.py`` and
 ``monkey_patch_extract_tool_calls_metrics.py``.
@@ -202,7 +213,7 @@ from collections.abc import Sequence
 from typing import Any, Callable, TypeAlias
 
 
-_PINNED_VLLM_COMMIT: str = "8936118134d0547fa1cc78adab2d03edd6d3dc48"
+_PINNED_VLLM_COMMIT: str = "32e45636e3d7e02615facc8c63645ce4ac1d7e11"
 _PATCH_TAG: str = "qwen36-agent-setup-tool-call-in-think-rescue-v1"
 
 # The literal markers we rescue. Kept as module-level constants so the
