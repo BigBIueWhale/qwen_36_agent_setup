@@ -235,9 +235,10 @@ def section_0_pin_consistency() -> None:
 def section_1_qwen3_coder() -> None:
     run.section("1. monkey_patch_qwen3_coder.py")
     patch_path = PATCH_DIR / "monkey_patch_qwen3_coder.py"
-    target_src = (VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py").read_text()
-    init_src = (VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py").read_text()
-    utils_src = (VLLM_DIR / "vllm/tool_parsers/utils.py").read_text()
+    qwen3_src = (VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py").read_text()
+    abstract_src = (
+        VLLM_DIR / "vllm/tool_parsers/abstract_tool_parser.py"
+    ).read_text()
     engine_src = (VLLM_DIR / "vllm/entrypoints/openai/engine/protocol.py").read_text()
 
     # The buggy landmark string — must be present.
@@ -245,21 +246,46 @@ def section_1_qwen3_coder() -> None:
     run.expect_in(
         "buggy sentinel str.index(\">\") still present at master",
         sentinel,
-        target_src,
+        qwen3_src,
     )
 
-    # Regex landmark in __init__.
+    # Regex shape landmark — must appear specifically in the SUBCLASS
+    # source (this is the qwen3-specific compiled regex, not inherited).
     regex_landmark = patch_constant(patch_path, "_UPSTREAM_REGEX_LANDMARK")
     run.expect_in(
-        "tool_call_parameter_regex shape unchanged",
+        "tool_call_parameter_regex shape unchanged in subclass __init__",
         regex_landmark,
-        init_src,
+        qwen3_src,
     )
+
+    # ``self.tool_call_parameter_regex`` MUST be assigned in the subclass
+    # source (it is a qwen3-specific compiled pattern). Use a strict
+    # word-boundary regex so we don't match unrelated identifiers.
     expected_attr = patch_constant(patch_path, "_EXPECTED_REGEX_ATTR")
-    run.expect_in(
-        "Qwen3CoderToolParser.__init__ assigns self.tool_call_parameter_regex",
+    regex_attr_re = re.compile(
+        rf"\bself\.{re.escape(expected_attr)}\s*[:=]"
+    )
+    run.expect(
+        "Qwen3CoderToolParser subclass __init__ assigns "
         f"self.{expected_attr}",
-        init_src,
+        regex_attr_re.search(qwen3_src) is not None,
+        f"regex {regex_attr_re.pattern!r} did not match",
+    )
+
+    # ``self.tools`` may be assigned by the subclass OR inherited from
+    # ``ToolParser.__init__`` (the actual situation at this pin).
+    # The patch's MRO-walking landmark check requires the assignment to
+    # appear ANYWHERE in the inheritance chain — and so do we, so a
+    # refactor that moves the assignment between subclass/base is fine
+    # but its disappearance from BOTH is caught.
+    tools_assignment_re = re.compile(r"\bself\.tools\s*[:=]")
+    run.expect(
+        "self.tools assigned somewhere in the Qwen3CoderToolParser MRO "
+        "(subclass __init__ OR base)",
+        tools_assignment_re.search(qwen3_src + "\n" + abstract_src) is not None,
+        "neither qwen3coder_tool_parser.py nor abstract_tool_parser.py "
+        "assigns self.tools — the patched _parse_xml_function_call body "
+        "would AttributeError at request time.",
     )
 
     # Signatures.

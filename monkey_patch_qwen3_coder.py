@@ -111,6 +111,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from typing import Any, Callable, TypeAlias
 
 
@@ -234,36 +235,104 @@ _require(
 
 # The replacement body references `self.tool_call_parameter_regex` and
 # `self.tools`. Neither is settable at class-definition time (they are
-# created in __init__), so we verify via the __init__ source that the
-# names still exist there. This catches a rename at upstream-refactor
-# time, before the first real request discovers it via AttributeError.
-try:
-    _init_src = inspect.getsource(_ParserCls.__init__)
-except (OSError, TypeError) as _exc:
-    raise MonkeyPatchRefusedError(
-        f"[{_PATCH_TAG}] cannot read source of Qwen3CoderToolParser."
-        f"__init__: {_exc!r}"
-    ) from _exc
+# created in __init__), so we verify them via __init__ source.
+#
+# IMPORTANT: walk the MRO. ``self.tool_call_parameter_regex`` is set in
+# the *subclass*'s ``__init__``; ``self.tools`` is set in the *base
+# class* ``ToolParser.__init__`` and inherited via ``super().__init__()``.
+# Looking at only ``_ParserCls.__init__`` source would miss the inherited
+# assignment and refuse incorrectly. Combine sources across the MRO so
+# either lineage is acceptable, then assert each landmark is present
+# *somewhere* in the chain.
 
-_require(
-    f"self.{_EXPECTED_REGEX_ATTR}" in _init_src,
-    f"Qwen3CoderToolParser.__init__ no longer assigns "
-    f"self.{_EXPECTED_REGEX_ATTR}. The replacement body uses this "
-    f"attribute; patching without the attribute would AttributeError "
-    f"on the first request.",
+# Strict regex match: word-boundary ``self.tools`` followed by either
+# ``=`` (assignment) or ``:`` (annotated declaration). Avoids matching
+# ``self.tools_something`` or ``self.tools.append(...)`` calls.
+_TOOLS_ASSIGNMENT_RE = re.compile(r"\bself\.tools\s*[:=]")
+_REGEX_ATTR_ASSIGNMENT_RE = re.compile(
+    rf"\bself\.{re.escape(_EXPECTED_REGEX_ATTR)}\s*[:=]"
 )
+
+
+def _collect_init_sources(cls: type) -> list[tuple[str, str]]:
+    """Walk the MRO and return ``(qualname, source)`` for every ancestor
+    that defines its own ``__init__`` (vs. inheriting one).
+
+    Refuses with :class:`MonkeyPatchRefusedError` if no ``__init__`` is
+    inspectable — that is a structural surprise we should not paper
+    over.
+    """
+    collected: list[tuple[str, str]] = []
+    for ancestor in cls.__mro__:
+        if ancestor is object:
+            continue
+        if "__init__" not in ancestor.__dict__:
+            continue
+        try:
+            src = inspect.getsource(ancestor.__init__)
+        except (OSError, TypeError) as exc:
+            raise MonkeyPatchRefusedError(
+                f"[{_PATCH_TAG}] cannot read source of "
+                f"{ancestor.__qualname__}.__init__ during MRO walk for "
+                f"attribute-landmark verification: {exc!r}"
+            ) from exc
+        collected.append((ancestor.__qualname__, src))
+    if not collected:
+        raise MonkeyPatchRefusedError(
+            f"[{_PATCH_TAG}] no inspectable __init__ found anywhere in "
+            f"the MRO of {cls.__qualname__}. Cannot verify the "
+            f"replacement body's attribute assumptions."
+        )
+    return collected
+
+
+_init_sources = _collect_init_sources(_ParserCls)
+_init_qualnames = [qn for qn, _ in _init_sources]
+_combined_init_src = "\n".join(src for _, src in _init_sources)
+
+
+def _require_attribute_in_mro(
+    matcher: re.Pattern[str],
+    attr_label: str,
+    consequence: str,
+) -> None:
+    """Refuse if ``matcher`` does not match anywhere in the MRO's
+    combined ``__init__`` sources. The error message names every
+    ancestor we searched so an operator can audit the claim.
+    """
+    if matcher.search(_combined_init_src):
+        return
+    raise MonkeyPatchRefusedError(
+        f"[{_PATCH_TAG}] no {attr_label} assignment found anywhere in "
+        f"the __init__ chain of Qwen3CoderToolParser. {consequence} "
+        f"Searched (in MRO order): {_init_qualnames!r}."
+    )
+
+
+_require_attribute_in_mro(
+    _REGEX_ATTR_ASSIGNMENT_RE,
+    f"self.{_EXPECTED_REGEX_ATTR}",
+    f"The replacement body reads self.{_EXPECTED_REGEX_ATTR}; without "
+    f"the attribute the patched call would AttributeError on the "
+    f"first request.",
+)
+# The upstream-regex SHAPE landmark must appear in the SUBCLASS source
+# (it is the subclass that compiles and assigns the regex). Don't
+# weaken this by allowing matches in unrelated ancestors.
 _require(
-    _UPSTREAM_REGEX_LANDMARK in _init_src,
+    _UPSTREAM_REGEX_LANDMARK in _init_sources[0][1],
     f"expected parameter-regex landmark {_UPSTREAM_REGEX_LANDMARK!r} "
-    f"not found in __init__ source. The upstream regex's structural "
-    f"shape has changed; the replacement body's assumption that each "
-    f"match yields a single 'KEY>VALUE' body may no longer hold.",
+    f"not found in {_init_sources[0][0]}.__init__ source. The upstream "
+    f"regex's structural shape has changed; the replacement body's "
+    f"assumption that each match yields a single 'KEY>VALUE' body may "
+    f"no longer hold.",
 )
-_require(
-    "self.tools" in _init_src or "self.tools =" in _init_src,
-    "Qwen3CoderToolParser no longer exposes self.tools. The "
-    "replacement body passes self.tools to find_tool_properties; "
-    "without this attribute the patched call would AttributeError.",
+_require_attribute_in_mro(
+    _TOOLS_ASSIGNMENT_RE,
+    "self.tools",
+    "The replacement body passes self.tools to find_tool_properties; "
+    "without this attribute the patched call would AttributeError at "
+    "request time.",
 )
 
 
