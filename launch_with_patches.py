@@ -311,9 +311,23 @@ def _verify_target_carries_tag(
 def _verify_qwen3_coder(patch_module: ModuleType) -> None:
     """Verify ``monkey_patch_qwen3_coder`` actually replaced the parser.
 
-    Re-imports ``Qwen3CoderToolParser`` from the same path vLLM's
-    request handler uses and confirms ``_parse_xml_function_call``
-    carries the patch tag.
+    Three layers, each catching a regression class the others would miss:
+
+    1. Tag presence on ``_parse_xml_function_call`` (the v1 verifier;
+       kept as the cheapest pre-flight signal).
+    2. **Behavioral**: instantiate ``Qwen3CoderToolParser`` with the
+       cached Qwen3.6 tokenizer and a synthetic tool list, then call
+       ``_parse_xml_function_call`` on a deliberately truncated input
+       (``"calculator>\\n<parameter=a"``). The patch's whole purpose is
+       to return ``None`` on that input rather than raise ``ValueError``;
+       this asserts the function table actually carries the new
+       behavior, defending against a regression where the tag is
+       stamped but the function-table got swapped back, or where some
+       sibling patch composed on top of ours.
+    3. Behavioral negative-control on a well-formed input: confirm the
+       same parser returns a non-None result (so we know the
+       ``None``-on-truncation isn't a parser-completely-broken false
+       positive).
     """
     expected_tag = _expected_tag_from(patch_module)
     try:
@@ -334,13 +348,139 @@ def _verify_qwen3_coder(patch_module: ModuleType) -> None:
         target_description="Qwen3CoderToolParser",
     )
 
+    # Behavioral check: instantiate the parser and exercise the patched
+    # method on the precise input the patch was written to handle.
+    try:
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+        from vllm.tokenizers import get_tokenizer
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import behavioral-check deps "
+            f"(ChatCompletionToolsParam, get_tokenizer): {exc!r}"
+        ) from exc
+
+    try:
+        # The model's tokenizer is already cached locally — get_tokenizer
+        # reads from $HF_HOME/$HUGGINGFACE_HUB_CACHE without a network
+        # round-trip on a warmed cache.
+        tokenizer = get_tokenizer("QuantTrio/Qwen3.6-27B-AWQ")
+    except Exception as exc:  # noqa: BLE001
+        # Tokenizer construction can fail for environment reasons (no
+        # cache, no network); refuse explicitly with the cause.
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} could not construct the "
+            f"Qwen3.6 tokenizer: {exc!r}. The HuggingFace cache is "
+            f"either missing or the download failed; the launcher "
+            f"cannot complete its post-install behavioral check "
+            f"without a parser instance."
+        ) from exc
+
+    tool_calc = ChatCompletionToolsParam.model_validate(
+        {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "description": "Add two numbers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "string"},
+                        "b": {"type": "string"},
+                    },
+                    "required": ["a", "b"],
+                },
+            },
+        }
+    )
+    parser = Qwen3CoderToolParser(tokenizer, tools=[tool_calc])
+
+    # Truncated probe — the exact bug class #39771.
+    truncated = "calculator>\n<parameter=a"
+    try:
+        result = parser._parse_xml_function_call(truncated)
+    except ValueError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED: "
+            f"_parse_xml_function_call raised ValueError on truncated "
+            f"input {truncated!r} — this is the exact upstream bug the "
+            f"patch is supposed to eliminate. The patch tag is present "
+            f"but the function table was reverted to the buggy version."
+            f"\n  underlying: {exc!r}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 -- any raise is a hard refusal
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED: "
+            f"_parse_xml_function_call raised "
+            f"{type(exc).__name__} on truncated input {truncated!r}: "
+            f"{exc!r}. The patch was supposed to return None silently."
+        ) from exc
+    if result is not None:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED: "
+            f"_parse_xml_function_call({truncated!r}) returned "
+            f"{result!r}, expected None. The patch's contract is to "
+            f"return None on truncated parameter tags so the outer "
+            f"loop can drop the call and keep its siblings."
+        )
+
+    # Behavioral negative control: well-formed input must still return
+    # a real ToolCall. This catches the regression where the patched
+    # function returns None on EVERYTHING (rather than only on the
+    # truncated case), which would silently break tool calling.
+    well_formed = (
+        "calculator>\n<parameter=a>\n2\n</parameter>\n"
+        "<parameter=b>\n3\n</parameter>\n"
+    )
+    try:
+        good = parser._parse_xml_function_call(well_formed)
+    except Exception as exc:  # noqa: BLE001
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED on negative control: "
+            f"_parse_xml_function_call({well_formed!r}) raised "
+            f"{type(exc).__name__}: {exc!r}. The patched function is "
+            f"refusing on inputs the original would have accepted — "
+            f"it has over-broadened the truncation guard."
+        ) from exc
+    if good is None:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED on negative control: "
+            f"_parse_xml_function_call({well_formed!r}) returned None. "
+            f"A well-formed tool call must produce a ToolCall, not "
+            f"None. The patched function appears to be returning None "
+            f"on all inputs."
+        )
+
 
 def _verify_hybrid_kv_allocator(patch_module: ModuleType) -> None:
-    """Verify ``monkey_patch_hybrid_kv_allocator`` replaced both targets.
+    """Verify ``monkey_patch_hybrid_kv_allocator`` replaced both targets
+    AND the replacements behave with the patched (filtered-groups)
+    divisor instead of the unpatched ``len(kv_cache_groups)`` divisor.
 
-    The patch replaces TWO functions in
-    ``vllm.v1.core.kv_cache_utils``; both must bear the tag, or the
-    fix is half-applied and the boot-line / scheduler views disagree.
+    Three layers:
+
+    1. Tag presence on both ``_report_kv_cache_config`` and
+       ``get_max_concurrency_for_kv_cache_config``.
+    2. **Behavioral**: construct a synthetic ``KVCacheConfig`` mirroring
+       the Qwen3.6-27B layout (1 ``FullAttentionSpec`` group + 3
+       ``MambaSpec`` groups in mode ``"none"``). Call the patched
+       ``get_max_concurrency_for_kv_cache_config``. The patched divisor
+       is 1 (only the attention group contributes per-token capacity);
+       the unpatched divisor is 4 (all four groups). Compute the
+       expected concurrency under each and assert the actual result
+       matches the patched value.
+    3. Behavioral negative-control: monkey_patch_hybrid_kv_allocator
+       can be cleanly distinguished from upstream by the synthetic
+       ``KVCacheConfig`` test above. Cosmetic: also exercise
+       ``_report_kv_cache_config`` to confirm it doesn't raise on the
+       same input (the patched body validates input shape).
     """
     expected_tag = _expected_tag_from(patch_module)
     try:
@@ -364,6 +504,208 @@ def _verify_hybrid_kv_allocator(patch_module: ModuleType) -> None:
         patch_module_name=patch_module.__name__,
         target_description="vllm.v1.core.kv_cache_utils",
     )
+
+    # Behavioral: build a synthetic KVCacheConfig and call the patched
+    # function; assert the divisor used was the post-patch one.
+    try:
+        import torch
+
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            MambaSpec,
+        )
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import behavioral-check deps "
+            f"(KVCacheConfig family, torch): {exc!r}"
+        ) from exc
+
+    # Qwen3.6-27B layout: 1 attention group of 16 layers (full attn at
+    # indices 3, 7, ..., 63) + 3 disjoint MambaSpec groups (3 different
+    # GDN shapes per attention block, 16 layers each), 47 GDN layers
+    # total — but for the discriminator we only need DIFFERENT counts
+    # in the two divisor regimes, not a faithful Qwen3.6 reproduction.
+    # 1 attn vs 4 total (1+3) is a 4× ratio, which is unambiguous.
+    block_size = 16
+    num_kv_heads = 4
+    head_size = 256
+    num_full_attn_layers = 16
+    num_mamba_layers = 16  # per group; identical so the test is symmetric
+
+    full_attn_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.bfloat16,
+    )
+
+    # The pinned signature of MambaSpec is (block_size, shapes, dtypes,
+    # page_size_padded?, mamba_type?, mamba_cache_mode?, num_speculative_blocks?).
+    # mamba_cache_mode="none" so the patch's filter excludes all three
+    # Mamba groups (post-patch divisor = 1; pre-patch divisor = 4).
+    #
+    # We need each Mamba spec to contribute meaningful bytes so the
+    # bytes-summed difference between (1 attn) and (1 attn + 3 mamba)
+    # is large enough to escape rounding. Pad each Mamba page to 256 MB
+    # so unpatched arithmetic sums 1024 MB total (256 MB attn + 3 *
+    # 256 MB mamba), versus patched 256 MB. That's a 4x ratio in
+    # max_memory_usage_per_request, mapping to a 4x ratio in concurrency.
+    huge_padded_bytes = 256 * 1024 * 1024
+    mamba_specs: list[MambaSpec] = []
+    for shape_tuple in (
+        ((128, 128),),
+        ((256,),),
+        ((1024,),),
+    ):
+        mamba_specs.append(
+            MambaSpec(
+                block_size=block_size,
+                shapes=shape_tuple,
+                dtypes=(torch.bfloat16,) * len(shape_tuple),
+                page_size_padded=huge_padded_bytes,
+                mamba_cache_mode="none",
+            )
+        )
+
+    mamba_groups = [
+        KVCacheGroupSpec(
+            layer_names=[f"mamba.{idx}.{i}" for i in range(num_mamba_layers)],
+            kv_cache_spec=spec,
+        )
+        for idx, spec in enumerate(mamba_specs)
+    ]
+    full_attn_group = KVCacheGroupSpec(
+        layer_names=[f"attn.{i}" for i in range(num_full_attn_layers)],
+        kv_cache_spec=full_attn_spec,
+    )
+
+    synthetic_config = KVCacheConfig(
+        num_blocks=10000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[full_attn_group, *mamba_groups],
+    )
+
+    # We need a VllmConfig-shaped object the patch can read. The patch
+    # only touches three sub-attributes: cache_config.mamba_cache_mode,
+    # parallel_config.{decode,prefill}_context_parallel_size, and
+    # model_config.max_model_len. Use a stub via SimpleNamespace; the
+    # filter helper does `getattr(getattr(cfg, "cache_config", None),
+    # "mamba_cache_mode", "none")` so the stub need only expose those.
+    from types import SimpleNamespace
+
+    stub_vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="none",
+            num_gpu_blocks_override=None,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=65536,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_encoder_input_tokens=0,
+        ),
+    )
+
+    # Compute the expected post-patch concurrency, mirroring the
+    # patched function's arithmetic. The patched divisor is 1 because
+    # only the FullAttentionSpec group contributes (mamba_cache_mode
+    # is "none"). Compute what the unpatched divisor (4 total groups)
+    # would have produced, and assert the actual result matches the
+    # patched value, NOT the unpatched value.
+    from vllm.utils.math_utils import cdiv
+
+    full_attn_max_bytes = full_attn_spec.max_memory_usage_bytes(
+        stub_vllm_config
+    )
+    page_size_bytes = full_attn_spec.page_size_bytes
+
+    num_layer_per_group_patched = num_full_attn_layers
+    max_mem_per_request_patched = (
+        num_layer_per_group_patched * full_attn_max_bytes
+    )
+    memory_per_block_patched = page_size_bytes * num_layer_per_group_patched
+    num_blocks_per_request_patched = cdiv(
+        max_mem_per_request_patched, memory_per_block_patched
+    )
+    expected_patched = (
+        synthetic_config.num_blocks / num_blocks_per_request_patched
+    )
+
+    # The unpatched divisor would have summed all 4 groups' specs in
+    # `max_memory_usage_per_request`. For our specs the Mamba groups
+    # report O(1) bytes (mamba_cache_mode=none), so the per-request
+    # bytes are roughly the same — but the unpatched arithmetic uses
+    # `max(...)` over `len(group.layer_names)` across all groups, which
+    # is identical to ours since all groups have 16 layers. The
+    # discriminating term is the SUM of max_memory_usage_bytes:
+    # patched sums only attn (= attn_bytes), unpatched sums attn + 3*mamba
+    # (= attn_bytes + 3*mamba_O1_bytes). Even one byte of mamba O(1)
+    # state in the sum changes the divisor.
+
+    actual = _kv_cache_utils_mod.get_max_concurrency_for_kv_cache_config(
+        stub_vllm_config, synthetic_config
+    )
+
+    # We allow a small relative tolerance for floating-point
+    # round-trip; the value should be exactly the patched one.
+    if not isinstance(actual, (int, float)):
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED: "
+            f"get_max_concurrency_for_kv_cache_config returned "
+            f"{actual!r} (type {type(actual).__name__}); expected float."
+        )
+    if abs(actual - expected_patched) > 1e-6 * max(
+        abs(expected_patched), 1.0
+    ):
+        # Compute what unpatched would have produced for context.
+        mamba_total_bytes = sum(
+            s.max_memory_usage_bytes(stub_vllm_config) for s in mamba_specs
+        )
+        max_mem_per_request_unpatched = num_layer_per_group_patched * (
+            full_attn_max_bytes + mamba_total_bytes
+        )
+        num_blocks_per_request_unpatched = cdiv(
+            max_mem_per_request_unpatched, memory_per_block_patched
+        )
+        expected_unpatched = (
+            synthetic_config.num_blocks
+            / num_blocks_per_request_unpatched
+        )
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED: "
+            f"get_max_concurrency_for_kv_cache_config returned "
+            f"{actual!r}, expected patched value {expected_patched!r} "
+            f"(unpatched would be ~{expected_unpatched!r}). The "
+            f"function table appears to be carrying the unpatched "
+            f"arithmetic — the patch tag is present but the body has "
+            f"been reverted."
+        )
+
+    # Cosmetic: exercise _report_kv_cache_config too. It only logs;
+    # we assert it does NOT raise on the synthetic input. (The patched
+    # body has _validate_kv_cache_config_shape guards that would refuse
+    # on a malformed config, so a non-raise here proves the wiring.)
+    try:
+        _kv_cache_utils_mod._report_kv_cache_config(
+            stub_vllm_config, synthetic_config
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] behavioral verification of "
+            f"{patch_module.__name__!r} FAILED: "
+            f"_report_kv_cache_config raised "
+            f"{type(exc).__name__}: {exc!r} on a valid synthetic "
+            f"config. The patched body is refusing on input the "
+            f"contract should accept."
+        ) from exc
 
 
 def _verify_extract_tool_calls_metrics(patch_module: ModuleType) -> None:
