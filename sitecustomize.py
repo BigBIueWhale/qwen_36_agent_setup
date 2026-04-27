@@ -50,6 +50,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_reasoning_field_egress",
     "monkey_patch_reasoning_field_ingest",
     "monkey_patch_tool_call_in_think_detector",
+    "monkey_patch_default_sampling_params",
 )
 
 

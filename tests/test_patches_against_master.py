@@ -733,6 +733,96 @@ def section_5_detector() -> None:
 
 
 # --------------------------------------------------------------------
+# Section 11: Patch 6 — default_sampling_params
+# --------------------------------------------------------------------
+
+
+def section_11_default_sampling_params() -> None:
+    """Patch 6 — monkey_patch_default_sampling_params. Wraps
+    ``ChatCompletionRequest.to_sampling_params`` to enforce Qwen3.6
+    Best Practices defaults for fields the client did NOT explicitly
+    send. The detection primitive is Pydantic v2's ``model_fields_set``.
+    """
+    run.section("11. monkey_patch_default_sampling_params.py")
+    patch_path = PATCH_DIR / "monkey_patch_default_sampling_params.py"
+    protocol_src = (
+        VLLM_DIR / "vllm/entrypoints/openai/chat_completion/protocol.py"
+    ).read_text()
+    sampling_src = (VLLM_DIR / "vllm/sampling_params.py").read_text()
+
+    # Patch tag.
+    expected_tag = patch_constant(patch_path, "_PATCH_TAG")
+    run.expect_eq(
+        "_PATCH_TAG is the v1 default-sampling-params tag",
+        expected_tag,
+        "qwen36-agent-setup-default-sampling-params-v1",
+    )
+
+    # Target class still defined in the expected module.
+    run.expect_in(
+        "ChatCompletionRequest still defined in chat_completion.protocol",
+        "class ChatCompletionRequest(",
+        protocol_src,
+    )
+
+    # The body landmark we anchor on (proves to_sampling_params still
+    # ends in a SamplingParams.from_optional(...) call — the wrapper's
+    # delegate-then-overwrite contract relies on that shape).
+    landmark = patch_constant(patch_path, "_FROM_OPTIONAL_LANDMARK")
+    run.expect_in(
+        "from_optional landmark present in to_sampling_params source",
+        landmark,
+        protocol_src,
+    )
+
+    # Method signature.
+    expected_params = patch_constant(patch_path, "_EXPECTED_PARAMS")
+    sig = vllm_function_signature(
+        "vllm/entrypoints/openai/chat_completion/protocol.py",
+        "ChatCompletionRequest.to_sampling_params",
+    )
+    run.expect_eq(
+        "ChatCompletionRequest.to_sampling_params signature",
+        sig,
+        list(expected_params),
+    )
+
+    # Each field the patch claims to enforce a default for must still
+    # appear as an attribute on SamplingParams (we do setattr on the
+    # returned instance — a missing attribute would be silently ignored
+    # without strict-attr typing).
+    qwen_defaults = patch_constant(patch_path, "QWEN36_DEFAULTS")
+    run.expect(
+        "QWEN36_DEFAULTS is a non-empty dict",
+        isinstance(qwen_defaults, dict) and bool(qwen_defaults),
+        f"got {type(qwen_defaults).__name__}: {qwen_defaults!r}",
+    )
+    for name in qwen_defaults:
+        # SamplingParams field-line regex: `    <name>: <type> = <default>`
+        pattern = re.compile(
+            rf"^\s{{4}}{re.escape(name)}\s*:", re.MULTILINE
+        )
+        run.expect(
+            f"SamplingParams declares field {name!r}",
+            pattern.search(sampling_src) is not None,
+            f"no `    {name}:` field declaration in vllm/sampling_params.py",
+        )
+
+    # The request-side fields whose presence in `model_fields_set` we
+    # rely on must each be declared in ChatCompletionRequest at master.
+    required = patch_constant(patch_path, "_REQUEST_FIELDS_REQUIRED")
+    for name in required:
+        pattern = re.compile(
+            rf"^\s{{4}}{re.escape(name)}\s*:", re.MULTILINE
+        )
+        run.expect(
+            f"ChatCompletionRequest declares field {name!r}",
+            pattern.search(protocol_src) is not None,
+            f"no `    {name}:` field declaration in chat_completion/protocol.py",
+        )
+
+
+# --------------------------------------------------------------------
 # Section 6: Launcher self-consistency (renumbered after section 5
 # absorbed the rescue/detector slot)
 # --------------------------------------------------------------------
@@ -742,13 +832,14 @@ def section_6_launcher() -> None:
     run.section("6. launch_with_patches.py — registry consistency")
     launcher_src = (PATCH_DIR / "launch_with_patches.py").read_text()
 
-    # Every patch module is registered in _PATCH_MODULES (the 5 surviving).
+    # Every patch module is registered in _PATCH_MODULES (the 6 surviving).
     expected_modules = (
         "monkey_patch_qwen3_coder",
         "monkey_patch_hybrid_kv_allocator",
         "monkey_patch_reasoning_field_egress",
         "monkey_patch_reasoning_field_ingest",
         "monkey_patch_tool_call_in_think_detector",
+        "monkey_patch_default_sampling_params",
     )
     for name in expected_modules:
         run.expect_in(
@@ -847,6 +938,7 @@ def section_9_no_silent_failures() -> None:
         "monkey_patch_reasoning_field_egress.py": 0,
         "monkey_patch_reasoning_field_ingest.py": 0,
         "monkey_patch_tool_call_in_think_detector.py": 0,
+        "monkey_patch_default_sampling_params.py": 0,
     }
     for path in patch_files:
         try:
@@ -1046,6 +1138,7 @@ def main() -> int:
         section_3_egress_mechanism,
         section_4_ingest,
         section_5_detector,
+        section_11_default_sampling_params,
         section_6_launcher,
         section_9_no_silent_failures,
         section_10_sitecustomize_and_readme,
