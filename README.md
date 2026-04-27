@@ -557,7 +557,7 @@ Each of these is tracked and none are urgent.
 ├── monkey_patch_extract_tool_calls_metrics.py                     # §7.6 — non-streaming markup-leak observability
 ├── monkey_patch_extract_tool_calls_streaming_metrics.py           # §7.7 — streaming markup-leak observability
 └── tests/
-    └── test_patches_against_master.py                             # static + structural-mirror suite (131 checks; runs without torch/CUDA)
+    └── test_patches_against_master.py                             # static + structural-mirror suite (141 checks; runs without torch/CUDA)
 ```
 
 Eight Python files (7 patches + launcher + sitecustomize) plus the static test suite, all server-side. Patch 2 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
