@@ -1,6 +1,6 @@
 # Qwen3.6 on a single RTX 5090 — production-grade agentic deployment
 
-**Last updated: 2026-04-25.** `QuantTrio/Qwen3.6-27B-AWQ` (dense VL, AWQ INT4) on **vLLM** (llama.cpp rejected, §5.4). Multi-tool agentic pipelines with vision, reasoning, preserved-thinking. Host: single NVIDIA RTX 5090, 32 GB VRAM, Blackwell SM 12.0, Linux, CUDA 13.0, nvidia-container-toolkit v1.19.0.
+**Last updated: 2026-04-27.** `QuantTrio/Qwen3.6-27B-AWQ` (dense VL, AWQ INT4) on **vLLM** (llama.cpp rejected, §5.4). Multi-tool agentic pipelines with vision, reasoning, preserved-thinking. Host: single NVIDIA RTX 5090, 32 GB VRAM, Blackwell SM 12.0, Linux, CUDA 13.0, nvidia-container-toolkit v1.19.0.
 
 This README documents a specific, pinned, reproducible deployment. Every choice below is deliberate.
 
@@ -17,7 +17,7 @@ This README documents a specific, pinned, reproducible deployment. Every choice 
 | `--max-model-len` | **65,536** |
 | Disk size | 20.36 GiB |
 | VRAM at boot (measured) | 19.78 GiB resident (MTP head auto-skipped via `qwen3_5.py:701-706`'s `skip_prefixes=["mtp."]`) |
-| KV pool available | 6.89 GiB at gmu=0.92, all-modalities-on. Boot log says `GPU KV cache size: 28,224 tokens` (under-reported by §6.3's bug; with patch 3 installed → ~113K) |
+| KV pool available | 6.89 GiB at gmu=0.92, image:2/video:1. Boot log: `GPU KV cache size: 111,328 tokens` (patch 3 installed; unpatched §6.3 would display ~28K) |
 | Per-token attention KV at BF16 | `4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes = 65,536 bytes/token` (16 GiB at the model's native 262K context) |
 | `preserve_thinking` | Set as server-wide default via `--default-chat-template-kwargs '{"preserve_thinking": true}'` |
 | MTP speculative decoding | OFF (head present in the AWQ checkpoint as BF16 but auto-skipped at load; §5.3) |
@@ -90,23 +90,16 @@ Keeping `linear_attn.in_proj_{a,b}` in BF16 is likely load-bearing for thinking-
 | CUDA toolkit inside image | 13.0.2 |
 | Image PyTorch | `2.11.0+cu130` |
 | Image FlashInfer | `0.6.8.post1` |
-| `transformers` pinned inside image | `5.6.2` (no §6.7 import regression — root cause PR #40331 was reverted in `3975eb6de6`) |
+| `transformers` pinned inside image | `5.6.2` (past vLLM PR #40331's brief 2026-04-21 boot regression, reverted by `3975eb6de6`) |
 | `pydantic` pinned inside image | `2.13.3` (matches the version the §7.4 egress patch's mechanism was empirically validated against) |
 
-vLLM CI publishes a commit-tagged variant for every nightly build (`nightly-<commit>`), digest-pinnable. We pin by digest because nightly tags can be re-pushed. Master HEAD when this pin was selected was `32e45636e3` (3 commits ahead, no patched surface touched). The §6.7 boot-import regression in the 2026-04-21 nightly was reverted upstream (PR #40438) and is not present in this image.
+vLLM CI publishes a commit-tagged variant for every nightly build (`nightly-<commit>`), digest-pinnable. We pin by digest because nightly tags can be re-pushed. Master HEAD when this pin was selected was `32e45636e3` (3 commits ahead, no patched surface touched).
 
 ### 3.3 Client
 
-This repo does not ship or pin a client and does not require any client-side code. The deployment exposes an OpenAI-compatible HTTP API at `/v1/chat/completions` that any off-the-shelf OpenAI-compatible client connects to directly.
+No client-side code in this repo. The deployment exposes an OpenAI-compatible HTTP API at `/v1/chat/completions`. Verified to connect unmodified: **OpenAI Python SDK**, **Qwen Code CLI** (Alibaba TypeScript), **Qwen-Agent** (Alibaba Python — `qwen_agent/llm/oai.py`), and any other Chat Completions client that reads/writes `choices[i].(message|delta).reasoning_content`.
 
-**Verified-interoperable clients** (connect unmodified; no shims, no post-processors):
-
-- **OpenAI Python SDK** (`openai.OpenAI(base_url=…).chat.completions.create(…)`).
-- **Qwen Code CLI** (TypeScript, Alibaba — `qwen-code/packages/core/`).
-- **Qwen-Agent** (Python, Alibaba — `Qwen-Agent/qwen_agent/llm/oai.py`).
-- Any other OpenAI Chat Completions client that reads `choices[i].message.reasoning_content` / `choices[i].delta.reasoning_content` and writes `message.reasoning_content` on outgoing assistant turns.
-
-The wire-level interop hazards that historically made third-party clients silently lose data against vLLM — §6.1 (ingest), §6.4 (egress) — are closed server-side by the §7 patches; §6.5 (`<tool_call>`-in-`<think>`) is detected but the wire passes through unchanged so the agent's retry policy can act on it.
+The wire-level interop hazards that made third-party clients silently lose data — §6.1 (ingest), §6.4 (egress) — are closed server-side by the §7 patches. §6.5 (`<tool_call>`-in-`<think>`) is detected but the wire passes through unchanged so the agent's retry policy decides.
 
 ---
 
@@ -136,7 +129,7 @@ The hybrid attention pattern is why the KV-cache memory math diverges from a pur
 
 ### 5.2 Max context length: 65,536 tokens
 
-`--max-model-len 65536`. The byte budget on a 32 GiB card after weights + activations + vision profiling reservation leaves ~6.89 GiB for KV at gmu=0.92. At per-token attention KV of 65,536 bytes/token for 27B (4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes), 65,536 tokens is comfortable headroom. Boot log reports `GPU KV cache size: 28,224 tokens` (under-reported by ~4× due to the §6.3 hybrid-KV bug; with patch 3 installed → ~113K concurrent). The model's native 262K context would require 16.0 GiB of attention-only KV — does not fit on this card without dropping precision.
+`--max-model-len 65536`. The byte budget on a 32 GiB card after weights + activations + vision profiling reservation leaves ~6.89 GiB for KV at gmu=0.92. At per-token attention KV of 65,536 bytes/token for 27B (4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes), 65,536 tokens is comfortable headroom. Boot log reports `GPU KV cache size: 28,224 tokens` (under-reported by ~4× due to the §6.3 hybrid-KV bug; with patch 3 installed → 111,328 measured 2026-04-27). The model's native 262K context would require 16.0 GiB of attention-only KV — does not fit on this card without dropping precision.
 
 `--gpu-memory-utilization 0.92` is the empirical knee: lower wastes pool, higher risks Triton-warmup OOM.
 
@@ -207,7 +200,7 @@ Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, 
 
 ### 6.3 Issue #37121 — hybrid-KV scheduler/log under-reports concurrent capacity [Class D — observability bug]
 
-vLLM's V1 paged KV cache manager forms one `KVCacheGroupSpec` per same-shape layer set. For Qwen3.6-27B that's 4 groups (1 full × 16 + 3 GDN × 16). The byte allocator at `vllm/v1/core/kv_cache_utils.py:1148-1169` allocates a single shared pool sized correctly. The bug is purely in *reporting*: `_report_kv_cache_config:1305-1346` and `get_max_concurrency_for_kv_cache_config:802-820` divide by `len(kv_cache_groups)` (4 for our model), so the displayed `GPU KV cache size: X tokens` and `Maximum concurrency` are ~4× understated. For the 27B-AWQ build: boot log says `GPU KV cache size: ~28K tokens`; with patch 3 installed → `~113K tokens`. Operators sizing `--max-model-len` against the displayed number under-utilize their hardware.
+vLLM's V1 paged KV cache manager forms one `KVCacheGroupSpec` per same-shape layer set. For Qwen3.6-27B that's 4 groups (1 full × 16 + 3 GDN × 16). The byte allocator at `vllm/v1/core/kv_cache_utils.py:1148-1169` allocates a single shared pool sized correctly. The bug is purely in *reporting*: `_report_kv_cache_config:1305-1346` and `get_max_concurrency_for_kv_cache_config:802-820` divide by `len(kv_cache_groups)` (4 for our model), so the displayed `GPU KV cache size: X tokens` and `Maximum concurrency` are ~4× understated. For the 27B-AWQ build: boot log says `GPU KV cache size: ~28K tokens`; with patch 3 installed → `~111K tokens`. Operators sizing `--max-model-len` against the displayed number under-utilize their hardware.
 
 **Upstream status (2026-04-25)**: issue #37121 open since 2026-03-15. PR #40384 (narrow scheduler-reporting fix, our backport source) and competing PR #40694 both open. PR #37429 (broader byte-level redesign) blocked on RFC.
 
@@ -228,10 +221,6 @@ Qwen3.6 occasionally emits `<tool_call>...</tool_call>` markup inside `<think>..
 ### 6.6 Issue #39584 — parallel tool calls crash Responses API [Class A — sidestepped]
 
 `vllm/entrypoints/openai/responses/serving.py:1377` has a hardcoded `assert len(delta_message.tool_calls) == 1`. **Affects us**: no — we use Chat Completions.
-
-### 6.7 `transformers` `GenerationConfig` import regression [Class C — closed]
-
-The 2026-04-21 nightly shipped a broken boot path. Root cause was vLLM PR #40331; closed upstream by commit `3975eb6de6` (PR #40438). The currently-pinned image is past the revert.
 
 ---
 
@@ -261,7 +250,7 @@ Replaces `Qwen3CoderToolParser._parse_xml_function_call` to use `str.find(">")` 
 
 ### 7.3 Patch 3 — `monkey_patch_hybrid_kv_allocator.py`
 
-Replaces `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config` in `vllm.v1.core.kv_cache_utils`. Both reporting sites divide by `len(kv_cache_groups)` (4 for our model: 1 attn + 3 GDN), making displayed token capacity ~4× understated. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`). Boot-log `GPU KV cache size` goes from `~28K tokens` to `~113K tokens`. Backport semantics, not literal port — the pinned commit's `MambaSpec.max_memory_usage_bytes` signature is `(self, vllm_config)`, not the master signature PR #40384 targets. **Removal trigger**: PR #40384 or PR #40694 merges. **CRITICAL**: remove BEFORE pulling an image with PR #37429 (the broader byte-level redesign) — it changes the tensor layout and the patch's reporting view would no longer be coherent.
+Replaces `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config` in `vllm.v1.core.kv_cache_utils`. Both reporting sites divide by `len(kv_cache_groups)` (4 for our model: 1 attn + 3 GDN), making displayed token capacity ~4× understated. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`). Boot-log `GPU KV cache size` goes from `~28K tokens` to `~111K tokens`. Backport semantics, not literal port — the pinned commit's `MambaSpec.max_memory_usage_bytes` signature is `(self, vllm_config)`, not the master signature PR #40384 targets. **Removal trigger**: PR #40384 or PR #40694 merges. **CRITICAL**: remove BEFORE pulling an image with PR #37429 (the broader byte-level redesign) — it changes the tensor layout and the patch's reporting view would no longer be coherent.
 
 ### 7.4 Patch 4 — `monkey_patch_reasoning_field_egress.py`
 
@@ -281,7 +270,7 @@ Three pre-flight checks run BEFORE the per-patch import loop: sitecustomize-pres
 
 ### 7.S sitecustomize loader — `sitecustomize.py`
 
-vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the five patches, **only patch 3** (`monkey_patch_hybrid_kv_allocator`) targets EngineCore-resident code; patches 1, 2, 4, 5 target API-server-resident code and become live in PID 1 directly. Without `sitecustomize`, patch 3 is silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~29K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~117K tokens).
+vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the five patches, **only patch 3** (`monkey_patch_hybrid_kv_allocator`) targets EngineCore-resident code; patches 1, 2, 4, 5 target API-server-resident code and become live in PID 1 directly. Without `sitecustomize`, patch 3 is silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~28K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~111K tokens).
 
 CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interpreter startup, including spawned children. With `PYTHONPATH=/opt/patches`, `site.py` finds our file, which imports each patch in launcher order. Each patch's strict landmark check runs in EngineCore too; any refusal aborts startup loudly. The same flow runs in PID 1 — sitecustomize installs the patches, `launch.py` then hits cache via `importlib.import_module(...)`. Each patch's module-level code fires once.
 
@@ -369,9 +358,7 @@ Expected (after §7.4 egress patch): `choices[0].message.reasoning_content` popu
 
 | Item | Evidence status |
 |---|---|
-| Long-context retrieval quality past ~32K | Only 16 of 64 layers are full attention; long-range retrieval rides on a thin substrate. No RULER / needle-in-haystack numbers published for Qwen3.6-27B at any precision. Validate on your workload before committing. |
-| `<tool_call>`-inside-`<think>` frequency, and thinking-mode loop rate under our specific AWQ config | `<tool_call>`-inside-`<think>` is community-reported at single-digit-percent. Patch §7.5 detects and surfaces it as a structured WARNING (`model_emit_warning kind=tool_call_in_reasoning`); watch logs for the residual rate. **Thinking-mode loop rate** is measured at 17.4% on Qwen3.5-35B-A3B unquantized (issue #88 on `QwenLM/Qwen3.6`); not measured under our AWQ + BF16-linear-attn + BF16-KV config. |
-| Hybrid KV scheduler-reporting bug (§6.3) | Boot log under-reports concurrent-KV capacity by ~4×. Patch 3 corrects the log; admission behavior is identical with or without it. Tracked at vLLM #37121. |
+| `<tool_call>`-in-`<think>` rate, thinking-mode loop rate under our AWQ config | `<tool_call>`-in-`<think>` community-reported single-digit-percent; patch §7.5 surfaces it as structured WARNING (`model_emit_warning kind=tool_call_in_reasoning`). **Loop rate** measured 17.4% on Qwen3.5-35B-A3B unquantized; not re-measured under AWQ + BF16-linear-attn + BF16-KV. |
 | Image count boot failure threshold (§5.8) | `image ∈ {0, 1, 2, 3}` boots; `image ∈ {10, 100, 999}` (and the default-999 when flag omitted) crash with TensorRT-LLM `throwRuntimeError`. We did not bisect 4–9; treat 3 as the ceiling. |
 
 ---
@@ -390,23 +377,21 @@ Expected (after §7.4 egress patch): `choices[0].message.reasoning_content` popu
 
 ---
 
-## 11. Remaining work for the 27B-AWQ deployment
+## 11. Validation status
 
-The 27B-AWQ deployment booted and served a 210-prompt corpus on 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). The A-list patch fixes are closed: A1 (egress nested-serialization regression — superseded by §7.4 v3 with end-to-end nested-dump verification) and A2 (the `launch_no_p1.py` empty-directory artifact, removed).
-
-### 11.1 Validation status
+210-prompt corpus served 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). 2026-04-27 production-flag run (container `qwen36` on `127.0.0.1:8001`, §8.2 flags) closed B4 / B6 / B7 — artifacts under `/tmp/qwen36_research/validation_2026-04-27/`.
 
 | ID | Path | Status | Coverage |
 |---|---|---|---|
-| **B1** | Tool-bearing requests | **Partial** | 5-turn agentic HTTP torture covers `tool_calls[]` round-trip; specific schema variation (parallel tools, deeply nested params, `anyOf`) not yet broken out into a dedicated corpus. |
-| **B2** | Tool-call-in-think | **Detector-validated; rescue intentionally not implemented** | §7.5 detects and emits a structured WARNING; the agent's retry policy decides what to do. Earlier rescue patch removed (over-engineered for stochastic model OOD). |
-| **B3** | Multi-turn `reasoning_content` round-trip | **Validated** | PRESERVE/STRIPPED/CORRUPTED arms distinguishable; 5-turn agentic round-trip of `reasoning_content`. |
-| **B4** | Vision input | **Open** | Model is VL; corpus is text-only. Real-image runs pending. |
+| **B1** | Tool-bearing requests | **Partial** | 5-turn agentic round-trip of `tool_calls[]`; parallel tools, deeply nested params, `anyOf` not yet a dedicated corpus. |
+| **B2** | `<tool_call>`-in-`<think>` | **Detector-validated** | §7.5 emits structured WARNING; retry policy belongs to the agent. |
+| **B3** | Multi-turn `reasoning_content` round-trip | **Validated** | PRESERVE/STRIPPED/CORRUPTED arms distinguishable; 5-turn round-trip. |
+| **B4** | Vision input | **Validated** | 2 real images correctly described (`disc5_imgs/img1.png`, `img2.png`); negative control without image hallucinates unrelated content. |
 | **B5** | Streaming correctness | **Validated** | `reasoning_content` round-trips across deltas. |
-| **B6** | Concurrency stress | **Open** | Two-concurrent-60K-token validation pending. |
-| **B7** | Long-context retrieval quality | **Open** | Needle-in-haystack at 32K/64K not exercised. |
+| **B6** | Concurrency stress | **Validated** | 4 concurrent at 30K input tokens each fully admitted (peak Running=3, peak KV usage 76.6%, no OOM); 4×10K thinking-on shows 1.50× speedup over serial (peak Running=4). |
+| **B7** | Long-context retrieval | **Validated (single-needle)** | Needle recalled at 32K @ depth 10/50/90% and 60K @ depth 50%; negative control did not invent. RULER multi-needle / multi-distractor not exercised. |
 
-Reasonable order for what remains: B4 (vision smoke) → B6 (concurrency stress) → B7 (retrieval quality) → B1 deepening.
+What remains: B1 schema-variation corpus and B7 multi-needle RULER. Neither is gated by the patches; both depend on workload-specific fixtures.
 
 ---
 
@@ -415,7 +400,7 @@ Reasonable order for what remains: B4 (vision smoke) → B6 (concurrency stress)
 Re-evaluate the pinned versions when:
 
 1. **vLLM tags a `v0.19.2` final** or later — migrate to a semver-tagged image.
-2. **A newer nightly passes the boot smoke test** without the §6.7 regression.
+2. **A newer nightly passes the boot smoke test.**
 3. **vLLM widens ingest to accept `reasoning_content`** — remove patch 1.
 4. **PR #39772 merges** — remove patch 2.
 5. **PR #40384 or #40694 merges** — remove patch 3.
@@ -443,5 +428,3 @@ Each is tracked; none urgent.
 └── tests/
     └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
 ```
-
-Seven Python files (5 patches + launcher + sitecustomize) plus the static test suite, all server-side. Patch 3 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
