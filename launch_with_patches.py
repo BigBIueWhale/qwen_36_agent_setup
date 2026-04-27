@@ -354,29 +354,60 @@ def _verify_qwen3_coder(patch_module: ModuleType) -> None:
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionToolsParam,
         )
-        from vllm.tokenizers import get_tokenizer
     except ImportError as exc:
         raise PatchVerificationError(
-            f"[{_LAUNCHER_TAG}] cannot import behavioral-check deps "
-            f"(ChatCompletionToolsParam, get_tokenizer): {exc!r}"
+            f"[{_LAUNCHER_TAG}] cannot import behavioral-check dep "
+            f"ChatCompletionToolsParam: {exc!r}"
         ) from exc
 
-    try:
-        # The model's tokenizer is already cached locally — get_tokenizer
-        # reads from $HF_HOME/$HUGGINGFACE_HUB_CACHE without a network
-        # round-trip on a warmed cache.
-        tokenizer = get_tokenizer("QuantTrio/Qwen3.6-27B-AWQ")
-    except Exception as exc:  # noqa: BLE001
-        # Tokenizer construction can fail for environment reasons (no
-        # cache, no network); refuse explicitly with the cause.
-        raise PatchVerificationError(
-            f"[{_LAUNCHER_TAG}] behavioral verification of "
-            f"{patch_module.__name__!r} could not construct the "
-            f"Qwen3.6 tokenizer: {exc!r}. The HuggingFace cache is "
-            f"either missing or the download failed; the launcher "
-            f"cannot complete its post-install behavioral check "
-            f"without a parser instance."
-        ) from exc
+    # Decoupled from the served model. The patched ``_parse_xml_function_call``
+    # only depends on ``self.tools``, ``self.tool_call_parameter_regex``
+    # (compiled in ``__init__`` from a hard-coded pattern), and
+    # ``self._convert_param_value`` (a method). It never tokenises anything,
+    # so a real Qwen3.6 tokenizer is not required to exercise it.
+    #
+    # ``Qwen3CoderToolParser.__init__`` (vllm/tool_parsers/qwen3coder_tool_parser.py
+    # lines 33-93 at the pinned commit) imposes only two requirements on
+    # the tokenizer it is handed:
+    #
+    # 1. ``self.model_tokenizer`` must be truthy (``if not self.model_tokenizer:
+    #    raise ValueError(...)`` at line 71-75).
+    # 2. ``self.vocab.get("<tool_call>")`` and ``self.vocab.get("</tool_call>")``
+    #    must each return a non-None integer (line 77-84), where ``self.vocab``
+    #    is the ``ToolParser.vocab`` cached_property defined at
+    #    ``vllm/tool_parsers/abstract_tool_parser.py:79-83`` returning
+    #    ``self.model_tokenizer.get_vocab()``.
+    #
+    # The minimal mock below satisfies both. The integer IDs are arbitrary;
+    # the verifier never tokenises anything, only calls
+    # ``_parse_xml_function_call`` directly with text. This decoupling
+    # means an operator can change the served ``--model`` argv without
+    # editing this verifier — the previous version hard-coded
+    # ``QuantTrio/Qwen3.6-27B-AWQ`` and would have hit the network or
+    # spuriously failed on any other deployment target's cache.
+    class _Qwen3CoderVerifierTokenizerMock:
+        """Minimal mock satisfying ``Qwen3CoderToolParser.__init__``'s
+        contract. NOT a substitute for a real tokenizer in any other
+        context — only the two attributes above are populated."""
+
+        # The IDs are arbitrary non-zero ints; they only need to be
+        # distinct and non-None so the constructor's
+        # ``if ... is None: raise RuntimeError`` guard does not trigger.
+        _vocab: dict[str, int] = {
+            "<tool_call>": 1_000_001,
+            "</tool_call>": 1_000_002,
+        }
+
+        def get_vocab(self) -> dict[str, int]:
+            return self._vocab
+
+        # Truthy check (``if not self.model_tokenizer:``). A fresh
+        # ``object`` instance is already truthy in Python; we set this
+        # explicitly to make the contract obvious to a future reader.
+        def __bool__(self) -> bool:
+            return True
+
+    tokenizer_mock = _Qwen3CoderVerifierTokenizerMock()
 
     tool_calc = ChatCompletionToolsParam.model_validate(
         {
@@ -395,7 +426,7 @@ def _verify_qwen3_coder(patch_module: ModuleType) -> None:
             },
         }
     )
-    parser = Qwen3CoderToolParser(tokenizer, tools=[tool_calc])
+    parser = Qwen3CoderToolParser(tokenizer_mock, tools=[tool_calc])
 
     # Truncated probe — the exact bug class #39771.
     truncated = "calculator>\n<parameter=a"
