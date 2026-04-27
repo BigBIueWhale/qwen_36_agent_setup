@@ -159,7 +159,9 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import runpy
+import subprocess
 import sys
 from types import ModuleType
 from typing import Callable, Iterable
@@ -718,6 +720,356 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
 
 
 # --------------------------------------------------------------------
+# Pre-flight checks (run BEFORE the per-patch import loop).
+# --------------------------------------------------------------------
+#
+# These three checks defend against the spawn-vs-fork class of failure
+# (sitecustomize missing, registry drift between launcher and
+# sitecustomize, or a subprocess-only deviation that hides patch 2's
+# install from EngineCore). Each refuses with a typed
+# :class:`LauncherError` on failure; none of them log anything in the
+# happy path.
+
+
+_SITECUSTOMIZE_MISSING_MSG: str = (
+    "sitecustomize.py is not the qwen36-agent-setup version (or is not "
+    "importable at all). The most likely cause is the docker run "
+    "command is missing the bind-mount "
+    "`-v \"$PWD/sitecustomize.py:/opt/patches/sitecustomize.py:ro\"`. "
+    "Without our sitecustomize, vLLM v1's spawned EngineCore subprocess "
+    "will not re-install the patches and patch 2 "
+    "(monkey_patch_hybrid_kv_allocator) will be silently dead in "
+    "EngineCore — the boot-log GPU KV cache line will show the unpatched "
+    "(~4x under-counted) value. See sitecustomize.py's docstring and "
+    "README §7.S for the full rationale."
+)
+
+
+def _preflight_sitecustomize_present() -> ModuleType:
+    """Refuse to boot if our ``sitecustomize`` is not loaded.
+
+    The launcher's PID-1 patch loop runs in the API-server process,
+    but vLLM v1 spawns its EngineCore as a fresh Python interpreter
+    (CUDA forbids ``fork`` after init). The spawned interpreter does
+    NOT inherit the parent's ``sys.modules`` — without OUR
+    ``sitecustomize`` on its ``sys.path`` to re-import the patches,
+    patch 2 (``monkey_patch_hybrid_kv_allocator``) is silently dead in
+    EngineCore even though the launcher's PID-1 verifier reports
+    success. A missing ``sitecustomize.py`` bind-mount is the single
+    most common cause of this regression and the failure mode is
+    silent (boot-log emits the unpatched ``GPU KV cache size`` line).
+
+    Note: Debian's CPython ships a stub ``/usr/lib/python3.12/sitecustomize.py``
+    with no module-level globals, so a bare ``import sitecustomize``
+    will succeed even when our bind-mount is absent. We discriminate
+    by checking the module exposes the expected ``_PATCH_MODULES``
+    tuple — only OUR sitecustomize defines it.
+    """
+    try:
+        import sitecustomize  # noqa: F401  -- imported for side-effects
+    except ImportError as exc:
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] sitecustomize is not importable from the "
+            f"current Python environment ({sys.executable!r}, "
+            f"sys.path={sys.path!r}). {_SITECUSTOMIZE_MISSING_MSG}"
+        ) from exc
+
+    if not hasattr(sitecustomize, "_PATCH_MODULES"):
+        # The Debian-stub sitecustomize was loaded instead of ours.
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] sitecustomize was importable as "
+            f"{sitecustomize.__file__!r} but does NOT define "
+            f"`_PATCH_MODULES` — this is a system-default "
+            f"sitecustomize, not the qwen36-agent-setup one. "
+            f"{_SITECUSTOMIZE_MISSING_MSG}"
+        )
+
+    if not getattr(__import__("builtins"), "_qwen36_sitecustomize_loaded", False):
+        # Our sitecustomize was somehow imported but its module-level
+        # install code never fired. This would only happen if
+        # `_qwen36_sitecustomize_loaded` was forged on builtins, or if
+        # the file was edited to skip the install. Either way the
+        # patches did NOT get auto-installed in PID 1, so the launcher
+        # cannot rely on the PID-1 install side-effect.
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] sitecustomize was importable as "
+            f"{sitecustomize.__file__!r} and exposes _PATCH_MODULES, "
+            f"but the install-completion sentinel "
+            f"`builtins._qwen36_sitecustomize_loaded` was not set. The "
+            f"sitecustomize file may have been edited to skip the "
+            f"install loop, or its module-level code raised silently "
+            f"before reaching the install. Audit sitecustomize.py."
+        )
+
+    return sitecustomize
+
+
+def _preflight_registry_drift_check(sitecustomize_module: ModuleType) -> None:
+    """Refuse to boot if ``sitecustomize._PATCH_MODULES`` and
+    :data:`_PATCH_MODULES` (this module) disagree.
+
+    Drift between the two registries is a well-known footgun: a
+    maintainer adds a new patch to one and forgets the other. The
+    sitecustomize tuple is what gets imported in EngineCore; the
+    launcher tuple is what gets verified in PID 1. A drift means
+    EngineCore would either skip an installed patch (sitecustomize
+    short, launcher long) or install a patch the launcher doesn't
+    know how to verify (sitecustomize long, launcher short). Both
+    are silent failures.
+    """
+    sitecustomize_modules = getattr(
+        sitecustomize_module, "_PATCH_MODULES", None
+    )
+    if not isinstance(sitecustomize_modules, tuple) or not all(
+        isinstance(m, str) for m in sitecustomize_modules
+    ):
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] sitecustomize._PATCH_MODULES is not a "
+            f"tuple of strings; got {type(sitecustomize_modules).__name__}: "
+            f"{sitecustomize_modules!r}. The launcher cannot cross-check "
+            f"the registry against a malformed value. Edit "
+            f"sitecustomize.py to restore the documented contract."
+        )
+    if sitecustomize_modules != _PATCH_MODULES:
+        # Build a precise diff so the operator sees exactly which entry
+        # is in one tuple and not the other.
+        only_in_sitecustomize = [
+            m for m in sitecustomize_modules if m not in _PATCH_MODULES
+        ]
+        only_in_launcher = [
+            m for m in _PATCH_MODULES if m not in sitecustomize_modules
+        ]
+        order_drift = (
+            sitecustomize_modules != _PATCH_MODULES
+            and not only_in_sitecustomize
+            and not only_in_launcher
+        )
+        diff_lines = []
+        if only_in_sitecustomize:
+            diff_lines.append(
+                f"  only in sitecustomize._PATCH_MODULES: "
+                f"{only_in_sitecustomize!r}"
+            )
+        if only_in_launcher:
+            diff_lines.append(
+                f"  only in launch_with_patches._PATCH_MODULES: "
+                f"{only_in_launcher!r}"
+            )
+        if order_drift:
+            diff_lines.append(
+                f"  same set, different order: "
+                f"sitecustomize={sitecustomize_modules!r}, "
+                f"launcher={_PATCH_MODULES!r}"
+            )
+        diff_text = "\n".join(diff_lines)
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] registry drift detected between "
+            f"sitecustomize._PATCH_MODULES and "
+            f"launch_with_patches._PATCH_MODULES:\n{diff_text}\n"
+            f"Both tuples must be byte-identical (same entries in the "
+            f"same order). The launcher uses its own tuple for the "
+            f"per-patch verifier loop; sitecustomize uses its tuple for "
+            f"the EngineCore re-install. A drift means EngineCore and "
+            f"the API server are running with different patch sets, "
+            f"which is silent in the boot log but visible at request "
+            f"time as cross-process behaviour disagreement."
+        )
+
+
+_SUBPROCESS_INSTALL_PROBE: str = """\
+import importlib
+import sys
+
+_TARGETS = [
+    ("monkey_patch_qwen3_coder",
+     "vllm.tool_parsers.qwen3coder_tool_parser",
+     "Qwen3CoderToolParser",
+     "_parse_xml_function_call"),
+    ("monkey_patch_hybrid_kv_allocator",
+     "vllm.v1.core.kv_cache_utils",
+     None,
+     "get_max_concurrency_for_kv_cache_config"),
+    ("monkey_patch_hybrid_kv_allocator",
+     "vllm.v1.core.kv_cache_utils",
+     None,
+     "_report_kv_cache_config"),
+    ("monkey_patch_extract_tool_calls_metrics",
+     "vllm.tool_parsers.qwen3coder_tool_parser",
+     "Qwen3CoderToolParser",
+     "extract_tool_calls"),
+    ("monkey_patch_extract_tool_calls_streaming_metrics",
+     "vllm.tool_parsers.qwen3coder_tool_parser",
+     "Qwen3CoderToolParser",
+     "extract_tool_calls_streaming"),
+    ("monkey_patch_reasoning_field_ingest",
+     "vllm.entrypoints.chat_utils",
+     None,
+     "_parse_chat_message_content"),
+    ("monkey_patch_tool_call_in_think_rescue",
+     "vllm.reasoning.qwen3_reasoning_parser",
+     "Qwen3ReasoningParser",
+     "extract_reasoning"),
+    ("monkey_patch_tool_call_in_think_rescue",
+     "vllm.reasoning.qwen3_reasoning_parser",
+     "Qwen3ReasoningParser",
+     "extract_reasoning_streaming"),
+]
+
+# sitecustomize already ran (CPython's site.py auto-loaded it before
+# this -c probe started executing); the patches are in sys.modules
+# of THIS interpreter. Re-import each target FROM SCRATCH (not from
+# the patch module's cached references) so what we read is what
+# vLLM's request handler will see.
+lines = []
+for patch_name, vllm_mod, cls_name, attr in _TARGETS:
+    try:
+        mod = importlib.import_module(vllm_mod)
+    except ImportError as exc:
+        lines.append(f"FAIL {patch_name} {vllm_mod} import: {exc!r}")
+        continue
+    target = mod
+    if cls_name is not None:
+        target = getattr(mod, cls_name, None)
+        if target is None:
+            lines.append(
+                f"FAIL {patch_name} {vllm_mod}.{cls_name} not found"
+            )
+            continue
+    fn = getattr(target, attr, None)
+    if fn is None:
+        lines.append(
+            f"FAIL {patch_name} {vllm_mod}.{cls_name or '<module>'}.{attr} "
+            f"not found"
+        )
+        continue
+    tag = getattr(fn, "__qwen36_patch__", None)
+    lines.append(
+        f"OK {patch_name} {cls_name or '<module>'}.{attr} {tag!r}"
+    )
+
+# Egress patch: leaf-class-tag style probe (different attribute from
+# function patches). Only check the tag is non-None and matches the
+# patch's _PATCH_TAG.
+try:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatMessage as _ChatMessage,
+    )
+    from vllm.entrypoints.openai.engine.protocol import (
+        DeltaMessage as _DeltaMessage,
+    )
+    chat_tag = getattr(_ChatMessage, "__qwen36_egress_patch__", None)
+    delta_tag = getattr(_DeltaMessage, "__qwen36_egress_patch__", None)
+    lines.append(
+        f"OK monkey_patch_reasoning_field_egress ChatMessage {chat_tag!r}"
+    )
+    lines.append(
+        f"OK monkey_patch_reasoning_field_egress DeltaMessage {delta_tag!r}"
+    )
+except Exception as exc:  # noqa: BLE001 -- probe must report all failures
+    lines.append(
+        f"FAIL monkey_patch_reasoning_field_egress probe: {exc!r}"
+    )
+
+# Print interpreter identity so the launcher can confirm the spawn
+# subprocess is the same Python it would itself run.
+print("EXEC", sys.executable)
+for line in lines:
+    print(line)
+"""
+
+
+def _preflight_subprocess_install_check() -> None:
+    """Spawn a fresh interpreter, run the install probe, and confirm
+    every patch tag is present and matches.
+
+    Defends against three failure modes the in-process check cannot:
+
+    1. ``sitecustomize`` is importable from PID 1's ``sys.path`` but
+       NOT from a child interpreter's (e.g. PYTHONPATH not exported,
+       env var unset, sys.path differs).
+    2. The child interpreter is not the same Python as PID 1
+       (different venv, different ``sys.executable``).
+    3. The patches' subprocess install has a regression that doesn't
+       reproduce in the in-process check (e.g. import side-effect
+       races against EngineCore's own imports).
+
+    Probes via ``subprocess.run([sys.executable, "-c", <probe>])``.
+    The probe prints one line per target; the launcher parses the
+    output and refuses if any line starts with ``FAIL`` or carries a
+    ``None`` tag.
+    """
+    env = os.environ.copy()
+    proc = subprocess.run(
+        [sys.executable, "-c", _SUBPROCESS_INSTALL_PROBE],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] subprocess install check exited "
+            f"non-zero ({proc.returncode}). The spawn child cannot "
+            f"install the patches — most likely sitecustomize.py is "
+            f"not on the child's sys.path (PYTHONPATH unset or wrong) "
+            f"or one of the patches refused on its own landmark check.\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+
+    output_lines = proc.stdout.strip().splitlines()
+    exec_line = next(
+        (line for line in output_lines if line.startswith("EXEC ")), None
+    )
+    target_lines = [
+        line
+        for line in output_lines
+        if line.startswith("OK ") or line.startswith("FAIL ")
+    ]
+
+    if exec_line is None:
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] subprocess install check produced no "
+            f"EXEC line. The probe did not run to completion.\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    child_executable = exec_line[len("EXEC "):].strip()
+    if child_executable != sys.executable:
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] subprocess install check ran under a "
+            f"different interpreter ({child_executable!r}) than the "
+            f"launcher itself ({sys.executable!r}). The container's "
+            f"spawn children must be the same Python the launcher is. "
+            f"Check `--entrypoint python3` in the docker run command."
+        )
+
+    failures = [line for line in target_lines if line.startswith("FAIL ")]
+    if failures:
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] subprocess install check found "
+            f"{len(failures)} target(s) the spawn child could not "
+            f"verify. Each failure is one patch that would silently "
+            f"NOT install in EngineCore:\n  "
+            + "\n  ".join(failures)
+            + f"\nstderr:\n{proc.stderr}"
+        )
+
+    untagged = [
+        line
+        for line in target_lines
+        if line.startswith("OK ") and line.endswith("None")
+    ]
+    if untagged:
+        raise LauncherError(
+            f"[{_LAUNCHER_TAG}] subprocess install check found "
+            f"{len(untagged)} target(s) without the expected "
+            f"__qwen36_patch__ / __qwen36_egress_patch__ tag in the "
+            f"spawn child. The patch imported but did not stamp its "
+            f"target — the install ran in PID 1 but NOT in the child:\n"
+            f"  " + "\n  ".join(untagged)
+        )
+
+
+# --------------------------------------------------------------------
 # Orchestration.
 # --------------------------------------------------------------------
 
@@ -826,8 +1178,24 @@ def main(argv: Iterable[str] | None = None) -> None:
             f"vllm/vllm-openai container."
         ) from exc
 
+    # Pre-flight: refuse to boot if sitecustomize is missing or the
+    # registry has drifted. These checks run BEFORE the per-patch
+    # import loop because (a) sitecustomize already installed the
+    # patches if it was importable, so the loop below is a no-op
+    # validation rather than an install path; and (b) catching a
+    # missing bind-mount HERE produces a launcher-specific error
+    # message naming the missing flag, instead of a confusing
+    # boot-log line emitted by the spawned EngineCore subprocess
+    # several seconds later.
+    sitecustomize_module = _preflight_sitecustomize_present()
+    _preflight_registry_drift_check(sitecustomize_module)
+    _preflight_subprocess_install_check()
+
     # Strict ordered install. Each patch's own typed exceptions and
     # the launcher's PatchVerificationError propagate unchanged.
+    # Because sitecustomize already imported every patch in PID 1's
+    # sys.modules, these importlib.import_module calls hit cache and
+    # the loop is now a per-patch verifier pass (defense in depth).
     installed: list[ModuleType] = []
     for module_name in _PATCH_MODULES:
         installed.append(_import_and_verify(module_name))
