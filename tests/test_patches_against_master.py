@@ -1026,7 +1026,7 @@ def section_9_no_silent_failures() -> None:
 
 def section_10_sitecustomize_and_readme() -> None:
     """Static cross-checks: sitecustomize._PATCH_MODULES == launcher's
-    (drift would silently split EngineCore from PID 1); README §5.2
+    (drift would silently split EngineCore from PID 1); README §8.2
     docker run includes the load-bearing flags and bind-mounts every
     registered patch; pinned commit matches.
     """
@@ -1064,7 +1064,7 @@ def section_10_sitecustomize_and_readme() -> None:
 
     readme_src = readme_path.read_text()
 
-    # README §5.2 must contain the sitecustomize bind-mount and the
+    # README §8.2 must contain the sitecustomize bind-mount and the
     # --host 127.0.0.1 flag in the docker run block. Find the docker
     # run command (between ```bash ... ```), then check it contains
     # both strings.
@@ -1080,18 +1080,18 @@ def section_10_sitecustomize_and_readme() -> None:
     docker_run = docker_run_matches[0] if docker_run_matches else ""
     if docker_run:
         run.expect_in(
-            "README §5.2 docker run includes sitecustomize bind-mount",
+            "README §8.2 docker run includes sitecustomize bind-mount",
             "sitecustomize.py:/opt/patches/sitecustomize.py:ro",
             docker_run,
         )
         run.expect_in(
-            "README §5.2 docker run includes --host 127.0.0.1",
+            "README §8.2 docker run includes --host 127.0.0.1",
             "--host 127.0.0.1",
             docker_run,
         )
-        # The §5.2 command must NOT bind to 0.0.0.0 anywhere.
+        # The §8.2 command must NOT bind to 0.0.0.0 anywhere.
         run.expect_not_in(
-            "README §5.2 docker run does NOT bind to 0.0.0.0",
+            "README §8.2 docker run does NOT bind to 0.0.0.0",
             "--host 0.0.0.0",
             docker_run,
         )
@@ -1101,7 +1101,7 @@ def section_10_sitecustomize_and_readme() -> None:
         # (hybrid_kv_allocator) is silently dead in the spawned EngineCore.
         # Catch the regression of a maintainer dropping the env var.
         run.expect_in(
-            "README §5.2 docker run includes -e PYTHONPATH=/opt/patches",
+            "README §8.2 docker run includes -e PYTHONPATH=/opt/patches",
             "PYTHONPATH=/opt/patches",
             docker_run,
         )
@@ -1110,7 +1110,7 @@ def section_10_sitecustomize_and_readme() -> None:
         # default ENTRYPOINT [vllm, serve] runs and the launcher is
         # never executed at all (no patches install).
         run.expect_in(
-            "README §5.2 docker run includes --entrypoint python3",
+            "README §8.2 docker run includes --entrypoint python3",
             "--entrypoint python3",
             docker_run,
         )
@@ -1120,7 +1120,7 @@ def section_10_sitecustomize_and_readme() -> None:
         # file's name in the repo is launch_with_patches.py; the in-container
         # path is /opt/patches/launch.py.
         run.expect_in(
-            "README §5.2 docker run bind-mounts launch_with_patches.py "
+            "README §8.2 docker run bind-mounts launch_with_patches.py "
             "at /opt/patches/launch.py",
             "launch_with_patches.py:/opt/patches/launch.py:ro",
             docker_run,
@@ -1129,12 +1129,12 @@ def section_10_sitecustomize_and_readme() -> None:
         # 2026-04-28: prefill batch flag reverted to the 32 GiB-bucket
         # right value; H100-default 16384 wasted ~26K KV-pool tokens.
         run.expect_in(
-            "README §5.2 docker run uses --max-num-batched-tokens 8192",
+            "README §8.2 docker run uses --max-num-batched-tokens 8192",
             "--max-num-batched-tokens 8192",
             docker_run,
         )
         run.expect_not_in(
-            "README §5.2 docker run does NOT use --max-num-batched-tokens 16384",
+            "README §8.2 docker run does NOT use --max-num-batched-tokens 16384",
             "--max-num-batched-tokens 16384",
             docker_run,
         )
@@ -1143,12 +1143,12 @@ def section_10_sitecustomize_and_readme() -> None:
         # against future image bumps (vLLM auto-derives [1,2,4,8] for
         # max_num_seqs=4 today but the heuristic could change).
         run.expect_in(
-            "README §5.2 docker run includes -cc cudagraph_capture_sizes pin",
+            "README §8.2 docker run includes -cc cudagraph_capture_sizes pin",
             "cudagraph_capture_sizes",
             docker_run,
         )
         run.expect_in(
-            "README §5.2 docker run pins cudagraph capture sizes to [1,2,4,8]",
+            "README §8.2 docker run pins cudagraph capture sizes to [1,2,4,8]",
             "[1,2,4,8]",
             docker_run,
         )
@@ -1165,27 +1165,27 @@ def section_10_sitecustomize_and_readme() -> None:
                     f"{module_name}.py:/opt/patches/{module_name}.py:ro"
                 )
                 run.expect_in(
-                    f"README §5.2 docker run bind-mounts {module_name}",
+                    f"README §8.2 docker run bind-mounts {module_name}",
                     expected_mount,
                     docker_run,
                 )
 
-    # 2026-04-28: §5.3 now contains the 2-concurrent warmup shape (loose
+    # 2026-04-28: §8.3 now contains the 2-concurrent warmup shape (loose
     # assertions on the load-bearing markers — exact JSON varies).
     run.expect(
-        "README §5.3 warmup uses enable_thinking:false",
+        "README §8.3 warmup uses enable_thinking:false",
         re.search(r"enable_thinking.*false", readme_src) is not None,
-        "expected a chat_template_kwargs entry with enable_thinking:false in §5.3",
+        "expected a chat_template_kwargs entry with enable_thinking:false in §8.3",
     )
     run.expect(
-        "README §5.3 warmup uses --max-time 60",
+        "README §8.3 warmup uses --max-time 60",
         "--max-time 60" in readme_src,
         "expected --max-time 60 on the warmup curl invocations",
     )
 
-    # 2026-04-28: §5.4 wedge-recovery probe has its own subsection.
+    # 2026-04-28: §8.4 wedge-recovery probe has its own subsection.
     run.expect_in(
-        "README §5.4 documents the deep-probe install path",
+        "README §8.4 documents the deep-probe install path",
         "qwen36_deep_probe.sh",
         readme_src,
     )
