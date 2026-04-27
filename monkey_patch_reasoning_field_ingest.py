@@ -1,115 +1,71 @@
-"""Strict, fail-loud ingest patch for the ``reasoning`` / ``reasoning_content`` split.
+"""Strict, fail-loud ingest patch for the ``reasoning_content`` field on
+inbound assistant messages.
 
-Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce`` (README §3.2).
-Companion to ``monkey_patch_reasoning_field_egress.py`` (§7.3); this file
-is §7.4. Same fail-loud import-time discipline as every other patch in
-this repo.
-
-What this fixes
----------------
+Why this patch must exist
+-------------------------
 
 vLLM's chat-completion ingest at ``vllm/entrypoints/chat_utils.py``
-line 1510-1548 (``_parse_chat_message_content``) accepts ``reasoning``
-from assistant messages::
+line 1519 reads ``message.get("reasoning")`` and silently drops
+``reasoning_content``. The chat template at ``chat_template.jinja``
+lines 91-92 reads ``message.reasoning_content`` to render historical
+``<think>`` blocks under ``preserve_thinking=true``. **vLLM is feeding
+its own template a field its own ingest discards.** The bug is purely
+upstream: the ingest path's "what counts as reasoning" disagrees with
+the template's "what counts as reasoning" — independent of any
+client-side standard. Without this patch every multi-turn agent loop
+loses prior reasoning on replay; the model — RL-trained to expect
+prior-turn reasoning — re-derives context from scratch and tool-arg
+correctness degrades after 2-3 turns (``badlogic/pi-mono#3325``).
 
-    reasoning = message.get("reasoning")
-    ...
-    if reasoning is not None:
-        result_msg["reasoning"] = cast(str, reasoning)
-        result_msg["reasoning_content"] = cast(str, reasoning)
+Companion patch: ``monkey_patch_reasoning_field_egress.py`` (egress half
+of the same ``reasoning`` / ``reasoning_content`` mismatch). The two
+together close the round-trip silently broken by upstream.
 
-and **silently drops** ``reasoning_content``. The downstream chat
-template at ``chat_template.jinja`` line 91-92 reads
-``message.reasoning_content``, which means the existing code only
-satisfies the template when the client happens to have sent
-``reasoning``. The two clients in our production stack both send
-``reasoning_content``:
-
-* Qwen Code CLI — ``qwen-code/packages/core/src/core/openaiContentGenerator/converter.ts:335,514``
-* Qwen-Agent — ``Qwen-Agent/qwen_agent/llm/oai.py:149, 169-173``
-
-Both are silently losing prior-turn reasoning today. Prior-turn
-reasoning is load-bearing for interleaved thinking: without it the
-model re-derives context from scratch, loses chain-of-thought
-continuity across tool-call round-trips, and degrades tool-selection
-quality. The README calls this out; this patch is the fix.
-
-Why a wrapper, not a rewrite
-----------------------------
-
-The branch we care about is one ``message.get(...)`` call inside a
-~40-line function that also handles tool-call passthrough, content
-normalization, and multi-modal item tracking. Rewriting the whole
-function to fix one line triples the surface area that drifts when
-upstream moves. A **wrapper that normalizes the input dict before
-delegating** is the minimum-surface change that preserves every other
-code path verbatim.
+Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce``.
 
 Patch-discipline contract
 -------------------------
 
 This file is a patch, not a library. At import it:
 
-1. Imports vLLM. Failure is a hard ImportError; we do not hide it.
-2. Imports ``vllm.entrypoints.chat_utils``; failure is fatal.
-3. Verifies ``_parse_chat_message_content`` exists, is callable, and
-   has exactly the signature
-   ``(message, mm_tracker, content_format, interleave_strings,
-   mm_processor_kwargs=None)``.
-4. Reads the function's source via ``inspect.getsource`` and verifies
-   two landmarks are present:
-
-   * ``reasoning = message.get("reasoning")`` — the exact bug line.
-     If it is missing, upstream has already restructured this code and
-     our assumption that ``reasoning_content`` is dropped may no
-     longer hold; we refuse to wrap.
-   * ``if role == "assistant":`` — the role-gated branch this patch
-     relies on. If it is missing, the downstream semantics of the
-     synthesized ``reasoning`` field have changed and our input
-     normalization may be wrong; we refuse to wrap.
-
-5. Installs the wrapper on the module, tags it with
-   ``__qwen36_patch__``, verifies both ``getattr`` and
-   ``inspect.getattr_static`` resolve to the tagged wrapper.
-6. Logs a single INFO line via ``vllm.logger.init_logger`` naming the
-   module, the wrapped function, and the pinned commit.
+1. Imports vLLM and ``vllm.entrypoints.chat_utils``; either failing is
+   a hard ImportError.
+2. Verifies ``_parse_chat_message_content`` exists, is callable, and
+   has the expected signature (parameter names + the trailing-default
+   shape the wrapper relies on).
+3. Reads the function's source via ``inspect.getsource`` and verifies
+   two landmarks: the bug line ``reasoning = message.get("reasoning")``
+   and the assistant-role gate ``if role == "assistant":``. Both
+   absent → upstream restructured the path → refuse.
+4. Installs the wrapper, tags it with ``__qwen36_patch__``, and verifies
+   both ``getattr`` and ``inspect.getattr_static`` resolve to the
+   tagged wrapper.
 
 Any step failing raises :class:`IngestPatchRefusedError` and the
-interpreter does not continue. There is no ``SystemExit(0)`` or
-``try/except Exception: pass`` on any install path.
+interpreter does not continue. No ``SystemExit(0)``, no
+``try/except: pass``, no silent fallback.
 
 Critical correctness invariants
 -------------------------------
 
 * **Input normalization only.** The wrapper NEVER mutates the caller's
-  ``message`` dict. When it needs to synthesize ``reasoning``, it
-  takes a shallow copy and modifies the copy before calling the
-  original. Callers may hold references to the inbound dict (for
-  logging, audit, retry buffers); we must not surprise them.
-* **No silent resolution of client ambiguity.** If the client sent
-  both ``reasoning`` and ``reasoning_content`` with different non-None
-  values, we do not guess which one it "really" meant. We raise
-  :class:`ReasoningFieldAmbiguityError` — a ``ValueError`` subclass so
-  vLLM's request-level error handling converts it to HTTP 400 rather
-  than 500. The alternative — prefer one, drop the other — is exactly
-  the silent-degradation class this patch exists to remove.
-* **Role-gated.** The synthesis only runs on ``role == "assistant"``.
-  The template reads ``reasoning_content`` only from assistant turns;
-  synthesizing on ``user`` / ``system`` / ``tool`` turns would inject
-  a field the downstream consumers do not expect.
-* **Non-None, non-string inputs are not coerced.** If
-  ``reasoning_content`` is present but not a string, we refuse
-  (``ReasoningFieldAmbiguityError``) rather than stringifying it.
-  Silent coercion of a dict or list to ``str(dict)`` would corrupt
-  downstream template rendering in exactly the way this whole patch
-  stack is designed to prevent.
-* **Pass-through on happy paths.** If neither field is set, or if
-  only ``reasoning`` is set (matching upstream's existing behavior),
-  the original is called with the original ``message`` object — not a
-  copy. No allocation, no identity change.
-* **No try/except on the original call.** Exceptions from the
-  upstream function propagate unchanged. The wrapper adds exactly one
-  pre-processing step and delegates.
+  ``message`` dict; it returns a shallow copy when synthesis is
+  needed. Callers may hold references for logging / audit / retry.
+* **No silent resolution of client ambiguity.** Both ``reasoning`` and
+  ``reasoning_content`` set with **different** non-None values raises
+  :class:`ReasoningFieldAmbiguityError` (a ``ValueError`` subclass →
+  HTTP 400). Choosing one and dropping the other is the silent-
+  degradation class this patch exists to remove.
+* **Role-gated.** Synthesis only runs on ``role == "assistant"``; the
+  template reads ``reasoning_content`` only from assistant turns.
+* **Non-string ``reasoning_content`` is refused, not coerced.** A dict
+  or list stringified via ``str(...)`` would corrupt downstream
+  template rendering.
+* **Pass-through on happy paths.** Neither set, or only ``reasoning``
+  set (upstream's existing behavior) → the original is called with
+  the unchanged ``message`` object — no allocation, no identity change.
+* **No try/except on the delegate call.** Exceptions from the upstream
+  function propagate unchanged.
 """
 
 from __future__ import annotations
@@ -123,16 +79,13 @@ _PATCH_TAG: str = "qwen36-agent-setup-reasoning-ingest-v1"
 
 
 # Source landmarks proving the ingest shape is the one we expect.
-# ``_BUG_LANDMARK`` is the exact line that drops ``reasoning_content``;
-# ``_ROLE_GATE_LANDMARK`` is the role-gated branch whose template
-# consumer assumes ``reasoning_content`` is populated.
 _BUG_LANDMARK: str = 'reasoning = message.get("reasoning")'
 _ROLE_GATE_LANDMARK: str = 'if role == "assistant":'
 
 
-# Exact parameter list we verified against commit 8936118. Any drift
-# here means the wrapper's positional/keyword contract with the
-# original has broken and silent arg-shifts become possible.
+# Exact parameter list we verified against the pinned commit. Any drift
+# means the wrapper's positional/keyword contract with the original has
+# broken and silent arg-shifts become possible.
 _EXPECTED_PARAMS: list[str] = [
     "message",
     "mm_tracker",
@@ -211,10 +164,6 @@ _require(
     f"{_EXPECTED_PARAMS!r}, got {_param_names!r}.",
 )
 
-# The trailing parameter must remain optional (the wrapper forwards
-# ``**kwargs``-style via explicit named binding). A drift from
-# keyword-with-default to required would not trip the name check
-# above, so we assert the default explicitly.
 _mm_processor_param = _sig.parameters["mm_processor_kwargs"]
 _require(
     _mm_processor_param.default is None,
@@ -262,36 +211,11 @@ _require(
 def _normalize_assistant_reasoning(message: Any) -> Any:
     """Return a message dict where ``reasoning`` is populated if ``reasoning_content`` was.
 
-    Contract:
-
-    * Non-``dict`` / non-mapping inputs: returned unchanged. The
-      upstream function is typed ``ChatCompletionMessageParam``
-      (``TypedDict``); if a caller has passed something else, that is
-      upstream's problem to diagnose, not ours to mask.
-    * Non-assistant roles: returned unchanged.
-    * Assistant role, both fields ``None`` or absent: returned
-      unchanged.
-    * Assistant role, ``reasoning`` is non-None: returned unchanged
-      (matches existing upstream behavior; ``reasoning_content``, if
-      also present and equal, is redundant but not ambiguous — see
-      below for the unequal case).
-    * Assistant role, ``reasoning`` is None and ``reasoning_content``
-      is a non-empty string: a shallow copy is made with
-      ``reasoning`` set from ``reasoning_content``. The caller's dict
-      is NOT mutated.
-    * Assistant role, both fields non-None and **unequal**: raises
-      :class:`ReasoningFieldAmbiguityError`.
-    * Assistant role, ``reasoning_content`` is present but not a
-      string (or not a non-None value the upstream function could
-      itself have accepted in the ``reasoning`` slot): raises
-      :class:`ReasoningFieldAmbiguityError`. Silent coercion is not
-      an acceptable outcome.
+    See module docstring for the full policy matrix.
     """
-    # Duck-typed ``.get`` check: the real type is ``TypedDict`` at
-    # type-check time and ``dict`` at runtime. We accept any mapping
-    # that exposes ``.get`` and ``["role"]``; anything else falls
-    # through to the original function, which will raise its own
-    # clear error.
+    # Duck-typed ``.get`` check: real type is ``TypedDict`` at type-
+    # check time and ``dict`` at runtime. Anything else falls through
+    # to the original function, which raises its own clear error.
     if not isinstance(message, dict):
         return message
 
@@ -305,17 +229,14 @@ def _normalize_assistant_reasoning(message: Any) -> Any:
     if reasoning is None and reasoning_content is None:
         return message
 
-    # Happy path #2: ``reasoning`` is set, ``reasoning_content`` is
-    # absent or identical. Upstream already handles this correctly.
+    # Happy path #2: only ``reasoning`` set. Upstream already handles it.
     if reasoning is not None and reasoning_content is None:
         return message
 
     if reasoning is not None and reasoning_content is not None:
         if reasoning == reasoning_content:
-            # Client sent both with identical values. Not ambiguous;
-            # just redundant. Upstream happens to already populate
-            # both output slots from ``reasoning`` alone, so we can
-            # delegate unchanged.
+            # Redundant but not ambiguous; upstream populates both
+            # output slots from ``reasoning`` alone, so delegate.
             return message
         raise ReasoningFieldAmbiguityError(
             "assistant message specifies both 'reasoning' and "
@@ -326,8 +247,8 @@ def _normalize_assistant_reasoning(message: Any) -> Any:
         )
 
     # Remaining case: ``reasoning is None`` and
-    # ``reasoning_content is not None``. This is the class of request
-    # upstream silently drops. Normalize before delegating.
+    # ``reasoning_content is not None``. The class of request upstream
+    # silently drops. Normalize before delegating.
     if not isinstance(reasoning_content, str):
         raise ReasoningFieldAmbiguityError(
             "assistant message 'reasoning_content' is not a string "
@@ -348,18 +269,7 @@ def _parse_chat_message_content_reasoning_normalized(
     interleave_strings: bool,
     mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> Any:
-    """Ingest wrapper around ``_parse_chat_message_content``.
-
-    Contract:
-
-    * Normalizes ``message`` via :func:`_normalize_assistant_reasoning`
-      (see that function for the full policy matrix).
-    * Calls the original ``_parse_chat_message_content`` with the
-      normalized dict and the remaining arguments forwarded verbatim.
-      The original call is **NOT** inside a try/except; any exception
-      propagates unchanged.
-    * Returns the original's return value unchanged.
-    """
+    """Ingest wrapper around ``_parse_chat_message_content``."""
     normalized = _normalize_assistant_reasoning(message)
     return _original(
         normalized,
@@ -400,11 +310,9 @@ _require(
     "ours.",
 )
 
-# Second-order verification: ``inspect.getattr_static`` bypasses
-# descriptor protocol and module-level ``__getattr__`` hooks. A module
-# that has installed a ``__getattr__`` (PEP 562) could in principle
-# return a different object via normal attribute access than the one
-# sitting in ``__dict__``. We require both views to agree.
+# Static-lookup verification: ``inspect.getattr_static`` bypasses
+# descriptor protocol and module-level ``__getattr__`` hooks. Both
+# views must agree.
 _resolved_static = inspect.getattr_static(
     _chat_utils_mod, "_parse_chat_message_content"
 )

@@ -1,21 +1,12 @@
 # Qwen3.6 on a single RTX 5090 — production-grade agentic deployment
 
-**Last updated: 2026-04-25.** Currently deploying `QuantTrio/Qwen3.6-27B-AWQ` (dense vision-language, AWQ INT4).
-**Runtime: vLLM** (llama.cpp rejected for reasons documented in §5.4).
-**Target workload: multi-tool agentic pipelines** with vision, reasoning, and preserved-thinking across turns.
-**Host: single NVIDIA RTX 5090, 32 GB VRAM, Blackwell SM 12.0, Linux, CUDA 13.0, nvidia-container-toolkit v1.19.0.**
+**Last updated: 2026-04-25.** `QuantTrio/Qwen3.6-27B-AWQ` (dense VL, AWQ INT4) on **vLLM** (llama.cpp rejected, §5.4). Multi-tool agentic pipelines with vision, reasoning, preserved-thinking. Host: single NVIDIA RTX 5090, 32 GB VRAM, Blackwell SM 12.0, Linux, CUDA 13.0, nvidia-container-toolkit v1.19.0.
 
 This README documents a specific, pinned, reproducible deployment. Every choice below is deliberate.
 
----
+### Deployment target & load-bearing pins
 
-## ⚠️ 2026-04-25 — Deployment target changed
-
-Previous target was `RedHatAI/Qwen3.6-35B-A3B-NVFP4`. New target: **`QuantTrio/Qwen3.6-27B-AWQ`**. The 27B dense model is more capable per forward pass than a 35B-A3B MoE that activates only ~3B per token, fits on the card cleanly, and the AWQ recipe preserves the load-bearing layers (vision, `linear_attn.in_proj_a/b`, `lm_head`, embeddings, layer 0, MTP) at BF16 while quantizing MLPs and the rest. NVFP4 builds for 27B-dense were triaged and rejected — see §3.1.
-
----
-
-### The short version — load-bearing pins
+**`QuantTrio/Qwen3.6-27B-AWQ`** (selected 2026-04-25, replacing an earlier `RedHatAI/Qwen3.6-35B-A3B-NVFP4` target). The 27B dense model is more capable per forward pass than a 35B-A3B MoE that activates only ~3B per token, fits on the card cleanly, and the AWQ recipe preserves the load-bearing layers (vision, `linear_attn.in_proj_a/b`, `lm_head`, embeddings, layer 0, MTP) at BF16 while quantizing MLPs. NVFP4 builds for 27B-dense were triaged and rejected — see §3.1.
 
 | Slot | Pin |
 |---|---|
@@ -26,11 +17,11 @@ Previous target was `RedHatAI/Qwen3.6-35B-A3B-NVFP4`. New target: **`QuantTrio/Q
 | `--max-model-len` | **65,536** |
 | Disk size | 20.36 GiB |
 | VRAM at boot (measured) | 19.78 GiB resident (MTP head auto-skipped via `qwen3_5.py:701-706`'s `skip_prefixes=["mtp."]`) |
-| KV pool available | 6.89 GiB at gmu=0.92, all-modalities-on. Boot log says `GPU KV cache size: 28,224 tokens` (under-reported by §6.7's bug; with patch 2 installed → ~113K) |
+| KV pool available | 6.89 GiB at gmu=0.92, all-modalities-on. Boot log says `GPU KV cache size: 28,224 tokens` (under-reported by §6.3's bug; with patch 3 installed → ~113K) |
 | Per-token attention KV at BF16 | `4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes = 65,536 bytes/token` (16 GiB at the model's native 262K context) |
 | `preserve_thinking` | Set as server-wide default via `--default-chat-template-kwargs '{"preserve_thinking": true}'` |
 | MTP speculative decoding | OFF (head present in the AWQ checkpoint as BF16 but auto-skipped at load; §5.3) |
-| Patches in this repo | 7 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
+| Patches in this repo | 5 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
 
 ---
 
@@ -85,7 +76,7 @@ All versions are pinned for reproducibility. Floating tags (`latest`, `main`, `n
 
 Keeping `linear_attn.in_proj_{a,b}` in BF16 is likely load-bearing for thinking-mode loop resistance: `cpatonn` on HF `cyankiwi/Qwen3.5-27B-AWQ-4bit` discussion #2 reports that `cyankiwi/Qwen3.5-27B-AWQ-BF16-INT4` (linear-attn in BF16, rest INT4) was *"significantly better on the infinite loop issue"*. The MTP head ships in this checkpoint but is auto-skipped at load via `qwen3_5.py:701-706`'s `skip_prefixes=["mtp."]`.
 
-**Why this quant over published NVFP4 alternatives**: every Qwen3.6-27B NVFP4 quant we triaged either (a) won't fit on 32 GiB (huginnfork / kaitchup / igf-oeaw / lkk688 are all ≥26 GiB on disk because they preserve full `linear_attn` BF16 + everything else BF16 + only quantize MLPs), (b) has no documented recipe and no community validation (Benasd / reinforce20001 uploaded 2026-04-26 with no README), (c) strips vision (sakamakismile-Text), or (d) targets a different runtime (mlx, gguf, sglang). QuantTrio AWQ is the only option that simultaneously fits on the card, preserves the load-bearing layers, works with vLLM's `qwen3_coder` tool parser, and has been empirically validated on the target hardware (210-prompt corpus, 0% true garbling). Full triage at `/tmp/qwen36_research/qwen36_27b_nvfp4_full_triage_2026-04-26.md`.
+**Why this quant over published NVFP4 alternatives**: every Qwen3.6-27B NVFP4 quant triaged either won't fit on 32 GiB (preserves full BF16 everything except MLPs), lacks a documented recipe, strips vision, or targets a different runtime. QuantTrio AWQ is the only option that fits on the card, preserves the load-bearing layers, works with vLLM's `qwen3_coder` tool parser, and has been empirically validated on the target hardware (210-prompt corpus, 0% true garbling).
 
 ### 3.2 Runtime
 
@@ -99,11 +90,10 @@ Keeping `linear_attn.in_proj_{a,b}` in BF16 is likely load-bearing for thinking-
 | CUDA toolkit inside image | 13.0.2 |
 | Image PyTorch | `2.11.0+cu130` |
 | Image FlashInfer | `0.6.8.post1` |
-| `transformers` pinned inside image | `5.6.2` (no §6.6 import regression — root cause PR #40331 was reverted in `3975eb6de6`) |
-| `pydantic` pinned inside image | `2.13.3` (matches the version the §7.3 egress patch's mechanism was empirically validated against) |
-| `prometheus_client` pinned inside image | `0.24.1` (required by §7.6 / §7.7) |
+| `transformers` pinned inside image | `5.6.2` (no §6.7 import regression — root cause PR #40331 was reverted in `3975eb6de6`) |
+| `pydantic` pinned inside image | `2.13.3` (matches the version the §7.4 egress patch's mechanism was empirically validated against) |
 
-This image's underlying commit is the `:nightly` tag pointer at the moment of pinning; vLLM's CI publishes a commit-tagged variant for every nightly build, so `nightly-<commit>` is digest-pinnable. The amd64 digest above is what `:nightly` resolved to on 2026-04-26; nightly tags can be re-pushed in place, so we pin by digest. Master HEAD when this pin was selected was `32e45636e3` (3 commits ahead, all in `vllm/compilation/`, `vllm/distributed/`, and `vllm/v1/worker/utils.py` — no patched surface touched). The §6.6 boot-import regression that blocked the 2026-04-21 nightly `b47840019e…` was reverted upstream in commit `3975eb6de6` (PR #40438) and is not present in this image.
+vLLM CI publishes a commit-tagged variant for every nightly build (`nightly-<commit>`), digest-pinnable. We pin by digest because nightly tags can be re-pushed. Master HEAD when this pin was selected was `32e45636e3` (3 commits ahead, no patched surface touched). The §6.7 boot-import regression in the 2026-04-21 nightly was reverted upstream (PR #40438) and is not present in this image.
 
 ### 3.3 Client
 
@@ -116,7 +106,7 @@ This repo does not ship or pin a client and does not require any client-side cod
 - **Qwen-Agent** (Python, Alibaba — `Qwen-Agent/qwen_agent/llm/oai.py`).
 - Any other OpenAI Chat Completions client that reads `choices[i].message.reasoning_content` / `choices[i].delta.reasoning_content` and writes `message.reasoning_content` on outgoing assistant turns.
 
-The three wire-level interop hazards that historically made third-party clients silently lose data against vLLM — §6.1, §6.4, §6.5 — are closed server-side by the §7 patches.
+The wire-level interop hazards that historically made third-party clients silently lose data against vLLM — §6.1 (ingest), §6.4 (egress) — are closed server-side by the §7 patches; §6.5 (`<tool_call>`-in-`<think>`) is detected but the wire passes through unchanged so the agent's retry policy can act on it.
 
 ---
 
@@ -146,7 +136,7 @@ The hybrid attention pattern is why the KV-cache memory math diverges from a pur
 
 ### 5.2 Max context length: 65,536 tokens
 
-`--max-model-len 65536`. The byte budget on a 32 GiB card after weights + activations + vision profiling reservation leaves ~6.89 GiB for KV at gmu=0.92. At per-token attention KV of 65,536 bytes/token for 27B (4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes), 65,536 tokens is comfortable headroom. Boot log reports `GPU KV cache size: 28,224 tokens` (under-reported by ~4× due to the §6.7 hybrid-KV bug; with patch 2 installed → ~113K concurrent). The model's native 262K context would require 16.0 GiB of attention-only KV — does not fit on this card without dropping precision.
+`--max-model-len 65536`. The byte budget on a 32 GiB card after weights + activations + vision profiling reservation leaves ~6.89 GiB for KV at gmu=0.92. At per-token attention KV of 65,536 bytes/token for 27B (4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes), 65,536 tokens is comfortable headroom. Boot log reports `GPU KV cache size: 28,224 tokens` (under-reported by ~4× due to the §6.3 hybrid-KV bug; with patch 3 installed → ~113K concurrent). The model's native 262K context would require 16.0 GiB of attention-only KV — does not fit on this card without dropping precision.
 
 `--gpu-memory-utilization 0.92` is the empirical knee: lower wastes pool, higher risks Triton-warmup OOM.
 
@@ -156,19 +146,18 @@ The MTP head ships in the QuantTrio AWQ checkpoint as BF16 (~0.68 GiB) but is au
 
 ### 5.4 Runtime: vLLM, not llama.cpp
 
-Re-verified against `ggml-org/llama.cpp` master `0d0764df` (2026-04-22 10:52 PDT):
+Re-verified against `ggml-org/llama.cpp` master `0d0764df` (2026-04-22):
 
-| Dimension | vLLM | llama.cpp (verified 2026-04-22) |
+| Dimension | vLLM | llama.cpp |
 |---|---|---|
-| Dedicated Qwen3 tool parser | Yes (`qwen3_coder`, 683 lines) | **No.** `common/chat.cpp` contains no Qwen3-era handler; Qwen3.x routes through generic `peg-native` parser, which has live OPEN failure modes #20260, #20837, #21771, #22240. No merged fix PR for any of these. |
-| Dedicated reasoning parser | Yes (`qwen3`) | Generic `--reasoning-format deepseek`; no Qwen3-specific handling. The tool-call-in-think rescue our §7.5 patch implements has no upstream analog. |
-| MTP head | Loaded (disabled by §5.3) | **Dropped at GGUF conversion** (`convert_hf_to_gguf.py:4781-4782`: *"ignore MTP layers for now"*). PR #20700 unmerged WIP. |
-| Vision preprocessing | BICUBIC (matches HF `Qwen3VLImageProcessor`) | **BILINEAR** hardcoded at `tools/mtmd/clip.cpp:1357` for the QWEN3VL projector type. No upstream PR open. |
-| Agentic prompt-cache stability | Stable on our stack | Live regression llama.cpp #21383 (OPEN, 2026-04-03): Qwen3.5-27B CUDA illegal-memory-access under `--cache-ram` + agentic tool-call loop. |
-| CUDA / Ollama compatibility | Pinned CUDA 12.9 in image, runs on host 13.0 | Unsloth Qwen3.6 docs: *"Do NOT use CUDA 13.2 as you may get gibberish outputs"*; *"Currently no Qwen3.6 GGUF works in Ollama due to separate mmproj vision files."* |
-| Qwen official endorsement | Launch command in HF model card | Mentioned as "supported" without a pinned command |
+| Dedicated Qwen3 tool parser | Yes (`qwen3_coder`) | **No.** Qwen3.x routes through generic `peg-native`; live OPEN failure modes #20260/20837/21771/22240. |
+| Dedicated reasoning parser | Yes (`qwen3`) | Generic `--reasoning-format deepseek`; no Qwen3-specific handling. |
+| MTP head | Loaded (disabled by §5.3) | **Dropped at GGUF conversion** (`convert_hf_to_gguf.py:4781-4782`). PR #20700 unmerged WIP. |
+| Vision preprocessing | BICUBIC (matches HF `Qwen3VLImageProcessor`) | **BILINEAR** hardcoded at `tools/mtmd/clip.cpp:1357` for QWEN3VL. No upstream PR open. |
+| Agentic prompt-cache stability | Stable | Live regression llama.cpp #21383 (OPEN, 2026-04-03): Qwen3.5-27B CUDA illegal-memory-access under `--cache-ram`. |
+| Qwen official endorsement | Launch command in HF model card | "Supported" without a pinned command |
 
-Bottom line: every historical wire-level advantage llama.cpp held for this model is closed by a patch in this repo. The tool-parsing, MTP-drop, vision-preprocessing, and agentic-prompt-cache gaps above are live on master with no merged fix.
+The tool-parsing, MTP-drop, vision-preprocessing, and agentic-prompt-cache gaps above are live on master with no merged fix.
 
 ### 5.5 API endpoint: `/v1/chat/completions`, not Responses API
 
@@ -176,24 +165,10 @@ vLLM issue #39584 asserts `len(tool_calls)==1` in the Responses API streaming pa
 
 ### 5.6 Sampling parameters
 
-Per the Qwen3.6 model card's "Best Practices" block:
+Per the Qwen3.6 model card "Best Practices" block. Thinking-mode agentic use:
+`temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, max_tokens=16384`. Precise coding / low-variance tool args: `temperature=0.6, presence_penalty=0.0`, rest unchanged.
 
-For thinking-mode agentic use:
-```
-temperature: 1.0
-top_p: 0.95
-top_k: 20
-min_p: 0.0
-presence_penalty: 1.5
-repetition_penalty: 1.0
-max_tokens: 16384
-```
-
-For precise coding / low-variance tool argument generation: `temperature: 0.6`, otherwise as above with `presence_penalty: 0.0`.
-
-`presence_penalty=1.5` is Alibaba's shipped mitigation for the Qwen3-family thinking-mode loop pathology (Qwen's own LiveCodeBench surfaced 17.4% of 1,400 outputs truncated with no `</think>`, scaling to 27.5% on hard problems — measured with the precise-coding preset). It *"may occasionally result in language mixing and a slight decrease in model performance"* per Qwen's docs. A community alternative is `min_p=0.2` with `temperature=1.0` (per `janreges3` on HF `Qwen/Qwen3.5-35B-A3B` discussion #39); if you switch to `min_p=0.2` you can drop `presence_penalty` back to 0.
-
-`max_tokens=16384` gives generous headroom against the truncation crash mode patched in §7.1. Qwen3.6 does NOT support soft `/think` or `/nothink` switches — thinking mode is controlled exclusively via `chat_template_kwargs`.
+`presence_penalty=1.5` is Alibaba's shipped mitigation for the Qwen3-family thinking-mode loop pathology (LiveCodeBench: 17.4% of 1,400 outputs truncated with no `</think>`, 27.5% on hard problems). May cause language mixing and slight perf decrease per Qwen's docs. Community alternative: `min_p=0.2` with `temperature=1.0` (drop `presence_penalty` back to 0). `max_tokens=16384` gives headroom against the truncation crash mode patched in §7.2. Qwen3.6 does NOT support soft `/think` or `/nothink` switches — thinking mode is controlled exclusively via `chat_template_kwargs`.
 
 ### 5.7 `preserve_thinking=true` as a server-side default
 
@@ -201,7 +176,7 @@ For precise coding / low-variance tool argument generation: `temperature: 0.6`, 
 
 `enable_thinking` is *not* set server-side — clients pass `"chat_template_kwargs": {"enable_thinking": true}` in the request body when they want thinking on.
 
-The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.4) is closed by the §7.3 and §7.4 patches.
+The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.1 ingest, §6.4 egress) is closed by the §7.1 and §7.4 patches.
 
 ### 5.8 Multimodal cost accounting
 
@@ -216,155 +191,101 @@ The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.4) is 
 
 ## 6. vLLM issues — complete enumeration and per-issue disposition
 
-Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, **C**. Infrastructure bug, or **D**. Client-interop bug.
+Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, **C**. Infrastructure bug, or **D**. Client-interop bug. The five surviving §6 entries each correspond to one §7 patch in the same numerical slot.
 
-### 6.1 Issue #39056 — `<tool_call>` inside `<think>` swallowed by reasoning parser [Class B]
+### 6.1 Ingest silently drops `reasoning_content` [Class A — vLLM internal inconsistency]
 
-When the model occasionally emits `<tool_call>...</tool_call>` inside `<think>...</think>` (out-of-distribution emission), vLLM's reasoning parser swallows the markup into `reasoning_content` before the tool parser sees it. The response arrives with `tool_calls=[]` and the markup embedded in `reasoning_content` as plain text.
+`vllm/entrypoints/chat_utils.py:1519` reads `message.get("reasoning")` and silently drops `reasoning_content`. The chat template at `chat_template.jinja:91-92` reads `message.reasoning_content` to render historical `<think>` blocks under `preserve_thinking=true`. **vLLM is feeding its own template a field its own ingest discards.** Without resolution, every multi-turn agent loop loses prior reasoning on replay; the model — RL-trained to expect prior-turn reasoning — re-derives context from scratch and tool-arg correctness degrades after 2-3 turns. Our two production clients (Qwen Code CLI, Qwen-Agent) both write `reasoning_content`.
 
-The parser is correct-to-contract: Qwen3.6's chat template never renders historical tool_calls inside `<think>`, the Qwen3-Coder-Next training penalizes the pattern, and Alibaba's own evaluation in `Qwen-Agent/benchmark/deepplanning` strips everything up to `</think>` before parsing. Mid-think emission is a model failure mode.
+**Affects us**: yes. **Resolution**: §7.1.
 
-**Affects us**: yes, intermittently. **Resolution**: §7.5.
+### 6.2 Issue #39771 — qwen3_coder crashes on truncated `<parameter=` tag [Class A]
 
-### 6.2 Issue #39584 — parallel tool calls crash Responses API [Class A]
+`vllm/tool_parsers/qwen3coder_tool_parser.py:236` uses unsafe `str.index(">")`. When the model is truncated mid-`<parameter=NAME` (before `>`), `.index()` raises `ValueError`. The exception is caught at lines 320-324 and the parser returns `tools_called=False, tool_calls=[]` — collapsing **every well-formed sibling tool call in the same response**. Sibling code at line 227 already uses the safe `.find()/-1` pattern; line 236 is an internal inconsistency upstream PR #39772 acknowledges.
 
-`vllm/entrypoints/openai/responses/serving.py:1377` has a hardcoded `assert len(delta_message.tool_calls) == 1`. Legitimate parallel tool calls trip the assertion.
+**Affects us**: yes, whenever a response is truncated by `max_tokens` or by client disconnect mid-generation. **Resolution**: §7.2; complemented by `max_tokens=16384` keeping truncation rare.
 
-**Affects us**: no — we use Chat Completions. **Resolution**: none required.
+### 6.3 Issue #37121 — hybrid-KV scheduler/log under-reports concurrent capacity [Class D — observability bug]
 
-### 6.3 Issue #39771 — qwen3_coder crashes on truncated `<parameter=` tag [Class A]
-
-`vllm/tool_parsers/qwen3coder_tool_parser.py:236` uses unsafe `str.index(">")`. When the model is truncated mid-`<parameter=NAME` (before `>`), `.index()` raises `ValueError`. The exception is caught at line 320-324 and the parser returns `tools_called=False, content=raw_text` — a silent failure. Line 227, handling function names, already uses the safe `.find()`/`-1` pattern; line 236 is an internal inconsistency.
-
-**Affects us**: potentially, whenever a response is truncated by `max_tokens` or by client disconnect mid-generation. **Resolution**: §7.1; complemented by `max_tokens=16384` keeping truncation rare.
-
-### 6.4 `reasoning` vs `reasoning_content` response field name [Class D]
-
-vLLM uses the non-standard field name `reasoning` on **both** sides of the wire:
-
-- **Egress**: responses populate `choices[i].message.reasoning` (non-streaming) and `choices[i].delta.reasoning` (streaming). The OpenAI-standard field name is `reasoning_content`.
-- **Ingest**: on replay of prior assistant turns, vLLM reads `message.reasoning` only (`vllm/entrypoints/chat_utils.py:1519`) and ignores `message.reasoning_content`.
-
-Any client following the OpenAI standard silently loses reasoning in **both directions** every turn — defeats `preserve_thinking` (§5.7).
-
-**Affects us**: yes (Qwen-Agent and Qwen Code CLI both write `reasoning_content`). **Resolution**: §7.3 (egress) and §7.4 (ingest).
-
-### 6.5 vLLM silent tool-parser failure modes [Class A — observability gap]
-
-The `qwen3_coder` tool parser has 8 non-streaming and 6 streaming code paths where it returns `tools_called=False` with the raw `<tool_call>…` markup as `content`, or returns `tools_called=True` with invalid / truncated JSON arguments. All produce HTTP 200 with no error surfaced. vLLM emits no server-side metrics. Community evidence puts baseline frequency at 1–5% of tool-calling responses, rising to 10–20% under long context, reasoning, or speculative decoding.
-
-**Affects us**: yes — silent failures in agent loops manifest as mysterious behavioral drift. **Resolution**: §7.6 (non-streaming) and §7.7 (streaming) turn the silent-failure class into a Prometheus counter `qwen3_coder_silent_tool_call_failures_total{failure_kind, model}`.
-
-### 6.6 `transformers==5.5.4` broken `GenerationConfig` import in latest nightly [Class C]
-
-The 2026-04-21 nightly `vllm/vllm-openai:nightly-b47840019e61a3983c8144066a99c843d177947d` (digest `sha256:d39d4b0f…`) shipped a broken boot path: the statement `from transformers import GenerationConfig, PretrainedConfig` at `vllm/transformers_utils/config.py:18` raised `ImportError` at CLI boot because `transformers._LazyModule` had not initialized the top-level `GenerationConfig` export by the time vLLM's CLI loader imported it. The root cause was vLLM PR #40331 ("Parallelize torch/transformers import + weight prefetch + forkserver prewarm", commit `8256833fe6`, 2026-04-20), which restructured CLI startup such that `_LazyModule` saw a partial transformers state.
-
-**Affects us**: no longer. **Status**: closed upstream by commit `3975eb6de6` (PR #40438, 2026-04-21), which reverted #40331. The currently-pinned image (built 2026-04-26 05:19 UTC, 5 days past the revert) is on the lazy-imports path again — `vllm/entrypoints/cli/main.py:1-30` is back to deferred imports inside `main()`.
-
-### 6.7 Issue #37121 — hybrid-KV scheduler/log under-reports concurrent capacity [Class D — observability bug]
-
-vLLM's V1 paged KV cache manager forms one `KVCacheGroupSpec` per same-shape layer set. For Qwen3.6-27B that's 4 groups (1 full × 16 + 3 GDN × 16). The byte allocator at `vllm/v1/core/kv_cache_utils.py:1148-1169` allocates a single shared pool sized correctly. The bug is purely in *reporting*: `_report_kv_cache_config:1320-1324` and `get_max_concurrency_for_kv_cache_config:802-820` divide by `len(kv_cache_groups)` (4 for our model), so the displayed `GPU KV cache size: X tokens` and `Maximum concurrency` are ~4× understated. `scheduler.max_num_kv_tokens` is also affected but only consumed inside `if vllm_config.parallel_config.enable_return_routed_experts:` — off by default — so admission behavior is unchanged.
-
-For the 27B-AWQ build: boot log says `GPU KV cache size: ~28K tokens`; with patch 2 installed → `~113K tokens`.
+vLLM's V1 paged KV cache manager forms one `KVCacheGroupSpec` per same-shape layer set. For Qwen3.6-27B that's 4 groups (1 full × 16 + 3 GDN × 16). The byte allocator at `vllm/v1/core/kv_cache_utils.py:1148-1169` allocates a single shared pool sized correctly. The bug is purely in *reporting*: `_report_kv_cache_config:1305-1346` and `get_max_concurrency_for_kv_cache_config:802-820` divide by `len(kv_cache_groups)` (4 for our model), so the displayed `GPU KV cache size: X tokens` and `Maximum concurrency` are ~4× understated. For the 27B-AWQ build: boot log says `GPU KV cache size: ~28K tokens`; with patch 3 installed → `~113K tokens`. Operators sizing `--max-model-len` against the displayed number under-utilize their hardware.
 
 **Upstream status (2026-04-25)**: issue #37121 open since 2026-03-15. PR #40384 (narrow scheduler-reporting fix, our backport source) and competing PR #40694 both open. PR #37429 (broader byte-level redesign) blocked on RFC.
 
-**Resolution**: backported as `monkey_patch_hybrid_kv_allocator.py` (§7.2). Cosmetic for the deployment — byte allocation and admission are correct without it.
+**Resolution**: §7.3. Cosmetic for the deployment — byte allocation and admission are correct without it.
+
+### 6.4 Egress emits non-standard `reasoning` field name [Class D]
+
+vLLM emits the non-standard field name `reasoning` on the wire (since commit `c5113f60f2` deliberately removed `reasoning_content`). Qwen-Agent's OAI client at `Qwen-Agent/qwen_agent/llm/oai.py:111-112,126-127,169` strict-checks `reasoning_content` with **no fallback**; without the alias, every multi-turn agent loop loses prior reasoning on egress and degrades after 2-3 turns. Pydantic v2 compiled core schemas embed nested schemas by snapshot at build time, so a leaves-only rebuild still leaks `reasoning` through wrappers — every class on the dump chain must rebuild under `serialize_by_alias=True` for the leaf alias to reach the wire.
+
+**Affects us**: yes. **Resolution**: §7.4 (egress). §7.1 closes the matching ingest half.
+
+### 6.5 Issue #39056 — `<tool_call>` inside `<think>` is model OOD, not a parser bug [Class B]
+
+Qwen3.6 occasionally emits `<tool_call>...</tool_call>` markup inside `<think>...</think>` (single-digit percent under agentic workloads). Upstream's `Qwen3ReasoningParser.extract_reasoning` correctly partitions on `</think>` first (`qwen3_reasoning_parser.py:142-144`) and routes mid-think markup to `reasoning`. **The parser is correct to its contract; the model is misbehaving.** Qwen3.6's chat template never renders historical tool_calls inside `<think>`, the Qwen3-Coder-Next training penalizes the pattern, and Alibaba's own evaluation in `Qwen-Agent/benchmark/deepplanning` strips everything up to `</think>` before parsing.
+
+**Affects us**: yes, intermittently. **Resolution**: §7.5 (detect, don't rescue). The agent's retry policy decides what to do; the patch surfaces a structured WARNING so an operator can monitor the rate.
+
+### 6.6 Issue #39584 — parallel tool calls crash Responses API [Class A — sidestepped]
+
+`vllm/entrypoints/openai/responses/serving.py:1377` has a hardcoded `assert len(delta_message.tool_calls) == 1`. **Affects us**: no — we use Chat Completions.
+
+### 6.7 `transformers` `GenerationConfig` import regression [Class C — closed]
+
+The 2026-04-21 nightly shipped a broken boot path. Root cause was vLLM PR #40331; closed upstream by commit `3975eb6de6` (PR #40438). The currently-pinned image is past the revert.
 
 ---
 
 ## 7. The patches in this repo
 
-Seven monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patch 2; see §7.S). There is no client-side code in this repo.
+Five monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patch 3; see §7.S). There is no client-side code in this repo.
 
-Each patch addresses a specific defect named in §6 and only that defect. Each strictly validates its target's structure via landmarks before touching anything, and refuses to apply on any landmark mismatch with a typed exception that names the exact landmark that failed. The patch file itself is the source of truth; this section is a contract index.
+Each patch addresses a specific defect named in §6 and only that defect. Each strictly validates its target's structure via landmarks, refuses to apply on any landmark mismatch with a typed exception that names the exact landmark that failed, stamps `__qwen36_patch__` on every target, and verifies via both `getattr` and `inspect.getattr_static` that its install took effect. The patch file itself is the source of truth; this section is a contract index.
 
 | # | File | Defect addressed |
 |---|---|---|
-| 1 | [`monkey_patch_qwen3_coder.py`](monkey_patch_qwen3_coder.py) | §6.3 / #39771 — `_parse_xml_function_call` crash on truncated `<parameter=` |
-| 2 | [`monkey_patch_hybrid_kv_allocator.py`](monkey_patch_hybrid_kv_allocator.py) | §6.7 / #37121 (PR #40384 backport) — boot-log under-reporting |
-| 3 | [`monkey_patch_reasoning_field_egress.py`](monkey_patch_reasoning_field_egress.py) | §6.4 egress — rename `reasoning` → `reasoning_content` on response serialization |
-| 4 | [`monkey_patch_reasoning_field_ingest.py`](monkey_patch_reasoning_field_ingest.py) | §6.4 ingest — accept `reasoning_content` on replayed assistant messages |
-| 5 | [`monkey_patch_tool_call_in_think_rescue.py`](monkey_patch_tool_call_in_think_rescue.py) | §6.1 / #39056 — rescue `<tool_call>` blocks emitted inside `<think>` |
-| 6 | [`monkey_patch_extract_tool_calls_metrics.py`](monkey_patch_extract_tool_calls_metrics.py) | §6.5 non-streaming observability — Prometheus + WARNING on `markup_leak` |
-| 7 | [`monkey_patch_extract_tool_calls_streaming_metrics.py`](monkey_patch_extract_tool_calls_streaming_metrics.py) | §6.5 streaming observability — per-delta `markup_leak_streaming` |
-| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports patches 1–7 in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
+| 1 | [`monkey_patch_reasoning_field_ingest.py`](monkey_patch_reasoning_field_ingest.py) | §6.1 — accept `reasoning_content` on replayed assistant messages |
+| 2 | [`monkey_patch_qwen3_coder.py`](monkey_patch_qwen3_coder.py) | §6.2 / #39771 — `_parse_xml_function_call` crash on truncated `<parameter=` |
+| 3 | [`monkey_patch_hybrid_kv_allocator.py`](monkey_patch_hybrid_kv_allocator.py) | §6.3 / #37121 (PR #40384 backport) — boot-log under-reporting |
+| 4 | [`monkey_patch_reasoning_field_egress.py`](monkey_patch_reasoning_field_egress.py) | §6.4 — rename `reasoning` → `reasoning_content` on response serialization |
+| 5 | [`monkey_patch_tool_call_in_think_detector.py`](monkey_patch_tool_call_in_think_detector.py) | §6.5 / #39056 — detect `<tool_call>` emitted inside `<think>`, structured WARNING |
+| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 5 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
+| S | [`sitecustomize.py`](sitecustomize.py) | CPython auto-imports this from `PYTHONPATH=/opt/patches` at every interpreter startup — including the spawned EngineCore subprocess — so patch 3's targets are live in EngineCore's own `sys.modules` |
 
-### 7.1 Patch 1 — `monkey_patch_qwen3_coder.py`
-
-Replaces `Qwen3CoderToolParser._parse_xml_function_call` to use `str.find(">")` and, on a malformed `<parameter=` tag, return `None` for the whole tool call rather than raising `ValueError` (which the upstream `try/except Exception` collapses into "drop all N tool calls in this response"). Sibling well-formed tool calls in the same response are preserved. The dropped call's markup leaks to `content`, where §7.6 / §7.7 surface it as `markup_leak`. **Removal trigger**: PR #39772 merges.
-
-### 7.2 Patch 2 — `monkey_patch_hybrid_kv_allocator.py`
-
-Replaces `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config` in `vllm.v1.core.kv_cache_utils`. Both reporting sites divide by `len(kv_cache_groups)` (4 for our model: 1 attn + 3 GDN), making displayed token capacity ~4× understated. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`). Boot log `GPU KV cache size` goes from `~28K tokens` to `~113K tokens` on the 27B-AWQ build. Backport semantics, not literal port — the pinned commit's `MambaSpec.max_memory_usage_bytes` signature is `(self, vllm_config)`, not the master signature PR #40384 targets. **Removal trigger**: PR #40384 or PR #40694 merges.
-
-### 7.3 Patch 3 — `monkey_patch_reasoning_field_egress.py`
-
-Installs Pydantic v2 `serialization_alias = "reasoning_content"` on the `reasoning` field of `ChatMessage` and `DeltaMessage`, flips `model_config["serialize_by_alias"] = True`, deletes the cached `__pydantic_core_schema__` / `__pydantic_validator__` / `__pydantic_serializer__`, and calls `model_rebuild(force=True)`. Every response-serialization path emits `reasoning_content` on the wire. The internal Python attribute stays `.reasoning` — `serving.py:1036-1037` reads it as an attribute. **Removal trigger**: vLLM ships native `reasoning_content` on Chat Completions.
-
-### 7.4 Patch 4 — `monkey_patch_reasoning_field_ingest.py`
+### 7.1 Patch 1 — `monkey_patch_reasoning_field_ingest.py`
 
 Wraps `vllm.entrypoints.chat_utils._parse_chat_message_content`. When `role == "assistant"`, `reasoning is None`, and `reasoning_content` is a non-None string, synthesises a shallow copy with `reasoning` populated from `reasoning_content`. Both fields present with **different** values raises `ReasoningFieldAmbiguityError` (HTTP 400). Identical values pass through. Non-string `reasoning_content` (dict, list) refuses rather than being stringified. **Removal trigger**: vLLM widens ingest to accept `reasoning_content`.
 
-### 7.5 Patch 5 — `monkey_patch_tool_call_in_think_rescue.py`
+### 7.2 Patch 2 — `monkey_patch_qwen3_coder.py`
 
-Wraps `Qwen3ReasoningParser.extract_reasoning` (non-streaming) and `.extract_reasoning_streaming` (streaming). Moves any `<tool_call>...</tool_call>` markup the model emits INSIDE `<think>...</think>` out of reasoning and into content, so the downstream `Qwen3CoderToolParser` can see it.
+Replaces `Qwen3CoderToolParser._parse_xml_function_call` to use `str.find(">")` and, on a malformed `<parameter=` tag, return `None` for the whole tool call rather than raising `ValueError` (which the upstream `try/except Exception` collapses into "drop all N tool calls in this response"). Sibling well-formed tool calls in the same response are preserved. The MRO walk for inherited `self.tools` / `self.tool_call_parameter_regex` attribute landmarks is load-bearing per the prior audit (the inherited `self.tools` from `ToolParser.__init__` would refuse incorrectly under a non-walking check). **Removal trigger**: PR #39772 merges.
 
-The streaming path is architecturally load-bearing: `parse_delta` gates the tool-parser handoff on `self.is_reasoning_end(delta_token_ids)` (requires `</think>` in the current delta's tokens). Mid-`<think>`, that predicate is False, so a `DeltaMessage(content="<tool_call>…</tool_call>")` returned from the reasoning parser goes directly to the wire without ever reaching `extract_tool_calls_streaming`. The patch solves it with **deferred flush**: completed rescue blocks accumulate in a per-instance pending list; on the handoff delta the concatenation is prepended to upstream's `content` so the tool parser parses each complete block in a single pass.
+### 7.3 Patch 3 — `monkey_patch_hybrid_kv_allocator.py`
 
-**Removal trigger**: vLLM adopts a reasoning parser that re-routes tool-call markup itself.
+Replaces `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config` in `vllm.v1.core.kv_cache_utils`. Both reporting sites divide by `len(kv_cache_groups)` (4 for our model: 1 attn + 3 GDN), making displayed token capacity ~4× understated. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`). Boot-log `GPU KV cache size` goes from `~28K tokens` to `~113K tokens`. Backport semantics, not literal port — the pinned commit's `MambaSpec.max_memory_usage_bytes` signature is `(self, vllm_config)`, not the master signature PR #40384 targets. **Removal trigger**: PR #40384 or PR #40694 merges. **CRITICAL**: remove BEFORE pulling an image with PR #37429 (the broader byte-level redesign) — it changes the tensor layout and the patch's reporting view would no longer be coherent.
 
-### 7.6 Patch 6 — `monkey_patch_extract_tool_calls_metrics.py`
+### 7.4 Patch 4 — `monkey_patch_reasoning_field_egress.py`
 
-Wraps `Qwen3CoderToolParser.extract_tool_calls` (non-streaming). Fires server-side observability iff the result has the silent-failure shape (`tools_called is False` AND `model_output` contains `<tool_call>` / `<function=` / `<parameter=`); returns the upstream result unchanged. Emits Prometheus counter `qwen3_coder_silent_tool_call_failures_total{failure_kind="markup_leak", model=...}` plus a structured WARNING. Observation-only — upstream call is OUTSIDE the instrumentation `try/except`. **Removal trigger**: vLLM ships first-class metrics for tool-parser silent failures.
+Installs Pydantic v2 `serialization_alias = "reasoning_content"` on the `reasoning` field of `ChatMessage` and `DeltaMessage`, flips `model_config["serialize_by_alias"] = True` on **all six** classes that vLLM dumps on the wire (the two leaves plus `ChatCompletionResponseChoice`, `ChatCompletionResponseStreamChoice`, `ChatCompletionResponse`, `ChatCompletionStreamResponse`), drops the cached `__pydantic_core_schema__` / `__pydantic_validator__` / `__pydantic_serializer__`, and calls `model_rebuild(force=True)`. A leaves-only patch is provably insufficient — Pydantic v2 compiled core schemas embed nested schemas by snapshot at build time. Phase 3 verification constructs real `ChatCompletionResponse` and `ChatCompletionStreamResponse` instances, dumps each via `model_dump_json()` and `model_dump_json(exclude_unset=True)`, and asserts wire bytes contain `"reasoning_content":` and not `"reasoning":`. The internal Python attribute stays `.reasoning`. **Removal trigger**: vLLM ships native `reasoning_content` on Chat Completions.
 
-### 7.7 Patch 7 — `monkey_patch_extract_tool_calls_streaming_metrics.py`
+### 7.5 Patch 5 — `monkey_patch_tool_call_in_think_detector.py`
 
-Wraps `Qwen3CoderToolParser.extract_tool_calls_streaming`. Per-delta detection of `markup_leak_streaming` (non-empty `content` containing a complete marker AND empty `tool_calls`). Shares the counter with §7.6 via `failure_kind` label; on collision (already-registered) looks up the existing collector via `prometheus_client.REGISTRY._names_to_collectors` and reuses it. Partial markers do not fire — cross-delta accumulation is not implemented (acceptable observability noise, not a correctness bug). **Removal trigger**: same as §7.6.
+Wraps `Qwen3ReasoningParser.extract_reasoning` (non-streaming **only**) and emits a single structured WARNING (`model_emit_warning kind=tool_call_in_reasoning reasoning_len=N marker_count=M`) whenever the upstream-returned reasoning half contains literal `<tool_call>` markup. The wrapped return value is the upstream tuple **unchanged** — the agent's retry policy decides what to do. Detect, don't rescue: the parser is correct to its contract, the model is misbehaving, and a state-machine bandage across streaming deltas is high-complexity for a stochastic model-OOD failure mode. Streaming path is intentionally unwrapped — the rate is a model-side property, not per-modality, and a single non-streaming wrapper suffices. **Removal trigger**: Qwen3.6 retraining eliminates the OOD emission.
 
 ### 7.L Launcher — `launch_with_patches.py`
 
 Container entrypoint, replacing `["vllm", "serve"]` with `["python", "/opt/patches/launch.py", "serve", ...]`. Imports every registered patch in `_PATCH_MODULES` order, runs the per-patch `_PATCH_VERIFICATION` verifier for each (re-imports the relevant vLLM target FROM SCRATCH and asserts the install took effect), then hands off to vLLM's CLI via `runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__", alter_sys=True)`. Required because `PYTHONSTARTUP` does not fire under non-interactive entrypoints.
 
-The Pydantic-schema patch (egress) adds a behavioural verification — constructs an instance and asserts `model_dump()['reasoning_content']` equals a probe value while `'reasoning'` is absent — because a tag-only check would miss a "tag stamped but serializer rebuild silently failed" regression.
+Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5 carry tag-only verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications (the egress patch's wire-dump check; the ingest patch's static-lookup check) carry the load-bearing functional verification, so duplicating it here would only double the surface area.
 
-**Load order** matters: `reasoning_field_egress` must come before `tool_call_in_think_rescue` because the egress patch rebuilds the `DeltaMessage` Pydantic schema and the rescue patch constructs `DeltaMessage` instances at request time.
-
-**Known limitation — plugin-snapshot gap**: if vLLM's tool-parser registry takes a snapshot of a class before the patch ran, the verifier would pass and the served parser would still be unpatched. Mitigation: live smoke test (POST requests exercising each patched path).
+Three pre-flight checks run BEFORE the per-patch import loop: sitecustomize-present (refuse if Debian's stub got loaded instead of ours), registry drift (refuse if `sitecustomize._PATCH_MODULES != launch_with_patches._PATCH_MODULES`), and a subprocess install probe (`subprocess.run([sys.executable, "-c", PROBE])` to confirm a freshly-spawned interpreter sees patched targets). All three are load-bearing for patch 3 — without them, the spawned EngineCore silently runs unpatched code while the launcher reports success. **Load order** matters: `reasoning_field_egress` (patch 4) must come before any patch that constructs `DeltaMessage` at request time, since the rebuild changes Pydantic's compiled schema.
 
 ### 7.S sitecustomize loader — `sitecustomize.py`
 
-A defect class `launch_with_patches.py` alone cannot fix: vLLM v1 spawns its EngineCore as a separate `multiprocessing` child process, and on Linux + CUDA the start method is `spawn` (`vllm/utils/system_utils.py:_maybe_force_spawn` forces it after CUDA init — `fork` is forbidden). `spawn` means the EngineCore is a fresh Python interpreter that inherits the parent's environment but **not** the parent's `sys.modules`. Patches installed in the launcher's PID-1 process therefore have no effect on EngineCore unless re-imported in EngineCore's interpreter.
+vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the five patches, **only patch 3** (`monkey_patch_hybrid_kv_allocator`) targets EngineCore-resident code; patches 1, 2, 4, 5 target API-server-resident code and become live in PID 1 directly. Without `sitecustomize`, patch 3 is silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~29K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~117K tokens).
 
-Of the seven patches in this repo, **only patch 2** (`monkey_patch_hybrid_kv_allocator`) targets EngineCore-resident code: `vllm.v1.core.kv_cache_utils._report_kv_cache_config` and `get_max_concurrency_for_kv_cache_config` are called by the EngineCore at boot reporting time, never by the API server. Patches 1, 3, 4, 5, 6, 7 all target API-server-resident code and become live in PID 1 directly. So without `sitecustomize`, only patch 2 is silently dead — and the launcher's PID-1 verifier reports success (the in-process check sees its own patched module) while the operator-visible boot log shows the unpatched value.
+CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interpreter startup, including spawned children. With `PYTHONPATH=/opt/patches`, `site.py` finds our file, which imports each patch in launcher order. Each patch's strict landmark check runs in EngineCore too; any refusal aborts startup loudly. The same flow runs in PID 1 — sitecustomize installs the patches, `launch.py` then hits cache via `importlib.import_module(...)`. Each patch's module-level code fires once.
 
-Empirical fingerprint:
-
-```
-# Without sitecustomize — boot log shows the upstream filename:
-(EngineCore pid=NNN) INFO TIME [kv_cache_utils.py:1337]
-    GPU KV cache size: 29,008 tokens
-
-# With sitecustomize — boot log shows the patched filename:
-(EngineCore pid=190) INFO TIME [monkey_patch_hybrid_kv_allocator.py:743]
-    GPU KV cache size: 116,816 tokens
-```
-
-The filename annotation switch is the cleanest pass/fail discriminator for "is patch 2 live in EngineCore", and it is exactly what `tier3_enginecore_install_audit.py` asserts.
-
-**How sitecustomize fixes it.** CPython's `site.py` (standard library) auto-imports a top-level `sitecustomize` module from `sys.path` at every interpreter startup, including spawned multiprocessing children, before any user code runs. With `PYTHONPATH=/opt/patches` set in the docker run command, `/opt/patches` is on `sys.path` and our `sitecustomize.py` is what `site.py` finds. The flow inside the EngineCore's spawned interpreter:
-
-1. `multiprocessing.spawn` creates a fresh `python3` process and inherits `PYTHONPATH=/opt/patches`.
-2. The fresh interpreter runs `site.py`.
-3. `site.py` finds `/opt/patches/sitecustomize.py` and imports it.
-4. Our sitecustomize imports each of the seven patches in launcher order. Each patch's strict landmark check runs; any refusal aborts EngineCore startup loudly.
-5. EngineCore's main code subsequently sees the patched targets in its own `sys.modules`.
-
-The same flow runs in PID 1 (the launcher's interpreter): `site.py` runs first, sitecustomize installs the patches, then `launch.py` is loaded and its `importlib.import_module(...)` calls hit the cache. The launcher's verifiers still run for defense-in-depth; there is no double-install (each patch's module-level code only fires on first import).
-
-**Load-bearing for**: patch 2. **Defense-in-depth for**: patches 1, 3, 4, 5, 6, 7 (the launcher already imports them in PID 1; sitecustomize ensures the same install runs in any EngineCore-side child too, harmlessly cached).
-
-**Removal trigger**: patch 2 is the only EngineCore-side patch, so when `monkey_patch_hybrid_kv_allocator.py` is removed (PR #40384 / #40694 merges), `sitecustomize.py` does not strictly need to remain. Recommendation is to keep it for defense-in-depth — any future patch that targets EngineCore-resident code would silently fail in EngineCore without it.
+**Load-bearing for**: patch 3. **Defense-in-depth for**: patches 1, 2, 4, 5. **Removal trigger**: when patch 3 is removed; recommendation is to keep for defense-in-depth.
 
 ---
 
@@ -387,13 +308,11 @@ docker run --rm -d --name qwen36 --gpus all \
   --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -v "$PWD/sitecustomize.py:/opt/patches/sitecustomize.py:ro" \
+  -v "$PWD/monkey_patch_reasoning_field_ingest.py:/opt/patches/monkey_patch_reasoning_field_ingest.py:ro" \
   -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \
   -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \
   -v "$PWD/monkey_patch_reasoning_field_egress.py:/opt/patches/monkey_patch_reasoning_field_egress.py:ro" \
-  -v "$PWD/monkey_patch_reasoning_field_ingest.py:/opt/patches/monkey_patch_reasoning_field_ingest.py:ro" \
-  -v "$PWD/monkey_patch_tool_call_in_think_rescue.py:/opt/patches/monkey_patch_tool_call_in_think_rescue.py:ro" \
-  -v "$PWD/monkey_patch_extract_tool_calls_metrics.py:/opt/patches/monkey_patch_extract_tool_calls_metrics.py:ro" \
-  -v "$PWD/monkey_patch_extract_tool_calls_streaming_metrics.py:/opt/patches/monkey_patch_extract_tool_calls_streaming_metrics.py:ro" \
+  -v "$PWD/monkey_patch_tool_call_in_think_detector.py:/opt/patches/monkey_patch_tool_call_in_think_detector.py:ro" \
   -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
   -e VLLM_USE_V1=1 \
@@ -416,54 +335,33 @@ docker run --rm -d --name qwen36 --gpus all \
   --limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'
 ```
 
-Each flag's rationale lives in §5. Load-bearing items:
-- `--limit-mm-per-prompt` — default crashes boot (§5.8).
-- `--max-model-len 65536` — set by the byte budget (§5.2).
-- `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` — tool calling.
-- `--reasoning-parser qwen3` — server-side `<think>` extraction.
-- `--default-chat-template-kwargs '{"preserve_thinking": true}'` — preserves thinking across turns (§5.7).
-- `--host 127.0.0.1` — loopback-only binding. Combined with `--network host` (which removes Docker's port-forwarding indirection), vLLM listens only on the host's loopback interface. Do **not** change to `--host 0.0.0.0` on a publicly-routable host without an authenticating reverse proxy in front — vLLM has no built-in auth and the /v1/* and /metrics endpoints would be world-accessible.
-- `sitecustomize.py` bind-mount — load-bearing for patch 2 (`monkey_patch_hybrid_kv_allocator`). vLLM v1 spawns its EngineCore as a fresh Python interpreter (CUDA forbids `fork` after init); without sitecustomize, patch 2's launcher install in PID 1 has no effect on EngineCore, and the boot-log "GPU KV cache size" line shows the unpatched (~4× under-counted) value. See `sitecustomize.py`'s docstring for the full rationale and `tier3_enginecore_install_audit.py` for the strict assertion.
+Each flag's rationale lives in §5. Load-bearing items: `--limit-mm-per-prompt` (default crashes boot, §5.8); `--max-model-len 65536` (byte budget, §5.2); `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` (tool calling); `--reasoning-parser qwen3` (server-side `<think>` extraction); `--default-chat-template-kwargs '{"preserve_thinking": true}'` (§5.7); `--host 127.0.0.1` + `--network host` (loopback-only — do not change to `0.0.0.0` on a publicly-routable host without an authenticating reverse proxy; vLLM has no built-in auth); `sitecustomize.py` bind-mount (load-bearing for patch 3, see §7.S).
 
 ### 8.3 Smoke tests
 
-**Liveness**:
 ```bash
-curl -fs http://127.0.0.1:8000/health
-# expects: HTTP 200, empty body
-```
+# Liveness
+curl -fs http://127.0.0.1:8000/health  # expects HTTP 200, empty body
 
-**Chat with thinking and tool schema**:
-```bash
+# Chat with thinking + tool schema
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "Qwen3.6-27B-AWQ",
-    "messages": [
-      {"role": "user", "content": "What is 127 * 349?"}
-    ],
-    "tools": [
-      {"type": "function", "function": {
-        "name": "calculator",
-        "description": "Evaluate a math expression.",
-        "parameters": {
-          "type": "object",
-          "properties": {"expr": {"type": "string"}},
-          "required": ["expr"]
-        }
-      }}
-    ],
-    "temperature": 0.6,
-    "max_tokens": 4096,
-    "extra_body": {
-      "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true}
-    }
+    "messages": [{"role": "user", "content": "What is 127 * 349?"}],
+    "tools": [{"type": "function", "function": {
+      "name": "calculator", "description": "Evaluate a math expression.",
+      "parameters": {"type": "object", "properties": {"expr": {"type": "string"}},
+                     "required": ["expr"]}
+    }}],
+    "temperature": 0.6, "max_tokens": 4096,
+    "extra_body": {"chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true}}
   }' | jq .
 ```
 
-Expected (after the §7.3 egress patch is installed): `choices[0].message.reasoning_content` contains the `<think>` content; `choices[0].message.tool_calls[0].function.name == "calculator"` with valid JSON `arguments`; `finish_reason == "tool_calls"`.
+Expected (after §7.4 egress patch): `choices[0].message.reasoning_content` populated; `choices[0].message.tool_calls[0].function.name == "calculator"` with valid JSON `arguments`; `finish_reason == "tool_calls"`.
 
-**Operator visibility for silent tool-parser failures**: scrape `qwen3_coder_silent_tool_call_failures_total{failure_kind, model}` from the server's Prometheus endpoint. Non-zero rate indicates a residual parser silent-failure rate; investigate at the model-prompt level.
+**Operator visibility for `<tool_call>`-in-`<think>` model-OOD emission**: grep server logs for `model_emit_warning kind=tool_call_in_reasoning` (the §7.5 detector's structured WARNING).
 
 ---
 
@@ -472,73 +370,61 @@ Expected (after the §7.3 egress patch is installed): `choices[0].message.reason
 | Item | Evidence status |
 |---|---|
 | Long-context retrieval quality past ~32K | Only 16 of 64 layers are full attention; long-range retrieval rides on a thin substrate. No RULER / needle-in-haystack numbers published for Qwen3.6-27B at any precision. Validate on your workload before committing. |
-| `<tool_call>`-inside-`<think>` frequency, and thinking-mode loop rate under our specific AWQ config | `<tool_call>`-inside-`<think>` is community-reported at single-digit-percent. Patch §7.5 handles it; watch the `qwen3_coder_silent_tool_call_failures_total` series for residual rate. **Thinking-mode loop rate** is measured at 17.4% on Qwen3.5-35B-A3B unquantized (issue #88 on `QwenLM/Qwen3.6`); we have not measured it under our AWQ + BF16-linear-attn + BF16-KV config against a BF16-weights baseline. |
-| Hybrid KV scheduler-reporting bug (§6.7) | Boot log under-reports concurrent-KV capacity by ~4×. Patch 2 corrects the log; admission behavior is identical with or without it. Tracked at vLLM #37121. |
+| `<tool_call>`-inside-`<think>` frequency, and thinking-mode loop rate under our specific AWQ config | `<tool_call>`-inside-`<think>` is community-reported at single-digit-percent. Patch §7.5 detects and surfaces it as a structured WARNING (`model_emit_warning kind=tool_call_in_reasoning`); watch logs for the residual rate. **Thinking-mode loop rate** is measured at 17.4% on Qwen3.5-35B-A3B unquantized (issue #88 on `QwenLM/Qwen3.6`); not measured under our AWQ + BF16-linear-attn + BF16-KV config. |
+| Hybrid KV scheduler-reporting bug (§6.3) | Boot log under-reports concurrent-KV capacity by ~4×. Patch 3 corrects the log; admission behavior is identical with or without it. Tracked at vLLM #37121. |
 | Image count boot failure threshold (§5.8) | `image ∈ {0, 1, 2, 3}` boots; `image ∈ {10, 100, 999}` (and the default-999 when flag omitted) crash with TensorRT-LLM `throwRuntimeError`. We did not bisect 4–9; treat 3 as the ceiling. |
 
 ---
 
 ## 10. What this deployment explicitly does not use
 
-| Option | Status | Reason not chosen |
-|---|---|---|
-| llama.cpp | Not chosen | No dedicated Qwen3 tool / reasoning parser at master `0d0764df` (verified 2026-04-22); generic `peg-native` has four live OPEN failure modes. Vision resize is BILINEAR vs HF BICUBIC. Agentic prompt-cache regression on 27B-class models with `--cache-ram` is open (#21383). Full citations in §5.4. |
-| SGLang | Considered, not chosen | `qwen3_coder` tool parser exists but is independent from vLLM's, and our §7 patches target vLLM's parser surface specifically. Validated SGLang boot for 27B-AWQ was blocked by a Triton dtype mismatch in `causal_conv1d_triton.py:510` (`Mismatched type for col0 between then block (<['256'], bf16>) and else block (<['256'], fp16>)`); vLLM bypasses this via `mamba_mixer2 + gdn_attention_core`. |
-| Other community quants (NVFP4, GPTQ, MXFP4) | Rejected | Triaged in §3.1; either don't fit on 32 GiB, lack documented recipes, strip vision, or target other runtimes. |
-| MTP speculative decoding | Disabled by default | MTP head present in checkpoint but auto-skipped at load. Append `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'` to enable; not validated on this stack (§5.3). |
-| Parallel tool calls via Responses API | Not used | vLLM issue #39584 crashes the Responses-API streaming path. Chat Completions sidesteps the bug. |
-| `--enable-chunked-prefill` as an explicit flag | Implicit | Default on; auto-forced by `--enable-prefix-caching` on this hybrid model. |
-| TurboQuant low-bit KV | Not available *yet* | Hybrid follow-up vLLM PR #39931 (open, ready-for-review). Realistic merge mid-May 2026. |
+| Option | Reason |
+|---|---|
+| llama.cpp | No Qwen3 tool/reasoning parser; vision uses BILINEAR vs HF BICUBIC; agentic prompt-cache regression #21383 open. Full citations §5.4. |
+| SGLang | Triton dtype mismatch in `causal_conv1d_triton.py:510` blocked our 27B-AWQ boot; vLLM bypasses via `mamba_mixer2 + gdn_attention_core`. |
+| Other quants (NVFP4, GPTQ, MXFP4) | Triaged in §3.1; don't fit on 32 GiB, lack recipes, strip vision, or target other runtimes. |
+| MTP speculative decoding | Head auto-skipped at load; not validated on this stack (§5.3). |
+| Parallel tool calls via Responses API | #39584 crashes streaming path; Chat Completions sidesteps. |
+| `--enable-chunked-prefill` flag | Implicit — default on, auto-forced by `--enable-prefix-caching`. |
+| TurboQuant low-bit KV | vLLM PR #39931 open; realistic merge mid-May 2026. |
 
 ---
 
 ## 11. Remaining work for the 27B-AWQ deployment
 
-The 27B-AWQ deployment booted and served a 210-prompt corpus on 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). The two A-list patch fixes are closed. Of the seven B-list validation paths, four are now validated end-to-end (B1 partial, B2 unit, B3, B5) and three remain open (B4, B6, B7).
+The 27B-AWQ deployment booted and served a 210-prompt corpus on 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). The A-list patch fixes are closed: A1 (egress nested-serialization regression — superseded by §7.4 v3 with end-to-end nested-dump verification) and A2 (the `launch_no_p1.py` empty-directory artifact, removed).
 
-### 11.1 Patches to implement before declaring "production"
+### 11.1 Validation status
 
-**A1 — RESOLVED (2026-04-26).** The §7.3 egress patch was redesigned (v1 → v2) to fix the nested-serialization regression. v2 patches six classes in dependency order: leaves (`ChatMessage`, `DeltaMessage` — alias + `serialize_by_alias=True` + rebuild) plus four wrappers (`ChatCompletionResponseChoice`, `ChatCompletionResponseStreamChoice`, `ChatCompletionResponse`, `ChatCompletionStreamResponse` — `serialize_by_alias=True` + rebuild only). The patch's verification phase now constructs a real `ChatCompletionResponse(...).model_dump_json()` and `ChatCompletionStreamResponse(...).model_dump_json(exclude_unset=True)` and asserts wire bytes contain `"reasoning_content":"<probe>"` and not `"reasoning":`. The launcher's `_verify_reasoning_field_egress` runs the same check independently. `tests/test_patches_against_master.py` Section 3b reproduces the mechanism on a structural Pydantic mirror with a negative control proving the v1-style leaves-only patch leaks `reasoning` while v2 does not.
-
-**A2 — RESOLVED (2026-04-26 audit).** A prior README revision suspected `monkey_patch_qwen3_coder.py` was disabled in a `launch_no_p1.py` variant. That variant does not exist as a launcher in this repo — `launch_no_p1.py` is an empty root-owned directory leftover from a discarded experiment. The active `launch_with_patches.py` imports patch 1 normally, and `tests/test_patches_against_master.py` confirms the buggy `match_text.index(">")` landmark is byte-identical at the pinned commit (`qwen3coder_tool_parser.py:236`), so the patch installs cleanly. PR #39772 has not landed upstream.
-
-### 11.2 Validation gaps for the 27B-AWQ deployment
-
-The 2026-04-25 validation booted the server and ran 210 non-streaming text-only prompts. Subsequent tier-2/3/4 test rounds (2026-04-26 → 2026-04-27) extended coverage to wire-format strictness, EngineCore-side patch installation, multi-turn agentic tool calling, streaming correctness, and tool-call-in-think rescue at unit-level. Status per row:
-
-| ID | Path | Status (2026-04-27) | Coverage |
+| ID | Path | Status | Coverage |
 |---|---|---|---|
-| **B1** | Tool-bearing requests | **Partial** | tier-4 test4 (5-turn agentic HTTP torture, 4 tools wired, `tool_calls[]` populated and round-tripped) and tier-3 truncation_metrics (synthetic-truncation requests) cover the tool-call wire path. Specific schema variation (parallel tools in a single response, deeply nested params, array-of-object, `anyOf`) is not yet broken out into a dedicated corpus. |
-| **B2** | Tool-call-in-think rescue | **Unit-validated; live elicitation deferred** | tier-4 test2 covers patch 5's deferred-flush state machine end-to-end with synthetic tokens; tier-3 tool_call_in_think.log shows 12/12 forced-mid-think rescues both non-streaming and streaming. Still pending: a system-prompt corpus that elicits `<tool_call>` inside `<think>` from the live model without seeded prefixes (we have not yet measured the in-the-wild rate on this AWQ build). |
-| **B3** | Multi-turn `reasoning_content` round-trip | **Validated** | tier-3 preserve_thinking.log: PRESERVE/STRIPPED/CORRUPTED arms all distinguishable, model demonstrably reads injected reasoning on turn 2; tier-4 test4 round-trips `reasoning_content` across 5 agentic turns. |
-| **B4** | Vision input | **Open** | Model is VL; corpus and tier-3/4 tests are text-only. Real-image runs (BICUBIC resize, 1.56 GiB profiling reservation, `--limit-mm-per-prompt` ceiling) still pending. |
-| **B5** | Streaming correctness | **Validated** | tier-3 tool_call_in_think.log streaming arm: 12/12 rescued on streaming; tier-4 test3 covers patch 7's streaming markup-leak classifier end-to-end; tier-4 test4 round-trips `reasoning_content` across deltas. |
-| **B6** | Concurrency stress | **Open** | Two-concurrent-60K-token request validation pending; would also test the actual concurrent capacity reported by patch 2 (`Maximum concurrency: 13.55x` for 8K tokens / request at the live boot). |
+| **B1** | Tool-bearing requests | **Partial** | 5-turn agentic HTTP torture covers `tool_calls[]` round-trip; specific schema variation (parallel tools, deeply nested params, `anyOf`) not yet broken out into a dedicated corpus. |
+| **B2** | Tool-call-in-think | **Detector-validated; rescue intentionally not implemented** | §7.5 detects and emits a structured WARNING; the agent's retry policy decides what to do. Earlier rescue patch removed (over-engineered for stochastic model OOD). |
+| **B3** | Multi-turn `reasoning_content` round-trip | **Validated** | PRESERVE/STRIPPED/CORRUPTED arms distinguishable; 5-turn agentic round-trip of `reasoning_content`. |
+| **B4** | Vision input | **Open** | Model is VL; corpus is text-only. Real-image runs pending. |
+| **B5** | Streaming correctness | **Validated** | `reasoning_content` round-trips across deltas. |
+| **B6** | Concurrency stress | **Open** | Two-concurrent-60K-token validation pending. |
 | **B7** | Long-context retrieval quality | **Open** | Needle-in-haystack at 32K/64K not exercised. |
 
-Reasonable order for what remains: B4 (vision smoke) → B6 (concurrency stress) → B7 (retrieval quality) → B1 deepening → B2 in-the-wild elicitation.
-
-### 11.3 What "production-ready" means for this deployment
-
-Production-ready = (A1 + A2 resolved) AND (B1 + B2 + B3 + B5 covered to at least unit/end-to-end depth). All four are now true. B4 is required only if the agentic workload sends images. B6 and B7 are nice-to-have hardening but not blocking for a single-user Qwen Code CLI workflow.
+Reasonable order for what remains: B4 (vision smoke) → B6 (concurrency stress) → B7 (retrieval quality) → B1 deepening.
 
 ---
 
 ## 12. Update cadence
 
-Re-evaluate the pinned versions in this README when any of the following happens:
+Re-evaluate the pinned versions when:
 
-1. **vLLM tags a `v0.19.2` final** or later — migrate from the nightly image to a semver-tagged image.
-2. **A newer nightly image passes the `docker run --rm <image> vllm --help` smoke test** (i.e., does not exhibit the §6.6 transformers import regression). Upgrade the pinned digest.
-3. **Upstream PR #39772 merges** — remove `monkey_patch_qwen3_coder.py` (patch 1) and its bind-mount; remove the launcher's entry and verifier. The patch's source-landmark check refuses against a fixed function and tells the operator exactly this.
-4. **vLLM issue #38182 (MTP + prefix cache) closes with a verified fix** — reconsider enabling MTP speculative decoding on this stack.
-5. **vLLM PR #40384 (narrow hybrid-KV scheduler-reporting fix) merges** — or competing PR #40694 — remove `monkey_patch_hybrid_kv_allocator.py` (patch 2) and its bind-mount; remove the launcher entries.
-6. **vLLM PR #37429 (broader hybrid-KV byte-level redesign) merges** — would give Mamba/DeltaNet its own dedicated `MambaPool`. **Critical sequencing**: remove patch 2 BEFORE pulling an image that contains #37429 — the broader fix changes the underlying tensor layout, and patch 2's reporting view would no longer be coherent.
-7. **vLLM ships OpenAI-standard `reasoning_content` on ChatMessage / DeltaMessage natively** — remove `monkey_patch_reasoning_field_egress.py` (patch 3) and its bind-mount. Concurrent: if upstream also widens ingest acceptance to include `reasoning_content`, remove `monkey_patch_reasoning_field_ingest.py` (patch 4) in the same pass.
-8. **vLLM adopts a reasoning parser that re-routes `<tool_call>` markup itself** — remove `monkey_patch_tool_call_in_think_rescue.py` (patch 5). No upstream PR is tracking this today.
-9. **vLLM ships first-class metrics for tool-parser silent failures** — remove `monkey_patch_extract_tool_calls_metrics.py` (patch 6) AND `monkey_patch_extract_tool_calls_streaming_metrics.py` (patch 7).
+1. **vLLM tags a `v0.19.2` final** or later — migrate to a semver-tagged image.
+2. **A newer nightly passes the boot smoke test** without the §6.7 regression.
+3. **vLLM widens ingest to accept `reasoning_content`** — remove patch 1.
+4. **PR #39772 merges** — remove patch 2.
+5. **PR #40384 or #40694 merges** — remove patch 3.
+6. **PR #37429 merges** — **CRITICAL**: remove patch 3 BEFORE pulling that image (tensor layout changes; patch 3's reporting view would no longer be coherent).
+7. **vLLM ships OpenAI-standard `reasoning_content` natively** — remove patch 4.
+8. **Qwen3.6 retraining eliminates the OOD mid-think `<tool_call>` emission** — remove patch 5.
+9. **vLLM issue #38182 (MTP + prefix cache) closes** — reconsider enabling MTP.
 
-Each of these is tracked and none are urgent.
+Each is tracked; none urgent.
 
 ---
 
@@ -546,18 +432,16 @@ Each of these is tracked and none are urgent.
 
 ```
 .
-├── README.md                                                      # this document
-├── launch_with_patches.py                                         # §7.L — container entrypoint; imports patches 1–7 then runpys vLLM
-├── sitecustomize.py                                               # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
-├── monkey_patch_qwen3_coder.py                                    # §7.1 — parser crash fix on truncated <parameter=
-├── monkey_patch_hybrid_kv_allocator.py                            # §7.2 — hybrid-KV scheduler-budget fix (PR #40384 backport)
-├── monkey_patch_reasoning_field_egress.py                         # §7.3 — Pydantic serialization rename reasoning → reasoning_content
-├── monkey_patch_reasoning_field_ingest.py                         # §7.4 — accept reasoning_content on inbound assistant messages
-├── monkey_patch_tool_call_in_think_rescue.py                      # §7.5 — rescue <tool_call> emitted inside <think> (streaming + non-streaming)
-├── monkey_patch_extract_tool_calls_metrics.py                     # §7.6 — non-streaming markup-leak observability
-├── monkey_patch_extract_tool_calls_streaming_metrics.py           # §7.7 — streaming markup-leak observability
+├── README.md                                              # this document
+├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 5 patches then runpys vLLM
+├── sitecustomize.py                                       # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
+├── monkey_patch_reasoning_field_ingest.py                 # §7.1 — accept reasoning_content on inbound assistant messages
+├── monkey_patch_qwen3_coder.py                            # §7.2 — parser crash fix on truncated <parameter=
+├── monkey_patch_hybrid_kv_allocator.py                    # §7.3 — hybrid-KV scheduler-budget fix (PR #40384 backport)
+├── monkey_patch_reasoning_field_egress.py                 # §7.4 — Pydantic serialization rename reasoning → reasoning_content
+├── monkey_patch_tool_call_in_think_detector.py            # §7.5 — detect <tool_call> emitted inside <think>; structured WARNING
 └── tests/
-    └── test_patches_against_master.py                             # static + structural-mirror suite (141 checks; runs without torch/CUDA)
+    └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
 ```
 
-Eight Python files (7 patches + launcher + sitecustomize) plus the static test suite, all server-side. Patch 2 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
+Seven Python files (5 patches + launcher + sitecustomize) plus the static test suite, all server-side. Patch 3 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.

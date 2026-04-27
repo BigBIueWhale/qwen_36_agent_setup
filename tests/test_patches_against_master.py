@@ -1,23 +1,11 @@
-"""Static + structural-mirror verification that all 7 monkey-patches
-will apply cleanly against the pinned master commit.
-
-This script does NOT import vLLM (the host has no torch / CUDA / Triton).
-Instead it:
-
-1. Walks each patch's source-level landmark constants and asserts each
-   one is present in the corresponding master source file.
-2. AST-parses each master source file to extract function signatures
-   and verifies they match what the patches expect.
-3. For the egress patch (the only one with a non-trivial mechanism
-   that doesn't reduce to landmark matching), runs a real Pydantic v2
-   experiment on a structural mirror of vLLM's wire wrappers and
-   verifies the patch's mechanism produces the desired wire JSON.
-
-The pinned commit under test is read from each patch's
-``_PINNED_VLLM_COMMIT`` constant — they must all agree, and they must
-match the HEAD of /tmp/qwen36_research/vllm.
-
-Exits with status 0 iff every check passes; non-zero on any failure.
+"""Static + structural-mirror verification that the 5 monkey-patches
+will apply cleanly against the pinned master commit. Does NOT import
+vLLM (host has no torch/CUDA/Triton). Walks each patch's landmark
+constants against master source, AST-extracts function signatures, and
+runs a real Pydantic v2 experiment on a structural mirror of vLLM's
+wire wrappers (Section 3b) to prove the egress patch's mechanism. The
+pinned commit must match HEAD of /tmp/qwen36_research/vllm. Exits 0
+iff every check passes.
 """
 
 from __future__ import annotations
@@ -236,100 +224,58 @@ def section_1_qwen3_coder() -> None:
     run.section("1. monkey_patch_qwen3_coder.py")
     patch_path = PATCH_DIR / "monkey_patch_qwen3_coder.py"
     qwen3_src = (VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py").read_text()
-    abstract_src = (
-        VLLM_DIR / "vllm/tool_parsers/abstract_tool_parser.py"
-    ).read_text()
+    abstract_src = (VLLM_DIR / "vllm/tool_parsers/abstract_tool_parser.py").read_text()
     engine_src = (VLLM_DIR / "vllm/entrypoints/openai/engine/protocol.py").read_text()
 
-    # The buggy landmark string — must be present.
-    sentinel = patch_constant(patch_path, "_BUGGY_SENTINEL")
+    # The buggy str.index(">") landmark; the qwen3-specific regex SHAPE in
+    # the subclass; and the regex-attribute assignment in the subclass.
     run.expect_in(
-        "buggy sentinel str.index(\">\") still present at master",
-        sentinel,
+        "buggy sentinel still present at master",
+        patch_constant(patch_path, "_BUGGY_SENTINEL"),
         qwen3_src,
     )
-
-    # Regex shape landmark — must appear specifically in the SUBCLASS
-    # source (this is the qwen3-specific compiled regex, not inherited).
-    regex_landmark = patch_constant(patch_path, "_UPSTREAM_REGEX_LANDMARK")
     run.expect_in(
         "tool_call_parameter_regex shape unchanged in subclass __init__",
-        regex_landmark,
+        patch_constant(patch_path, "_UPSTREAM_REGEX_LANDMARK"),
         qwen3_src,
     )
-
-    # ``self.tool_call_parameter_regex`` MUST be assigned in the subclass
-    # source (it is a qwen3-specific compiled pattern). Use a strict
-    # word-boundary regex so we don't match unrelated identifiers.
     expected_attr = patch_constant(patch_path, "_EXPECTED_REGEX_ATTR")
-    regex_attr_re = re.compile(
-        rf"\bself\.{re.escape(expected_attr)}\s*[:=]"
-    )
     run.expect(
-        "Qwen3CoderToolParser subclass __init__ assigns "
-        f"self.{expected_attr}",
-        regex_attr_re.search(qwen3_src) is not None,
-        f"regex {regex_attr_re.pattern!r} did not match",
+        f"Qwen3CoderToolParser subclass __init__ assigns self.{expected_attr}",
+        re.search(rf"\bself\.{re.escape(expected_attr)}\s*[:=]", qwen3_src) is not None,
+    )
+    # `self.tools` may be assigned by the subclass OR inherited from
+    # `ToolParser.__init__`; the patch's MRO walk requires presence anywhere.
+    run.expect(
+        "self.tools assigned somewhere in the Qwen3CoderToolParser MRO",
+        re.search(r"\bself\.tools\s*[:=]", qwen3_src + "\n" + abstract_src) is not None,
     )
 
-    # ``self.tools`` may be assigned by the subclass OR inherited from
-    # ``ToolParser.__init__`` (the actual situation at this pin).
-    # The patch's MRO-walking landmark check requires the assignment to
-    # appear ANYWHERE in the inheritance chain — and so do we, so a
-    # refactor that moves the assignment between subclass/base is fine
-    # but its disappearance from BOTH is caught.
-    tools_assignment_re = re.compile(r"\bself\.tools\s*[:=]")
-    run.expect(
-        "self.tools assigned somewhere in the Qwen3CoderToolParser MRO "
-        "(subclass __init__ OR base)",
-        tools_assignment_re.search(qwen3_src + "\n" + abstract_src) is not None,
-        "neither qwen3coder_tool_parser.py nor abstract_tool_parser.py "
-        "assigns self.tools — the patched _parse_xml_function_call body "
-        "would AttributeError at request time.",
-    )
-
-    # Signatures.
-    sig = vllm_function_signature(
-        "vllm/tool_parsers/qwen3coder_tool_parser.py",
-        "Qwen3CoderToolParser._parse_xml_function_call",
-    )
     run.expect_eq(
         "_parse_xml_function_call signature",
-        sig,
+        vllm_function_signature(
+            "vllm/tool_parsers/qwen3coder_tool_parser.py",
+            "Qwen3CoderToolParser._parse_xml_function_call",
+        ),
         ["self", "function_call_str"],
-    )
-
-    sig_cpv = vllm_function_signature(
-        "vllm/tool_parsers/qwen3coder_tool_parser.py",
-        "Qwen3CoderToolParser._convert_param_value",
     )
     run.expect_eq(
         "_convert_param_value signature",
-        sig_cpv,
+        vllm_function_signature(
+            "vllm/tool_parsers/qwen3coder_tool_parser.py",
+            "Qwen3CoderToolParser._convert_param_value",
+        ),
         ["self", "param_value", "param_name", "param_config", "func_name"],
-    )
-
-    sig_ftp = vllm_function_signature(
-        "vllm/tool_parsers/utils.py",
-        "find_tool_properties",
     )
     run.expect_eq(
         "find_tool_properties signature",
-        sig_ftp,
+        vllm_function_signature("vllm/tool_parsers/utils.py", "find_tool_properties"),
         ["tools", "tool_name"],
     )
-
-    # ToolCall / FunctionCall importable from engine/protocol.py.
     run.expect_in(
-        "engine.protocol exports class FunctionCall",
-        "class FunctionCall(",
-        engine_src,
+        "engine.protocol exports class FunctionCall", "class FunctionCall(", engine_src
     )
-    run.expect_in(
-        "engine.protocol exports class ToolCall",
-        "class ToolCall(",
-        engine_src,
-    )
+    run.expect_in("engine.protocol exports class ToolCall", "class ToolCall(", engine_src)
 
 
 # --------------------------------------------------------------------
@@ -422,12 +368,9 @@ def section_2_hybrid_kv() -> None:
 
 def section_3_egress_static() -> None:
     run.section("3a. monkey_patch_reasoning_field_egress.py — static")
-    chat_src = (
-        VLLM_DIR / "vllm/entrypoints/openai/chat_completion/protocol.py"
-    ).read_text()
+    chat_src = (VLLM_DIR / "vllm/entrypoints/openai/chat_completion/protocol.py").read_text()
     engine_src = (VLLM_DIR / "vllm/entrypoints/openai/engine/protocol.py").read_text()
 
-    # All six target classes must exist.
     for cls_name in (
         "ChatMessage",
         "ChatCompletionResponseChoice",
@@ -440,28 +383,16 @@ def section_3_egress_static() -> None:
             f"class {cls_name}(",
             chat_src,
         )
-    run.expect_in(
-        "engine.protocol exports DeltaMessage",
-        "class DeltaMessage(",
-        engine_src,
-    )
+    run.expect_in("engine.protocol exports DeltaMessage", "class DeltaMessage(", engine_src)
 
-    # Each leaf carries `reasoning: str | None = None`.
     leaf_re = re.compile(r"reasoning:\s*str\s*\|\s*None\s*=\s*None")
-    run.expect(
-        "ChatMessage has reasoning: str | None = None",
-        leaf_re.search(chat_src) is not None,
-    )
+    run.expect("ChatMessage has reasoning: str | None = None", leaf_re.search(chat_src) is not None)
     run.expect(
         "DeltaMessage has reasoning: str | None = None",
         leaf_re.search(engine_src) is not None,
     )
-
-    # No pre-existing reasoning_content field.
     run.expect_not_in(
-        "ChatMessage does not already declare reasoning_content",
-        "reasoning_content:",
-        chat_src,
+        "ChatMessage does not already declare reasoning_content", "reasoning_content:", chat_src
     )
     run.expect_not_in(
         "DeltaMessage does not already declare reasoning_content",
@@ -470,30 +401,22 @@ def section_3_egress_static() -> None:
     )
 
     # Wrappers' nested-field shape.
-    # ChatCompletionResponseChoice: message: ChatMessage
-    run.expect_in(
-        "ChatCompletionResponseChoice has 'message: ChatMessage'",
-        "message: ChatMessage",
-        chat_src,
-    )
-    # ChatCompletionResponseStreamChoice: delta: DeltaMessage
-    run.expect_in(
-        "ChatCompletionResponseStreamChoice has 'delta: DeltaMessage'",
-        "delta: DeltaMessage",
-        chat_src,
-    )
-    # ChatCompletionResponse: choices: list[ChatCompletionResponseChoice]
-    run.expect_in(
-        "ChatCompletionResponse has 'choices: list[ChatCompletionResponseChoice]'",
-        "choices: list[ChatCompletionResponseChoice]",
-        chat_src,
-    )
-    # ChatCompletionStreamResponse: choices: list[ChatCompletionResponseStreamChoice]
-    run.expect_in(
-        "ChatCompletionStreamResponse has 'choices: list[ChatCompletionResponseStreamChoice]'",
-        "choices: list[ChatCompletionResponseStreamChoice]",
-        chat_src,
-    )
+    for label, needle in (
+        ("ChatCompletionResponseChoice has 'message: ChatMessage'", "message: ChatMessage"),
+        (
+            "ChatCompletionResponseStreamChoice has 'delta: DeltaMessage'",
+            "delta: DeltaMessage",
+        ),
+        (
+            "ChatCompletionResponse has 'choices: list[ChatCompletionResponseChoice]'",
+            "choices: list[ChatCompletionResponseChoice]",
+        ),
+        (
+            "ChatCompletionStreamResponse has 'choices: list[ChatCompletionResponseStreamChoice]'",
+            "choices: list[ChatCompletionResponseStreamChoice]",
+        ),
+    ):
+        run.expect_in(label, needle, chat_src)
 
 
 def section_3_egress_mechanism() -> None:
@@ -758,16 +681,17 @@ def section_4_ingest() -> None:
 # --------------------------------------------------------------------
 
 
-def section_5_rescue() -> None:
-    run.section("5. monkey_patch_tool_call_in_think_rescue.py")
-    patch_path = PATCH_DIR / "monkey_patch_tool_call_in_think_rescue.py"
-    parser_src = (
-        VLLM_DIR / "vllm/reasoning/qwen3_reasoning_parser.py"
-    ).read_text()
+def section_5_detector() -> None:
+    """Patch 5 — tool_call_in_think_detector. Wraps non-streaming
+    extract_reasoning only; streaming intentionally not wrapped (model-
+    side rate is not per-modality).
+    """
+    run.section("5. monkey_patch_tool_call_in_think_detector.py")
+    patch_path = PATCH_DIR / "monkey_patch_tool_call_in_think_detector.py"
+    parser_src = (VLLM_DIR / "vllm/reasoning/qwen3_reasoning_parser.py").read_text()
     base_src = (VLLM_DIR / "vllm/reasoning/basic_parsers.py").read_text()
-    engine_src = (VLLM_DIR / "vllm/entrypoints/openai/engine/protocol.py").read_text()
 
-    # Class hierarchy.
+    # Class hierarchy still as expected.
     run.expect_in(
         "Qwen3ReasoningParser still subclasses BaseThinkingReasoningParser",
         "class Qwen3ReasoningParser(BaseThinkingReasoningParser):",
@@ -779,244 +703,52 @@ def section_5_rescue() -> None:
         base_src,
     )
 
-    # Source landmarks.
-    nonstreaming = patch_constant(patch_path, "_NONSTREAMING_LANDMARK")
-    streaming = patch_constant(patch_path, "_STREAMING_LANDMARK")
-    run.expect_in(
-        "non-streaming landmark present",
-        nonstreaming,
-        parser_src,
+    # Patch tag.
+    expected_tag = patch_constant(patch_path, "_PATCH_TAG")
+    run.expect_eq(
+        "_PATCH_TAG is the v1 detector tag",
+        expected_tag,
+        "qwen36-agent-setup-tool-call-in-think-detector-v1",
     )
+
+    # Non-streaming landmark substring is still our anchor since we're
+    # wrapping extract_reasoning non-streaming.
+    landmark = patch_constant(patch_path, "_NONSTREAMING_LANDMARK")
     run.expect_in(
-        "streaming landmark present",
-        streaming,
+        "non-streaming landmark present in master",
+        landmark,
         parser_src,
     )
 
-    # Signatures (use AST extraction).
-    sig_extract = vllm_function_signature(
+    # extract_reasoning signature unchanged at the pin.
+    sig = vllm_function_signature(
         "vllm/reasoning/qwen3_reasoning_parser.py",
         "Qwen3ReasoningParser.extract_reasoning",
     )
     run.expect_eq(
         "extract_reasoning signature",
-        sig_extract,
-        ["self", "model_output", "request"],
-    )
-    sig_stream = vllm_function_signature(
-        "vllm/reasoning/qwen3_reasoning_parser.py",
-        "Qwen3ReasoningParser.extract_reasoning_streaming",
-    )
-    run.expect_eq(
-        "extract_reasoning_streaming signature",
-        sig_stream,
-        [
-            "self",
-            "previous_text",
-            "current_text",
-            "delta_text",
-            "previous_token_ids",
-            "current_token_ids",
-            "delta_token_ids",
-        ],
-    )
-
-    # Token literals — ``<think>``/``</think>`` in property bodies.
-    expected_start = patch_constant(patch_path, "_EXPECTED_START_TOKEN")
-    expected_end = patch_constant(patch_path, "_EXPECTED_END_TOKEN")
-    run.expect_in(
-        "start_token literal '<think>' present",
-        f'"{expected_start}"',
-        parser_src,
-    )
-    run.expect_in(
-        "end_token literal '</think>' present",
-        f'"{expected_end}"',
-        parser_src,
-    )
-
-    # DeltaMessage carries reasoning + content.
-    run.expect_in(
-        "DeltaMessage has reasoning field",
-        "reasoning: str | None = None",
-        engine_src,
-    )
-    run.expect_in(
-        "DeltaMessage has content field",
-        "content: str | None = None",
-        engine_src,
-    )
-
-    # PR #35687 awareness: master's extract_reasoning has the
-    # implicit-end-via-tool_call branch (lines 142-156). Our patch's
-    # premise is: that branch only fires when </think> is ABSENT, so
-    # when both </think> and a mid-think <tool_call> are emitted, the
-    # partition runs first and our rescue is still load-bearing.
-    # Verify the partition still happens BEFORE the implicit-end check.
-    extract_block_match = re.search(
-        r"def extract_reasoning\(.*?(?=\n    def |\nclass )",
-        parser_src,
-        re.DOTALL,
-    )
-    extract_body = extract_block_match.group(0) if extract_block_match else ""
-    partition_pos = extract_body.find("model_output.partition(self.end_token)")
-    tool_call_pos = extract_body.find(
-        "model_output.find(self._tool_call_tag)"
-    )
-    run.expect(
-        "extract_reasoning still partitions on </think> BEFORE implicit-end-via-tool_call check",
-        partition_pos != -1
-        and tool_call_pos != -1
-        and partition_pos < tool_call_pos,
-        f"partition_pos={partition_pos}, tool_call_pos={tool_call_pos}",
-    )
-
-
-# --------------------------------------------------------------------
-# Section 6: Patch 6 — extract_tool_calls_metrics
-# --------------------------------------------------------------------
-
-
-def section_6_metrics() -> None:
-    run.section("6. monkey_patch_extract_tool_calls_metrics.py")
-    patch_path = PATCH_DIR / "monkey_patch_extract_tool_calls_metrics.py"
-    patch_src = patch_path.read_text()
-    target_src = (
-        VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py"
-    ).read_text()
-    engine_src = (VLLM_DIR / "vllm/entrypoints/openai/engine/protocol.py").read_text()
-    prom_src = (
-        VLLM_DIR / "vllm/v1/metrics/prometheus.py"
-    ).read_text()
-
-    # Counter name MUST NOT contain "vllm" — vLLM's
-    # unregister_vllm_metrics() in vllm/v1/metrics/prometheus.py would
-    # deregister it at PrometheusStatLogger init.
-    counter_name = patch_constant(patch_path, "_COUNTER_NAME")
-    run.expect(
-        f"counter name does NOT contain 'vllm' (substring) "
-        f"(name={counter_name!r})",
-        "vllm" not in counter_name,
-        "would be deregistered by unregister_vllm_metrics() — see the "
-        "in-patch note. Choose a name without 'vllm' as a substring.",
-    )
-    # Confirm the upstream filter still has the "vllm" substring check
-    # — if it changes, our defensive rename may be unnecessary.
-    run.expect(
-        "upstream unregister_vllm_metrics still filters on 'vllm' substring",
-        '"vllm" in collector._name' in prom_src,
-        "vLLM's filter has changed; re-audit whether the rename is "
-        "still needed.",
-    )
-
-    # Signature.
-    sig = vllm_function_signature(
-        "vllm/tool_parsers/qwen3coder_tool_parser.py",
-        "Qwen3CoderToolParser.extract_tool_calls",
-    )
-    run.expect_eq(
-        "extract_tool_calls signature",
         sig,
         ["self", "model_output", "request"],
     )
 
-    # Silent-failure landmarks.
-    landmarks = patch_constant(patch_path, "_SILENT_FAILURE_LANDMARKS")
-    for lm in landmarks:
-        run.expect_in(
-            f"silent-failure landmark {lm!r} present",
-            lm,
-            target_src,
-        )
-
-    # ExtractedToolCallInformation carries the three attrs.
-    run.expect_in(
-        "ExtractedToolCallInformation declared in engine.protocol",
-        "class ExtractedToolCallInformation",
-        engine_src,
-    )
-    for attr in ("tools_called", "tool_calls", "content"):
-        run.expect_in(
-            f"ExtractedToolCallInformation declares {attr}",
-            f"{attr}:",
-            engine_src,
-        )
-
 
 # --------------------------------------------------------------------
-# Section 7: Patch 7 — extract_tool_calls_streaming_metrics
+# Section 6: Launcher self-consistency (renumbered after section 5
+# absorbed the rescue/detector slot)
 # --------------------------------------------------------------------
 
 
-def section_7_streaming_metrics() -> None:
-    run.section("7. monkey_patch_extract_tool_calls_streaming_metrics.py")
-    patch_path = PATCH_DIR / "monkey_patch_extract_tool_calls_streaming_metrics.py"
-    target_src = (
-        VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py"
-    ).read_text()
-
-    # Counter-name guard (mirror of section 6's check; both patches
-    # must agree on the same non-vllm-prefixed name).
-    counter_name = patch_constant(patch_path, "_COUNTER_NAME")
-    run.expect(
-        f"streaming patch counter name agrees with non-streaming "
-        f"(name={counter_name!r})",
-        counter_name == "qwen3_coder_silent_tool_call_failures_total",
-        "the two metrics patches must register the same counter name "
-        "for the cooperative-discovery-on-collision path to work.",
-    )
-    run.expect(
-        "streaming patch counter name does NOT contain 'vllm'",
-        "vllm" not in counter_name,
-        "would be deregistered by unregister_vllm_metrics().",
-    )
-
-    sig = vllm_function_signature(
-        "vllm/tool_parsers/qwen3coder_tool_parser.py",
-        "Qwen3CoderToolParser.extract_tool_calls_streaming",
-    )
-    run.expect_eq(
-        "extract_tool_calls_streaming signature",
-        sig,
-        [
-            "self",
-            "previous_text",
-            "current_text",
-            "delta_text",
-            "previous_token_ids",
-            "current_token_ids",
-            "delta_token_ids",
-            "request",
-        ],
-    )
-
-    # Streaming emit landmark.
-    landmark = patch_constant(patch_path, "_STREAMING_EMIT_LANDMARK")
-    run.expect_in(
-        "streaming emit landmark present",
-        landmark,
-        target_src,
-    )
-
-
-# --------------------------------------------------------------------
-# Section 8: Launcher self-consistency
-# --------------------------------------------------------------------
-
-
-def section_8_launcher() -> None:
-    run.section("8. launch_with_patches.py — registry consistency")
+def section_6_launcher() -> None:
+    run.section("6. launch_with_patches.py — registry consistency")
     launcher_src = (PATCH_DIR / "launch_with_patches.py").read_text()
 
-    # Every patch module is registered in _PATCH_MODULES.
+    # Every patch module is registered in _PATCH_MODULES (the 5 surviving).
     expected_modules = (
         "monkey_patch_qwen3_coder",
         "monkey_patch_hybrid_kv_allocator",
-        "monkey_patch_extract_tool_calls_metrics",
-        "monkey_patch_extract_tool_calls_streaming_metrics",
         "monkey_patch_reasoning_field_egress",
         "monkey_patch_reasoning_field_ingest",
-        "monkey_patch_tool_call_in_think_rescue",
+        "monkey_patch_tool_call_in_think_detector",
     )
     for name in expected_modules:
         run.expect_in(
@@ -1024,7 +756,6 @@ def section_8_launcher() -> None:
             f'"{name}"',
             launcher_src,
         )
-    # Every patch module has a verifier.
     for name in expected_modules:
         run.expect_in(
             f"_PATCH_VERIFICATION includes {name}",
@@ -1032,28 +763,19 @@ def section_8_launcher() -> None:
             launcher_src,
         )
 
-    # The new nested-egress check (load-bearing) is wired into
-    # _verify_reasoning_field_egress.
-    run.expect_in(
-        "launcher's egress verifier constructs ChatCompletionResponse",
-        "ChatCompletionResponse(",
-        launcher_src,
-    )
-    run.expect_in(
-        "launcher's egress verifier constructs ChatCompletionStreamResponse",
-        "ChatCompletionStreamResponse(",
-        launcher_src,
-    )
-    run.expect_in(
-        "launcher's egress verifier exercises model_dump_json() (non-streaming)",
-        "model_dump_json()",
-        launcher_src,
-    )
-    run.expect_in(
-        "launcher's egress verifier exercises model_dump_json(exclude_unset=True) (streaming)",
-        "model_dump_json(exclude_unset=True)",
-        launcher_src,
-    )
+    # Deleted patches must not be referenced by name in _PATCH_MODULES /
+    # _PATCH_VERIFICATION (these strings may appear in historical
+    # comments, but not as registry entries).
+    for deleted in (
+        "monkey_patch_extract_tool_calls_metrics",
+        "monkey_patch_extract_tool_calls_streaming_metrics",
+        "monkey_patch_tool_call_in_think_rescue",
+    ):
+        run.expect_not_in(
+            f"_PATCH_MODULES does NOT contain {deleted}",
+            f'"{deleted}",',
+            launcher_src,
+        )
 
 
 # --------------------------------------------------------------------
@@ -1062,34 +784,11 @@ def section_8_launcher() -> None:
 
 
 def section_9_no_silent_failures() -> None:
-    """Static check: every patch must complain loudly on unexpected
-    state. This section scans each patch's source for known
-    silent-failure anti-patterns and refuses if any are found.
-
-    The intent is to catch a future regression where a maintainer
-    "loosens" a patch by silently catching an exception that should
-    have refused, or by adding a logs-only fallback for a missing
-    dependency.
-
-    Each anti-pattern we forbid here corresponds to a real lesson
-    from the v1 → v2 rewrite:
-
-    * ``except Exception: pass`` — swallows real bugs, including the
-      ``EgressPatchRefusedError`` family this whole repo's discipline
-      relies on.
-    * ``except ImportError`` followed by anything other than ``raise``
-      — the patches' import-time deps (vllm, pydantic, prometheus_client)
-      are all required; degrading silently to a feature-disabled mode
-      defeats the whole reason an operator deployed the patch.
-    * ``logger.debug(`` for anything that signals an UNEXPECTED runtime
-      condition — DEBUG is invisible by default; surprises must surface
-      at WARNING or higher.
-
-    The two metrics patches (6, 7) are allowed exactly ONE
-    ``except Exception`` each: the per-call instrumentation guard,
-    which the docstring documents as "observability MUST NOT take
-    down a request". That guard now logs at WARNING (not DEBUG); the
-    section verifies that, too.
+    """Anti-pattern check across the 5 patches: refuse on ``except: pass``,
+    refuse on ``except ImportError`` blocks that don't raise, refuse on
+    ``_logger.debug()`` (DEBUG is invisible; surprises must surface at
+    WARNING+), enforce ``except Exception`` count budget per file (target:
+    zero), and verify each typed RefusedError class is actually raised.
     """
     run.section("9. No silent failures — anti-pattern check")
 
@@ -1127,37 +826,27 @@ def section_9_no_silent_failures() -> None:
                 f"block content: {block.strip()[:200]!r}" if not ok else "",
             )
 
-    # (c) Forbid logger.debug() in the metrics patches' instrumentation
-    # path — they were the only files that previously logged at DEBUG
-    # for an unexpected runtime exception, and we tightened both to
-    # WARNING. Catch a future regression that re-loosens it.
-    metrics_files = (
-        "monkey_patch_extract_tool_calls_metrics.py",
-        "monkey_patch_extract_tool_calls_streaming_metrics.py",
-    )
-    for fname in metrics_files:
-        path = PATCH_DIR / fname
+    # (c) Forbid logger.debug() across the surviving patches — DEBUG is
+    # invisible by default and unexpected runtime conditions must surface
+    # at WARNING or higher. Catches a future regression that re-loosens it.
+    for path in patch_files:
         src = path.read_text()
         run.expect_not_in(
-            f"{fname}: no logger.debug() (use WARNING for unexpected runtime conditions)",
+            f"{path.name}: no _logger.debug()",
             "_logger.debug(",
             src,
         )
 
     # (d) Count REAL ``except Exception`` clauses via AST (not regex,
-    # which over-counts string mentions inside docstrings). Each
-    # patch's count must equal a hand-audited budget; any deviation
-    # demands re-audit.
+    # which over-counts string mentions inside docstrings). Each patch's
+    # count must equal a hand-audited budget. The 5-patch suite uses
+    # zero ``except Exception`` clauses anywhere — typed exceptions only.
     expected_counts = {
         "monkey_patch_qwen3_coder.py": 0,
         "monkey_patch_hybrid_kv_allocator.py": 0,
         "monkey_patch_reasoning_field_egress.py": 0,
         "monkey_patch_reasoning_field_ingest.py": 0,
-        "monkey_patch_tool_call_in_think_rescue.py": 1,  # property fallback
-        # Metrics patches: outer per-call guard + inner logger-failure
-        # guard (so observability never crashes a request).
-        "monkey_patch_extract_tool_calls_metrics.py": 2,
-        "monkey_patch_extract_tool_calls_streaming_metrics.py": 2,
+        "monkey_patch_tool_call_in_think_detector.py": 0,
     }
     for path in patch_files:
         try:
@@ -1212,29 +901,10 @@ def section_9_no_silent_failures() -> None:
 
 
 def section_10_sitecustomize_and_readme() -> None:
-    """Static checks that don't require booting Docker:
-
-    * ``sitecustomize.py`` exists at the repo root and parses as Python.
-    * ``sitecustomize._PATCH_MODULES`` is a tuple of strings.
-    * ``sitecustomize._PATCH_MODULES`` is byte-identical to
-      ``launch_with_patches._PATCH_MODULES`` (the same drift check the
-      launcher runs at boot, but also caught at static-test time).
-    * The README's §8.2 docker run command includes the sitecustomize
-      bind-mount and ``--host 127.0.0.1``.
-    * The README's docker run includes ``-e PYTHONPATH=/opt/patches``
-      (load-bearing for ``site.py`` to find sitecustomize at all) and
-      ``--entrypoint python3`` (load-bearing for the launcher to run
-      instead of the image's default ``vllm`` entrypoint).
-    * Every entry in ``_PATCH_MODULES`` has a matching bind-mount line
-      in the docker run command (catches the regression where a
-      maintainer adds a patch to the launcher tuple but forgets to
-      mount the source file).
-    * The launcher itself is bind-mounted to ``/opt/patches/launch.py``.
-    * The README's pinned commit string matches :data:`EXPECTED_COMMIT`.
-
-    These checks correspond to the punch-list item C — without them, a
-    maintainer can drift one of the invariants and only discover at
-    deployment time (or worse, silently never).
+    """Static cross-checks: sitecustomize._PATCH_MODULES == launcher's
+    (drift would silently split EngineCore from PID 1); README §8.2
+    docker run includes the load-bearing flags and bind-mounts every
+    registered patch; pinned commit matches.
     """
     run.section("10. sitecustomize + README consistency")
 
@@ -1375,10 +1045,8 @@ def main() -> int:
         section_3_egress_static,
         section_3_egress_mechanism,
         section_4_ingest,
-        section_5_rescue,
-        section_6_metrics,
-        section_7_streaming_metrics,
-        section_8_launcher,
+        section_5_detector,
+        section_6_launcher,
         section_9_no_silent_failures,
         section_10_sitecustomize_and_readme,
     ]
