@@ -37,7 +37,7 @@ _UPSTREAM_REGEX_LANDMARK: str = "<parameter=(.*?)(?:</parameter>"
 _PATCH_TAG: str = "qwen36-agent-setup-pr39772-backport"
 
 ParseXmlFunctionCall: TypeAlias = Callable[[Any, str], Any]
-_logger = init_logger(__name__)
+_logger = init_logger(f"vllm.qwen36_patches.{__name__}")
 
 
 class MonkeyPatchRefusedError(RuntimeError):

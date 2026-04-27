@@ -832,7 +832,7 @@ def section_6_launcher() -> None:
     run.section("6. launch_with_patches.py — registry consistency")
     launcher_src = (PATCH_DIR / "launch_with_patches.py").read_text()
 
-    # Every patch module is registered in _PATCH_MODULES (the 6 surviving).
+    # Every patch module is registered in _PATCH_MODULES (the 7 surviving).
     expected_modules = (
         "monkey_patch_qwen3_coder",
         "monkey_patch_hybrid_kv_allocator",
@@ -840,6 +840,7 @@ def section_6_launcher() -> None:
         "monkey_patch_reasoning_field_ingest",
         "monkey_patch_tool_call_in_think_detector",
         "monkey_patch_default_sampling_params",
+        "monkey_patch_qwen3_coder_grammar",
     )
     for name in expected_modules:
         run.expect_in(
@@ -870,12 +871,42 @@ def section_6_launcher() -> None:
 
 
 # --------------------------------------------------------------------
+# Section 6b: Logger-name consistency across all patches.
+# --------------------------------------------------------------------
+#
+# Per Item 4 of the 2026-04-28 implementation: every patch module must
+# init its logger via `init_logger(f"vllm.qwen36_patches.{__name__}")`
+# (the prefix makes Python's logging hierarchy attach vLLM's stdout
+# handler to the patch's logger so info/warning lines reach
+# `docker logs qwen36`). A bare `init_logger(__name__)` produces a
+# logger that is invisible by default — silent in containers.
+
+
+def section_6b_logger_naming() -> None:
+    run.section("6b. Patch logger-naming consistency")
+    expected_literal = 'init_logger(f"vllm.qwen36_patches.{__name__}")'
+    for path in sorted(PATCH_DIR.glob("monkey_patch_*.py")):
+        src = path.read_text()
+        run.expect_in(
+            f"{path.name} uses init_logger(f'vllm.qwen36_patches.{{__name__}}')",
+            expected_literal,
+            src,
+        )
+        # Forbid the bare form.
+        run.expect_not_in(
+            f"{path.name} does NOT use bare init_logger(__name__)",
+            "init_logger(__name__)",
+            src,
+        )
+
+
+# --------------------------------------------------------------------
 # Section 9: No silent failures — anti-pattern checker
 # --------------------------------------------------------------------
 
 
 def section_9_no_silent_failures() -> None:
-    """Anti-pattern check across the 5 patches: refuse on ``except: pass``,
+    """Anti-pattern check across the 7 patches: refuse on ``except: pass``,
     refuse on ``except ImportError`` blocks that don't raise, refuse on
     ``_logger.debug()`` (DEBUG is invisible; surprises must surface at
     WARNING+), enforce ``except Exception`` count budget per file (target:
@@ -930,7 +961,7 @@ def section_9_no_silent_failures() -> None:
 
     # (d) Count REAL ``except Exception`` clauses via AST (not regex,
     # which over-counts string mentions inside docstrings). Each patch's
-    # count must equal a hand-audited budget. The 5-patch suite uses
+    # count must equal a hand-audited budget. The 7-patch suite uses
     # zero ``except Exception`` clauses anywhere — typed exceptions only.
     expected_counts = {
         "monkey_patch_qwen3_coder.py": 0,
@@ -939,6 +970,7 @@ def section_9_no_silent_failures() -> None:
         "monkey_patch_reasoning_field_ingest.py": 0,
         "monkey_patch_tool_call_in_think_detector.py": 0,
         "monkey_patch_default_sampling_params.py": 0,
+        "monkey_patch_qwen3_coder_grammar.py": 0,
     }
     for path in patch_files:
         try:
@@ -1039,14 +1071,14 @@ def section_10_sitecustomize_and_readme() -> None:
     docker_run_re = re.compile(
         r"```bash\s*\n(docker run.*?)```", re.DOTALL
     )
-    docker_run_match = docker_run_re.search(readme_src)
-    run.expect(
-        "README contains a `docker run` bash code block",
-        docker_run_match is not None,
-        "the §8.2 docker run command is missing or its fence is wrong",
+    docker_run_matches = docker_run_re.findall(readme_src)
+    run.expect_eq(
+        "README contains EXACTLY ONE `docker run` bash code block",
+        len(docker_run_matches),
+        1,
     )
-    if docker_run_match is not None:
-        docker_run = docker_run_match.group(1)
+    docker_run = docker_run_matches[0] if docker_run_matches else ""
+    if docker_run:
         run.expect_in(
             "README §8.2 docker run includes sitecustomize bind-mount",
             "sitecustomize.py:/opt/patches/sitecustomize.py:ro",
@@ -1065,7 +1097,7 @@ def section_10_sitecustomize_and_readme() -> None:
         )
 
         # PYTHONPATH=/opt/patches is load-bearing: without it, CPython's
-        # site.py never finds /opt/patches/sitecustomize.py, and patch 2
+        # site.py never finds /opt/patches/sitecustomize.py, and patch 3
         # (hybrid_kv_allocator) is silently dead in the spawned EngineCore.
         # Catch the regression of a maintainer dropping the env var.
         run.expect_in(
@@ -1094,6 +1126,33 @@ def section_10_sitecustomize_and_readme() -> None:
             docker_run,
         )
 
+        # 2026-04-28: prefill batch flag reverted to the 32 GiB-bucket
+        # right value; H100-default 16384 wasted ~26K KV-pool tokens.
+        run.expect_in(
+            "README §8.2 docker run uses --max-num-batched-tokens 8192",
+            "--max-num-batched-tokens 8192",
+            docker_run,
+        )
+        run.expect_not_in(
+            "README §8.2 docker run does NOT use --max-num-batched-tokens 16384",
+            "--max-num-batched-tokens 16384",
+            docker_run,
+        )
+
+        # 2026-04-28: -cc pin for cudagraph capture sizes — drift-immune
+        # against future image bumps (vLLM auto-derives [1,2,4,8] for
+        # max_num_seqs=4 today but the heuristic could change).
+        run.expect_in(
+            "README §8.2 docker run includes -cc cudagraph_capture_sizes pin",
+            "cudagraph_capture_sizes",
+            docker_run,
+        )
+        run.expect_in(
+            "README §8.2 docker run pins cudagraph capture sizes to [1,2,4,8]",
+            "[1,2,4,8]",
+            docker_run,
+        )
+
         # Every entry in _PATCH_MODULES must have a corresponding bind-mount
         # line in the docker run command. Catches the regression where a
         # patch is added to the launcher tuple but the operator forgets
@@ -1111,11 +1170,161 @@ def section_10_sitecustomize_and_readme() -> None:
                     docker_run,
                 )
 
+    # 2026-04-28: §8.3 now contains the 2-concurrent warmup shape (loose
+    # assertions on the load-bearing markers — exact JSON varies).
+    run.expect(
+        "README §8.3 warmup uses enable_thinking:false",
+        re.search(r"enable_thinking.*false", readme_src) is not None,
+        "expected a chat_template_kwargs entry with enable_thinking:false in §8.3",
+    )
+    run.expect(
+        "README §8.3 warmup uses --max-time 60",
+        "--max-time 60" in readme_src,
+        "expected --max-time 60 on the warmup curl invocations",
+    )
+
+    # 2026-04-28: §8.4 wedge-recovery probe has its own subsection.
+    run.expect_in(
+        "README §8.4 documents the deep-probe install path",
+        "qwen36_deep_probe.sh",
+        readme_src,
+    )
+
     # README's pinned commit string must match EXPECTED_COMMIT.
     run.expect_in(
         f"README references EXPECTED_COMMIT={EXPECTED_COMMIT[:12]}…",
         EXPECTED_COMMIT,
         readme_src,
+    )
+
+
+# --------------------------------------------------------------------
+# Section 12: Patch 7 — qwen3_coder_grammar AST verification.
+# --------------------------------------------------------------------
+
+
+def section_12_qwen3_coder_grammar() -> None:
+    """Patch 7 — monkey_patch_qwen3_coder_grammar. Overrides
+    ``Qwen3CoderToolParser.adjust_request`` (currently inherited from
+    ``ToolParser``) and flips ``supports_required_and_named=False``.
+    Verify the expected master-side shape: parser class exists and is a
+    subclass of ToolParser; either the subclass declares its own
+    adjust_request OR the inherited base method exists at
+    abstract_tool_parser.py; the base class still defines
+    ``supports_required_and_named``.
+    """
+    run.section("12. monkey_patch_qwen3_coder_grammar.py")
+    patch_path = PATCH_DIR / "monkey_patch_qwen3_coder_grammar.py"
+    parser_src_path = VLLM_DIR / "vllm/tool_parsers/qwen3coder_tool_parser.py"
+    abstract_src_path = VLLM_DIR / "vllm/tool_parsers/abstract_tool_parser.py"
+
+    parser_src = parser_src_path.read_text()
+    abstract_src = abstract_src_path.read_text()
+
+    # Patch tag.
+    expected_tag = patch_constant(patch_path, "_PATCH_TAG")
+    run.expect_eq(
+        "_PATCH_TAG is the v1 grammar tag",
+        expected_tag,
+        "qwen36-agent-setup-qwen3-coder-grammar-v1",
+    )
+
+    # Parse the parser source via AST to find the class definition.
+    parser_tree = ast.parse(parser_src)
+    parser_cls_node: ast.ClassDef | None = None
+    for node in ast.walk(parser_tree):
+        if isinstance(node, ast.ClassDef) and node.name == "Qwen3CoderToolParser":
+            parser_cls_node = node
+            break
+    run.expect(
+        "Qwen3CoderToolParser class exists in master at the pinned commit",
+        parser_cls_node is not None,
+        "qwen3coder_tool_parser.py does not declare class Qwen3CoderToolParser",
+    )
+
+    # Subclass must NOT already declare adjust_request (otherwise patch's
+    # remit is closed upstream).
+    if parser_cls_node is not None:
+        subclass_methods = {
+            sub.name
+            for sub in parser_cls_node.body
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        run.expect(
+            "Qwen3CoderToolParser does NOT yet declare adjust_request "
+            "(remit of patch 7)",
+            "adjust_request" not in subclass_methods,
+            "if upstream ships an override, delete patch 7 — see removal "
+            "trigger in the docstring",
+        )
+        run.expect(
+            "Qwen3CoderToolParser still subclasses ToolParser",
+            any(
+                isinstance(b, ast.Name) and b.id == "ToolParser"
+                for b in parser_cls_node.bases
+            ),
+            "base list: " + ", ".join(
+                b.id if isinstance(b, ast.Name) else "<expr>"
+                for b in parser_cls_node.bases
+            ),
+        )
+
+    # The inherited base method must still exist with the (self, request)
+    # signature shape we override against.
+    base_sig = vllm_function_signature(
+        "vllm/tool_parsers/abstract_tool_parser.py",
+        "ToolParser.adjust_request",
+    )
+    run.expect_eq(
+        "ToolParser.adjust_request signature",
+        base_sig,
+        ["self", "request"],
+    )
+
+    # supports_required_and_named is still declared on the BASE class —
+    # patch 7 sets the SUBCLASS attribute to False; the subclass dict
+    # initially does not contain it (inherited).
+    run.expect_in(
+        "ToolParser still declares supports_required_and_named",
+        "supports_required_and_named",
+        abstract_src,
+    )
+    if parser_cls_node is not None:
+        subclass_assignments = {
+            t.id
+            for sub in parser_cls_node.body
+            if isinstance(sub, ast.Assign)
+            for t in sub.targets
+            if isinstance(t, ast.Name)
+        }
+        # Also class-level annotated assignments (the form used in the
+        # base class itself).
+        for sub in parser_cls_node.body:
+            if isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
+                subclass_assignments.add(sub.target.id)
+        run.expect(
+            "Qwen3CoderToolParser does NOT yet override "
+            "supports_required_and_named (remit of patch 7)",
+            "supports_required_and_named" not in subclass_assignments,
+            "if upstream ships False here, patch 7's flag flip is "
+            "redundant — re-audit",
+        )
+
+    # Source landmarks the patch reads at import time must still be
+    # present in the master source.
+    base_landmark = patch_constant(patch_path, "_BASE_LANDMARK")
+    run.expect_in(
+        "BASE_LANDMARK still present in ToolParser.adjust_request",
+        base_landmark,
+        abstract_src,
+    )
+    base_get_json_landmark = patch_constant(
+        patch_path, "_BASE_GET_JSON_LANDMARK"
+    )
+    run.expect_in(
+        "BASE_GET_JSON_LANDMARK still present in ToolParser.adjust_request",
+        base_get_json_landmark,
+        abstract_src,
     )
 
 
@@ -1139,7 +1348,9 @@ def main() -> int:
         section_4_ingest,
         section_5_detector,
         section_11_default_sampling_params,
+        section_12_qwen3_coder_grammar,
         section_6_launcher,
+        section_6b_logger_naming,
         section_9_no_silent_failures,
         section_10_sitecustomize_and_readme,
     ]

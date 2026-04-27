@@ -36,7 +36,7 @@ _TOOL_CALL_OPEN: str = "<tool_call>"
 # upstream refactor of the partitioning strategy forces a re-audit.
 _NONSTREAMING_LANDMARK: str = "model_output.partition(self.end_token)"
 
-_logger = init_logger(__name__)
+_logger = init_logger(f"vllm.qwen36_patches.{__name__}")
 
 
 class DetectorPatchRefusedError(RuntimeError):

@@ -134,7 +134,7 @@ import vllm  # noqa: F401  — availability landmark; must not be guarded
 from vllm.logger import init_logger
 from vllm.entrypoints import chat_utils as _chat_utils_mod
 
-_logger = init_logger(__name__)
+_logger = init_logger(f"vllm.qwen36_patches.{__name__}")
 
 
 # --------------------------------------------------------------------
