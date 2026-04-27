@@ -275,7 +275,7 @@ For the 27B-AWQ build: boot log says `GPU KV cache size: ~28K tokens`; with patc
 
 ## 7. The patches in this repo
 
-Seven monkey-patches plus one container-entrypoint launcher. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` before `vllm serve` hands over to `uvicorn`. There is no client-side code in this repo.
+Seven monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patch 2; see §7.S). There is no client-side code in this repo.
 
 Each patch addresses a specific defect named in §6 and only that defect. Each strictly validates its target's structure via landmarks before touching anything, and refuses to apply on any landmark mismatch with a typed exception that names the exact landmark that failed. The patch file itself is the source of truth; this section is a contract index.
 
@@ -331,6 +331,40 @@ The Pydantic-schema patch (egress) adds a behavioural verification — construct
 **Load order** matters: `reasoning_field_egress` must come before `tool_call_in_think_rescue` because the egress patch rebuilds the `DeltaMessage` Pydantic schema and the rescue patch constructs `DeltaMessage` instances at request time.
 
 **Known limitation — plugin-snapshot gap**: if vLLM's tool-parser registry takes a snapshot of a class before the patch ran, the verifier would pass and the served parser would still be unpatched. Mitigation: live smoke test (POST requests exercising each patched path).
+
+### 7.S sitecustomize loader — `sitecustomize.py`
+
+A defect class `launch_with_patches.py` alone cannot fix: vLLM v1 spawns its EngineCore as a separate `multiprocessing` child process, and on Linux + CUDA the start method is `spawn` (`vllm/utils/system_utils.py:_maybe_force_spawn` forces it after CUDA init — `fork` is forbidden). `spawn` means the EngineCore is a fresh Python interpreter that inherits the parent's environment but **not** the parent's `sys.modules`. Patches installed in the launcher's PID-1 process therefore have no effect on EngineCore unless re-imported in EngineCore's interpreter.
+
+Of the seven patches in this repo, **only patch 2** (`monkey_patch_hybrid_kv_allocator`) targets EngineCore-resident code: `vllm.v1.core.kv_cache_utils._report_kv_cache_config` and `get_max_concurrency_for_kv_cache_config` are called by the EngineCore at boot reporting time, never by the API server. Patches 1, 3, 4, 5, 6, 7 all target API-server-resident code and become live in PID 1 directly. So without `sitecustomize`, only patch 2 is silently dead — and the launcher's PID-1 verifier reports success (the in-process check sees its own patched module) while the operator-visible boot log shows the unpatched value.
+
+Empirical fingerprint:
+
+```
+# Without sitecustomize — boot log shows the upstream filename:
+(EngineCore pid=NNN) INFO TIME [kv_cache_utils.py:1337]
+    GPU KV cache size: 29,008 tokens
+
+# With sitecustomize — boot log shows the patched filename:
+(EngineCore pid=190) INFO TIME [monkey_patch_hybrid_kv_allocator.py:743]
+    GPU KV cache size: 116,816 tokens
+```
+
+The filename annotation switch is the cleanest pass/fail discriminator for "is patch 2 live in EngineCore", and it is exactly what `tier3_enginecore_install_audit.py` asserts.
+
+**How sitecustomize fixes it.** CPython's `site.py` (standard library) auto-imports a top-level `sitecustomize` module from `sys.path` at every interpreter startup, including spawned multiprocessing children, before any user code runs. With `PYTHONPATH=/opt/patches` set in the docker run command, `/opt/patches` is on `sys.path` and our `sitecustomize.py` is what `site.py` finds. The flow inside the EngineCore's spawned interpreter:
+
+1. `multiprocessing.spawn` creates a fresh `python3` process and inherits `PYTHONPATH=/opt/patches`.
+2. The fresh interpreter runs `site.py`.
+3. `site.py` finds `/opt/patches/sitecustomize.py` and imports it.
+4. Our sitecustomize imports each of the seven patches in launcher order. Each patch's strict landmark check runs; any refusal aborts EngineCore startup loudly.
+5. EngineCore's main code subsequently sees the patched targets in its own `sys.modules`.
+
+The same flow runs in PID 1 (the launcher's interpreter): `site.py` runs first, sitecustomize installs the patches, then `launch.py` is loaded and its `importlib.import_module(...)` calls hit the cache. The launcher's verifiers still run for defense-in-depth; there is no double-install (each patch's module-level code only fires on first import).
+
+**Load-bearing for**: patch 2. **Defense-in-depth for**: patches 1, 3, 4, 5, 6, 7 (the launcher already imports them in PID 1; sitecustomize ensures the same install runs in any EngineCore-side child too, harmlessly cached).
+
+**Removal trigger**: patch 2 is the only EngineCore-side patch, so when `monkey_patch_hybrid_kv_allocator.py` is removed (PR #40384 / #40694 merges), `sitecustomize.py` does not strictly need to remain. Recommendation is to keep it for defense-in-depth — any future patch that targets EngineCore-resident code would silently fail in EngineCore without it.
 
 ---
 
@@ -526,4 +560,4 @@ Each of these is tracked and none are urgent.
     └── test_patches_against_master.py                             # static + structural-mirror suite (131 checks; runs without torch/CUDA)
 ```
 
-Nine Python files plus the test suite, all server-side. Seven runtime monkey-patches plus one container entrypoint plus one sitecustomize loader — patch 2 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
+Eight Python files (7 patches + launcher + sitecustomize) plus the static test suite, all server-side. Patch 2 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
