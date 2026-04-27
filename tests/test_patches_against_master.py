@@ -1221,11 +1221,20 @@ def section_10_sitecustomize_and_readme() -> None:
       launcher runs at boot, but also caught at static-test time).
     * The README's §8.2 docker run command includes the sitecustomize
       bind-mount and ``--host 127.0.0.1``.
+    * The README's docker run includes ``-e PYTHONPATH=/opt/patches``
+      (load-bearing for ``site.py`` to find sitecustomize at all) and
+      ``--entrypoint python3`` (load-bearing for the launcher to run
+      instead of the image's default ``vllm`` entrypoint).
+    * Every entry in ``_PATCH_MODULES`` has a matching bind-mount line
+      in the docker run command (catches the regression where a
+      maintainer adds a patch to the launcher tuple but forgets to
+      mount the source file).
+    * The launcher itself is bind-mounted to ``/opt/patches/launch.py``.
     * The README's pinned commit string matches :data:`EXPECTED_COMMIT`.
 
-    These four-ish checks correspond to the punch-list item C — without
-    them, a maintainer can drift one of the four invariants and only
-    discover at deployment time (or worse, silently never).
+    These checks correspond to the punch-list item C — without them, a
+    maintainer can drift one of the invariants and only discover at
+    deployment time (or worse, silently never).
     """
     run.section("10. sitecustomize + README consistency")
 
@@ -1292,6 +1301,53 @@ def section_10_sitecustomize_and_readme() -> None:
             "--host 0.0.0.0",
             docker_run,
         )
+
+        # PYTHONPATH=/opt/patches is load-bearing: without it, CPython's
+        # site.py never finds /opt/patches/sitecustomize.py, and patch 2
+        # (hybrid_kv_allocator) is silently dead in the spawned EngineCore.
+        # Catch the regression of a maintainer dropping the env var.
+        run.expect_in(
+            "README §8.2 docker run includes -e PYTHONPATH=/opt/patches",
+            "PYTHONPATH=/opt/patches",
+            docker_run,
+        )
+
+        # --entrypoint python3 is load-bearing: without it, the image's
+        # default ENTRYPOINT [vllm, serve] runs and the launcher is
+        # never executed at all (no patches install).
+        run.expect_in(
+            "README §8.2 docker run includes --entrypoint python3",
+            "--entrypoint python3",
+            docker_run,
+        )
+
+        # The launcher itself must be bind-mounted into /opt/patches/launch.py
+        # (the path the docker command then invokes). The launcher source
+        # file's name in the repo is launch_with_patches.py; the in-container
+        # path is /opt/patches/launch.py.
+        run.expect_in(
+            "README §8.2 docker run bind-mounts launch_with_patches.py "
+            "at /opt/patches/launch.py",
+            "launch_with_patches.py:/opt/patches/launch.py:ro",
+            docker_run,
+        )
+
+        # Every entry in _PATCH_MODULES must have a corresponding bind-mount
+        # line in the docker run command. Catches the regression where a
+        # patch is added to the launcher tuple but the operator forgets
+        # to add the bind-mount; without the mount the patch import
+        # raises ImportError at PID 1 startup, but without the static check
+        # the maintainer would only learn at deployment time.
+        if isinstance(sitecustomize_modules, tuple):
+            for module_name in sitecustomize_modules:
+                expected_mount = (
+                    f"{module_name}.py:/opt/patches/{module_name}.py:ro"
+                )
+                run.expect_in(
+                    f"README §8.2 docker run bind-mounts {module_name}",
+                    expected_mount,
+                    docker_run,
+                )
 
     # README's pinned commit string must match EXPECTED_COMMIT.
     run.expect_in(
