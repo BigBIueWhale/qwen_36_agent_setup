@@ -1207,6 +1207,101 @@ def section_9_no_silent_failures() -> None:
 
 
 # --------------------------------------------------------------------
+# Section 10: sitecustomize + README consistency
+# --------------------------------------------------------------------
+
+
+def section_10_sitecustomize_and_readme() -> None:
+    """Static checks that don't require booting Docker:
+
+    * ``sitecustomize.py`` exists at the repo root and parses as Python.
+    * ``sitecustomize._PATCH_MODULES`` is a tuple of strings.
+    * ``sitecustomize._PATCH_MODULES`` is byte-identical to
+      ``launch_with_patches._PATCH_MODULES`` (the same drift check the
+      launcher runs at boot, but also caught at static-test time).
+    * The README's §8.2 docker run command includes the sitecustomize
+      bind-mount and ``--host 127.0.0.1``.
+    * The README's pinned commit string matches :data:`EXPECTED_COMMIT`.
+
+    These four-ish checks correspond to the punch-list item C — without
+    them, a maintainer can drift one of the four invariants and only
+    discover at deployment time (or worse, silently never).
+    """
+    run.section("10. sitecustomize + README consistency")
+
+    sitecustomize_path = PATCH_DIR / "sitecustomize.py"
+    launcher_path = PATCH_DIR / "launch_with_patches.py"
+    readme_path = PATCH_DIR / "README.md"
+
+    run.expect(
+        "sitecustomize.py exists at repo root",
+        sitecustomize_path.is_file(),
+        f"missing: {sitecustomize_path}",
+    )
+    if not sitecustomize_path.is_file():
+        return  # skip remaining checks; their preconditions are unmet
+
+    sitecustomize_modules = patch_constant(sitecustomize_path, "_PATCH_MODULES")
+    is_str_tuple = isinstance(sitecustomize_modules, tuple) and all(
+        isinstance(m, str) for m in sitecustomize_modules
+    )
+    run.expect(
+        "sitecustomize._PATCH_MODULES is a tuple of strings",
+        is_str_tuple,
+        f"got {type(sitecustomize_modules).__name__}: "
+        f"{sitecustomize_modules!r}",
+    )
+
+    launcher_modules = patch_constant(launcher_path, "_PATCH_MODULES")
+    run.expect_eq(
+        "sitecustomize._PATCH_MODULES == launch_with_patches._PATCH_MODULES",
+        sitecustomize_modules,
+        launcher_modules,
+    )
+
+    readme_src = readme_path.read_text()
+
+    # README §8.2 must contain the sitecustomize bind-mount and the
+    # --host 127.0.0.1 flag in the docker run block. Find the docker
+    # run command (between ```bash ... ```), then check it contains
+    # both strings.
+    docker_run_re = re.compile(
+        r"```bash\s*\n(docker run.*?)```", re.DOTALL
+    )
+    docker_run_match = docker_run_re.search(readme_src)
+    run.expect(
+        "README contains a `docker run` bash code block",
+        docker_run_match is not None,
+        "the §8.2 docker run command is missing or its fence is wrong",
+    )
+    if docker_run_match is not None:
+        docker_run = docker_run_match.group(1)
+        run.expect_in(
+            "README §8.2 docker run includes sitecustomize bind-mount",
+            "sitecustomize.py:/opt/patches/sitecustomize.py:ro",
+            docker_run,
+        )
+        run.expect_in(
+            "README §8.2 docker run includes --host 127.0.0.1",
+            "--host 127.0.0.1",
+            docker_run,
+        )
+        # The §8.2 command must NOT bind to 0.0.0.0 anywhere.
+        run.expect_not_in(
+            "README §8.2 docker run does NOT bind to 0.0.0.0",
+            "--host 0.0.0.0",
+            docker_run,
+        )
+
+    # README's pinned commit string must match EXPECTED_COMMIT.
+    run.expect_in(
+        f"README references EXPECTED_COMMIT={EXPECTED_COMMIT[:12]}…",
+        EXPECTED_COMMIT,
+        readme_src,
+    )
+
+
+# --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 
@@ -1229,6 +1324,7 @@ def main() -> int:
         section_7_streaming_metrics,
         section_8_launcher,
         section_9_no_silent_failures,
+        section_10_sitecustomize_and_readme,
     ]
     for fn in sections:
         try:
