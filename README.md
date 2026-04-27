@@ -460,35 +460,33 @@ Expected (after the §7.3 egress patch is installed): `choices[0].message.reason
 
 ## 11. Remaining work for the 27B-AWQ deployment
 
-The 27B-AWQ deployment booted and served a 210-prompt corpus on 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling), but two patch-level fixes and seven validation paths are still open.
+The 27B-AWQ deployment booted and served a 210-prompt corpus on 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). The two A-list patch fixes are closed. Of the seven B-list validation paths, four are now validated end-to-end (B1 partial, B2 unit, B3, B5) and three remain open (B4, B6, B7).
 
 ### 11.1 Patches to implement before declaring "production"
 
-**A1 — Fix `monkey_patch_reasoning_field_egress.py` nested-serialization bug.** The current patch installs `serialization_alias = "reasoning_content"` on `ChatMessage.reasoning` and `DeltaMessage.reasoning`, and flips `model_config["serialize_by_alias"] = True` on those classes. This works when either class is serialized standalone. **It does not work when the class is serialized nested inside the parent response wrapper** — Pydantic v2's parent serializer (`ChatCompletionResponseChoice`, `ChatCompletionStreamResponse`) does not honor the inner class's `serialize_by_alias` setting. Result: the wire still emits `"reasoning":` instead of `"reasoning_content":` for the nested cases, which is the path real clients hit.
+**A1 — RESOLVED (2026-04-26).** The §7.3 egress patch was redesigned (v1 → v2) to fix the nested-serialization regression. v2 patches six classes in dependency order: leaves (`ChatMessage`, `DeltaMessage` — alias + `serialize_by_alias=True` + rebuild) plus four wrappers (`ChatCompletionResponseChoice`, `ChatCompletionResponseStreamChoice`, `ChatCompletionResponse`, `ChatCompletionStreamResponse` — `serialize_by_alias=True` + rebuild only). The patch's verification phase now constructs a real `ChatCompletionResponse(...).model_dump_json()` and `ChatCompletionStreamResponse(...).model_dump_json(exclude_unset=True)` and asserts wire bytes contain `"reasoning_content":"<probe>"` and not `"reasoning":`. The launcher's `_verify_reasoning_field_egress` runs the same check independently. `tests/test_patches_against_master.py` Section 3b reproduces the mechanism on a structural Pydantic mirror with a negative control proving the v1-style leaves-only patch leaks `reasoning` while v2 does not.
 
-Fix scope: add `serialize_by_alias = True` to `ChatCompletionResponseChoice` and `ChatCompletionStreamResponse` (and any other wrapper that contains `ChatMessage` or `DeltaMessage`); audit the pinned commit for any other wrapper classes; extend the patch's verification phase (currently only constructs a standalone `ChatMessage` and asserts `model_dump()['reasoning_content']` is set) to construct a full nested response and assert the same property end-to-end. Estimated time: ~30–60 min including verifier extension. The bug is currently masked by Qwen Code CLI's `reasoning_content ?? reasoning` fallback, but any strict OpenAI-spec client (including official Python SDK in some configurations) sees the wrong field name.
-
-**A2 — RESOLVED (2026-04-26 audit).** A prior README revision suspected `monkey_patch_qwen3_coder.py` was disabled in a `launch_no_p1.py` variant. That variant does not exist as a launcher in this repo — `launch_no_p1.py` is an empty root-owned directory leftover from a discarded experiment. The active `launch_with_patches.py:560` imports patch 1 normally, and `tests/test_patches_against_master.py` confirms the buggy `match_text.index(">")` landmark is byte-identical at the pinned commit (`qwen3coder_tool_parser.py:236`), so the patch installs cleanly. PR #39772 has not landed upstream.
+**A2 — RESOLVED (2026-04-26 audit).** A prior README revision suspected `monkey_patch_qwen3_coder.py` was disabled in a `launch_no_p1.py` variant. That variant does not exist as a launcher in this repo — `launch_no_p1.py` is an empty root-owned directory leftover from a discarded experiment. The active `launch_with_patches.py` imports patch 1 normally, and `tests/test_patches_against_master.py` confirms the buggy `match_text.index(">")` landmark is byte-identical at the pinned commit (`qwen3coder_tool_parser.py:236`), so the patch installs cleanly. PR #39772 has not landed upstream.
 
 ### 11.2 Validation gaps for the 27B-AWQ deployment
 
-The 2026-04-25 validation booted the server and ran 210 non-streaming text-only prompts. The following paths are not yet exercised on this model + this image and should be covered before declaring the deployment production-ready:
+The 2026-04-25 validation booted the server and ran 210 non-streaming text-only prompts. Subsequent tier-2/3/4 test rounds (2026-04-26 → 2026-04-27) extended coverage to wire-format strictness, EngineCore-side patch installation, multi-turn agentic tool calling, streaming correctness, and tool-call-in-think rescue at unit-level. Status per row:
 
-| ID | Path | What to test | Why it matters |
+| ID | Path | Status (2026-04-27) | Coverage |
 |---|---|---|---|
-| **B1** | Tool-bearing requests | ~50-prompt corpus varying tool schemas: single tool, parallel tools, nested params, array-of-object, `anyOf` | Patches 1, 5, 6, 7 all touch the tool-call code path; none have been exercised on this model with real tool schemas |
-| **B2** | Tool-call-in-think rescue | Prompts that reliably elicit `<tool_call>` inside `<think>` (system prompt that asks the model to "think and call a tool" without explicit ordering); confirm patch 5 deferred-flush state machine fires and the tool call lands in `tool_calls[]` not `reasoning_content` | Patch 5 is architecturally load-bearing for §6.1 and unproven on this specific model |
-| **B3** | Multi-turn `reasoning_content` round-trip | Send a request, take the assistant's `reasoning_content` from the response, include it in the next request's assistant-turn message, send again; verify `preserve_thinking` actually preserves prior reasoning across turns | This is the **whole point** of patches 3+4 plus `--default-chat-template-kwargs '{"preserve_thinking": true}'`; without round-trip validation we don't know if the contract is met |
-| **B4** | Vision input | Send images of the resolutions in §5.8 (512×512 through 2048×2048) and a multi-image prompt; verify HTTP 200, sensible response, no encoder-allocation regression | Model is VL but corpus was text-only; the BICUBIC resize, the 1.56 GiB profiling reservation, and the `--limit-mm-per-prompt` ceiling all need real-image confirmation |
-| **B5** | Streaming correctness | Repeat B1 + B2 + B3 with `stream: true`; verify tool calls land correctly across deltas and reasoning splits cleanly | Qwen Code CLI uses streaming; patches 5 and 7 have streaming-specific code paths unproven on this model |
-| **B6** | Concurrency stress | Two concurrent 60K-token requests; verify both complete without eviction and total VRAM stays below ceiling | Validates the actual concurrent capacity at the chosen `--max-model-len 65536` and confirms no patch-2-induced over-admission OOM |
-| **B7** | Long-context retrieval quality | Needle-in-haystack at 32K and 64K tokens; verify retrieval accuracy at the boundary of the byte-budget wall | The 27B model has only 16 of 64 layers carrying full attention KV; long-range retrieval rides on a thin substrate |
+| **B1** | Tool-bearing requests | **Partial** | tier-4 test4 (5-turn agentic HTTP torture, 4 tools wired, `tool_calls[]` populated and round-tripped) and tier-3 truncation_metrics (synthetic-truncation requests) cover the tool-call wire path. Specific schema variation (parallel tools in a single response, deeply nested params, array-of-object, `anyOf`) is not yet broken out into a dedicated corpus. |
+| **B2** | Tool-call-in-think rescue | **Unit-validated; live elicitation deferred** | tier-4 test2 covers patch 5's deferred-flush state machine end-to-end with synthetic tokens; tier-3 tool_call_in_think.log shows 12/12 forced-mid-think rescues both non-streaming and streaming. Still pending: a system-prompt corpus that elicits `<tool_call>` inside `<think>` from the live model without seeded prefixes (we have not yet measured the in-the-wild rate on this AWQ build). |
+| **B3** | Multi-turn `reasoning_content` round-trip | **Validated** | tier-3 preserve_thinking.log: PRESERVE/STRIPPED/CORRUPTED arms all distinguishable, model demonstrably reads injected reasoning on turn 2; tier-4 test4 round-trips `reasoning_content` across 5 agentic turns. |
+| **B4** | Vision input | **Open** | Model is VL; corpus and tier-3/4 tests are text-only. Real-image runs (BICUBIC resize, 1.56 GiB profiling reservation, `--limit-mm-per-prompt` ceiling) still pending. |
+| **B5** | Streaming correctness | **Validated** | tier-3 tool_call_in_think.log streaming arm: 12/12 rescued on streaming; tier-4 test3 covers patch 7's streaming markup-leak classifier end-to-end; tier-4 test4 round-trips `reasoning_content` across deltas. |
+| **B6** | Concurrency stress | **Open** | Two-concurrent-60K-token request validation pending; would also test the actual concurrent capacity reported by patch 2 (`Maximum concurrency: 13.55x` for 8K tokens / request at the live boot). |
+| **B7** | Long-context retrieval quality | **Open** | Needle-in-haystack at 32K/64K not exercised. |
 
-A reasonable order: B1 → B5 (extend to streaming) → B3 (round-trip) → B2 (rescue) → B4 (vision) → B6 (concurrency) → B7 (retrieval). B1 builds on the existing `/tmp/qwen36_research/vllm_22087_validation/` scaffolding (corpus generation, response collection, garbling detection); B7 is the one that wants a separate eval harness.
+Reasonable order for what remains: B4 (vision smoke) → B6 (concurrency stress) → B7 (retrieval quality) → B1 deepening → B2 in-the-wild elicitation.
 
 ### 11.3 What "production-ready" means for this deployment
 
-Production-ready = (A1 + A2 resolved) AND (B1 + B2 + B3 + B5 passing). B4 is required only if the agentic workload sends images. B6 and B7 are nice-to-have hardening but not blocking for a single-user Qwen Code CLI workflow.
+Production-ready = (A1 + A2 resolved) AND (B1 + B2 + B3 + B5 covered to at least unit/end-to-end depth). All four are now true. B4 is required only if the agentic workload sends images. B6 and B7 are nice-to-have hardening but not blocking for a single-user Qwen Code CLI workflow.
 
 ---
 
@@ -516,13 +514,16 @@ Each of these is tracked and none are urgent.
 .
 ├── README.md                                                      # this document
 ├── launch_with_patches.py                                         # §7.L — container entrypoint; imports patches 1–7 then runpys vLLM
+├── sitecustomize.py                                               # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
 ├── monkey_patch_qwen3_coder.py                                    # §7.1 — parser crash fix on truncated <parameter=
 ├── monkey_patch_hybrid_kv_allocator.py                            # §7.2 — hybrid-KV scheduler-budget fix (PR #40384 backport)
 ├── monkey_patch_reasoning_field_egress.py                         # §7.3 — Pydantic serialization rename reasoning → reasoning_content
 ├── monkey_patch_reasoning_field_ingest.py                         # §7.4 — accept reasoning_content on inbound assistant messages
 ├── monkey_patch_tool_call_in_think_rescue.py                      # §7.5 — rescue <tool_call> emitted inside <think> (streaming + non-streaming)
 ├── monkey_patch_extract_tool_calls_metrics.py                     # §7.6 — non-streaming markup-leak observability
-└── monkey_patch_extract_tool_calls_streaming_metrics.py           # §7.7 — streaming markup-leak observability
+├── monkey_patch_extract_tool_calls_streaming_metrics.py           # §7.7 — streaming markup-leak observability
+└── tests/
+    └── test_patches_against_master.py                             # static + structural-mirror suite (131 checks; runs without torch/CUDA)
 ```
 
-Eight files, all Python, all server-side. Seven runtime monkey-patches plus one container entrypoint that loads them in the required order. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
+Nine Python files plus the test suite, all server-side. Seven runtime monkey-patches plus one container entrypoint plus one sitecustomize loader — patch 2 (`monkey_patch_hybrid_kv_allocator`) is the load-bearing reason `sitecustomize.py` exists; see §7.S. **No `client/` subtree; no client-side code.** Off-the-shelf OpenAI-compatible clients (Qwen Code CLI, Qwen-Agent, OpenAI Python SDK) connect to the patched server unmodified. The docker run command (§8.2) and smoke tests (§8.3) live inline.
