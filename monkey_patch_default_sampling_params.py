@@ -95,7 +95,7 @@ _REQUEST_FIELDS_REQUIRED: tuple[str, ...] = (
 )
 
 
-_logger = init_logger(__name__)
+_logger = init_logger(f"vllm.qwen36_patches.{__name__}")
 
 
 class DefaultSamplingParamsPatchRefusedError(RuntimeError):

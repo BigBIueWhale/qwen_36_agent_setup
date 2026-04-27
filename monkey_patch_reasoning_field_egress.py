@@ -44,7 +44,7 @@ _FIELD_NAME: str = "reasoning"
 _ALIAS: str = "reasoning_content"
 _PROBE: str = "__qwen36_egress_probe__"
 
-_logger = init_logger(__name__)
+_logger = init_logger(f"vllm.qwen36_patches.{__name__}")
 
 
 class EgressPatchRefusedError(RuntimeError):

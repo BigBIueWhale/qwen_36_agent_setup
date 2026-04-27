@@ -36,37 +36,20 @@ that confirms the spawned EngineCore interpreter sees patched targets.
 Docker run shape
 ----------------
 
-The docker run command bind-mounts each patch and sitecustomize at
-``/opt/patches/<name>.py``, sets ``PYTHONPATH=/opt/patches``, and uses
-``--entrypoint python3 /opt/patches/launch.py``::
-
-    docker run --rm -d --name qwen36 --gpus all \\
-      --network host \\
-      --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
-      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\
-      -v "$PWD/sitecustomize.py:/opt/patches/sitecustomize.py:ro" \\
-      -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \\
-      -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \\
-      -v "$PWD/monkey_patch_reasoning_field_egress.py:/opt/patches/monkey_patch_reasoning_field_egress.py:ro" \\
-      -v "$PWD/monkey_patch_reasoning_field_ingest.py:/opt/patches/monkey_patch_reasoning_field_ingest.py:ro" \\
-      -v "$PWD/monkey_patch_tool_call_in_think_detector.py:/opt/patches/monkey_patch_tool_call_in_think_detector.py:ro" \\
-      -v "$PWD/monkey_patch_default_sampling_params.py:/opt/patches/monkey_patch_default_sampling_params.py:ro" \\
-      -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \\
-      -e HF_HUB_ENABLE_HF_TRANSFER=1 \\
-      -e VLLM_USE_V1=1 \\
-      -e PYTHONPATH=/opt/patches \\
-      --entrypoint python3 \\
-      vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \\
-      /opt/patches/launch.py serve \\
-      --host 127.0.0.1 ...  # remaining flags unchanged
-
-Load-bearing items: ``sitecustomize.py`` bind-mount (re-installs
-patches in spawned EngineCore — without it,
+The canonical ``docker run`` invocation is the one in **README §8.2**;
+it is the single source of truth for the deployment. Do not paraphrase
+it here — drift between this docstring and §8.2 has bitten this repo
+before. Load-bearing properties of that command (in case anyone is
+auditing this file in isolation): ``sitecustomize.py`` bind-mount
+(re-installs patches in spawned EngineCore — without it,
 ``monkey_patch_hybrid_kv_allocator`` is silently dead in the EngineCore
 subprocess); ``PYTHONPATH=/opt/patches`` (CPython's ``site.py`` finds
 sitecustomize on it); ``--entrypoint python3`` (overrides the image's
 ``[vllm, serve]``); ``--network host`` plus ``--host 127.0.0.1``
-(loopback-only binding so /v1/* and /metrics are not world-accessible).
+(loopback-only binding so /v1/* and /metrics are not world-accessible);
+``--restart unless-stopped`` (auto-recover from engine crash);
+``--health-cmd 'curl /health'`` (shallow liveness — deep wedge probe
+lives at ``health_probe.sh`` per README §8.4).
 
 Adding a new patch
 ------------------
@@ -573,6 +556,47 @@ def _verify_default_sampling_params(patch_module: ModuleType) -> None:
     )
 
 
+def _verify_qwen3_coder_grammar(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_qwen3_coder_grammar`` overrode
+    ``Qwen3CoderToolParser.adjust_request`` and flipped
+    ``supports_required_and_named=False``.
+
+    Tag-only check: the patch's own Phase 9 self-verification constructs
+    real ``ChatCompletionRequest`` instances, instantiates
+    ``Qwen3CoderToolParser`` against a minimal model_tokenizer surface,
+    calls the wrapped method in four behavioural cases (auto+tools,
+    empty tools, explicit structured_outputs, tool_choice='none'),
+    parses the structural_tag JSON, and round-trips it through
+    ``xgrammar.Grammar.from_structural_tag``. Re-doing that here would
+    duplicate the patch's own load-bearing verification — the launcher
+    need only confirm the install propagated to the target via both
+    attribute lookup and ``inspect.getattr_static``.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import "
+            f"vllm.tool_parsers.qwen3coder_tool_parser.Qwen3CoderToolParser "
+            f"for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        Qwen3CoderToolParser,
+        "adjust_request",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="Qwen3CoderToolParser",
+    )
+    if Qwen3CoderToolParser.supports_required_and_named is not False:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] {patch_module.__name__!r}: "
+            f"Qwen3CoderToolParser.supports_required_and_named is "
+            f"{Qwen3CoderToolParser.supports_required_and_named!r}, "
+            f"expected False (latent bug fix at engine/serving.py:646-665)."
+        )
+
+
 # --------------------------------------------------------------------
 # Registry. Order matters — see module docstring.
 # --------------------------------------------------------------------
@@ -594,13 +618,18 @@ _PATCH_MODULES: tuple[str, ...] = (
     # extract_reasoning (independent of the egress rebuild);
     # default_sampling_params wraps ChatCompletionRequest.to_sampling_params
     # (independent of every other surface — request-time field rewrite
-    # only).
+    # only); qwen3_coder_grammar overrides Qwen3CoderToolParser.adjust_request
+    # (must come AFTER qwen3_coder — patch 1 only touches the unrelated
+    # _parse_xml_function_call method on the same class — but ordering
+    # is defensive: a future regression where one clobbers the other
+    # would be visible to the launcher's tag verifier).
     "monkey_patch_qwen3_coder",
     "monkey_patch_hybrid_kv_allocator",
     "monkey_patch_reasoning_field_egress",
     "monkey_patch_reasoning_field_ingest",
     "monkey_patch_tool_call_in_think_detector",
     "monkey_patch_default_sampling_params",
+    "monkey_patch_qwen3_coder_grammar",
 )
 
 _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
@@ -610,6 +639,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_reasoning_field_ingest": _verify_reasoning_field_ingest,
     "monkey_patch_tool_call_in_think_detector": _verify_tool_call_in_think_detector,
     "monkey_patch_default_sampling_params": _verify_default_sampling_params,
+    "monkey_patch_qwen3_coder_grammar": _verify_qwen3_coder_grammar,
 }
 
 
@@ -736,6 +766,10 @@ _TARGETS = [
      "vllm.entrypoints.openai.chat_completion.protocol",
      "ChatCompletionRequest",
      "to_sampling_params"),
+    ("monkey_patch_qwen3_coder_grammar",
+     "vllm.tool_parsers.qwen3coder_tool_parser",
+     "Qwen3CoderToolParser",
+     "adjust_request"),
 ]
 
 # sitecustomize already ran (CPython's site.py auto-loaded it before
