@@ -1,4 +1,4 @@
-"""Tests for ``host_logs/qwen36_warning_forwarder.py``.
+"""Tests for ``host_ops/qwen36_warning_forwarder.py``.
 
 Runs without docker, network, or GPU. Synthesises log lines straight
 into the parser, drives signals via Python's ``signal`` module, and
@@ -28,10 +28,10 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FORWARDER = REPO_ROOT / "host_logs" / "qwen36_warning_forwarder.py"
+FORWARDER = REPO_ROOT / "host_ops" / "qwen36_warning_forwarder.py"
 
 # Make the forwarder importable without installing.
-sys.path.insert(0, str(REPO_ROOT / "host_logs"))
+sys.path.insert(0, str(REPO_ROOT / "host_ops"))
 
 import qwen36_warning_forwarder as fwd  # noqa: E402  — path set above
 

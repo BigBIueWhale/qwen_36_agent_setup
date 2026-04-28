@@ -49,7 +49,7 @@ sitecustomize on it); ``--entrypoint python3`` (overrides the image's
 (loopback-only binding so /v1/* and /metrics are not world-accessible);
 ``--restart unless-stopped`` (auto-recover from engine crash);
 ``--health-cmd 'curl /health'`` (shallow liveness — deep wedge probe
-lives at ``health_probe.sh`` per README §8.4).
+lives at ``host_ops/qwen36_deep_probe.sh`` per README §8.4).
 
 Adding a new patch
 ------------------

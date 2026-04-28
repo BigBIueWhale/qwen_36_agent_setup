@@ -1,0 +1,36 @@
+[Unit]
+# qwen36 wedge-recovery deep-liveness probe (one-shot, fired by the timer).
+#
+# Runs /usr/local/bin/qwen36_deep_probe.sh — a single curl + jq check that
+# the engine actually decoded a token. If the probe fails, it is retried
+# once after a 5-second pause; if it fails again, the unit `docker restart`s
+# the qwen36 container. The retry-and-restart logic is encoded inline in
+# ExecStart (rather than in a wrapper script) so the wedge-recovery
+# behaviour is fully visible in this single file.
+Description=Qwen3.6 wedge-recovery deep-liveness probe
+Documentation=file:///usr/local/bin/qwen36_deep_probe.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+# qwen36_deep_probe.sh exits 0 on healthy engine, 1 on probe failure.
+# || retries once after sleep 5; second || falls through to docker restart
+# (which exits 0 on success, hence the whole pipeline exits 0 unless even
+# docker restart fails — the timer will retry next minute either way).
+ExecStart=/bin/bash -c '/usr/local/bin/qwen36_deep_probe.sh || (sleep 5 && /usr/local/bin/qwen36_deep_probe.sh) || /usr/bin/docker restart qwen36'
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qwen36-deep-probe
+
+# Light hardening — the script reads from one localhost HTTP endpoint
+# and may invoke `docker restart`. NoNewPrivileges keeps the blast radius
+# bounded; we don't restrict ReadWritePaths because docker.sock access is
+# required for the recovery path.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+# Not directly enabled — driven by qwen36-deep-probe.timer.
+WantedBy=multi-user.target

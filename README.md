@@ -559,66 +559,43 @@ curl -s http://127.0.0.1:8001/v1/chat/completions \
   }' | jq .
 ```
 
-Operational: vLLM exports Prometheus metrics at `/metrics` — scrape for KV cache pressure, queue depth, request latency. Patch §7.5 emits `model_emit_warning kind=tool_call_in_reasoning` to docker logs when the model misbehaves; the host-side forwarder in §8.5 turns those into structured JSON Lines for alerting and ad-hoc queries.
+Operational: vLLM exports Prometheus metrics at `/metrics` — scrape for KV cache pressure, queue depth, request latency.
 
-### 8.4 Set up the wedge-recovery probe (deep liveness)
+### 8.4 Host-side ops bundle ([`host_ops/`](host_ops/))
 
-`--health-cmd 'curl -fsS http://127.0.0.1:8001/health'` from §8.2 detects the API-server process being dead, but **not** engine wedges where the HTTP layer answers `/health` with 200 while the EngineCore subprocess is stuck (CUDA hang, deadlocked allocator, livelocked scheduler — see vLLM forum thread *"V1 Engine child process dies unnoticed; check_health() is a no-op"*). [`health_probe.sh`](health_probe.sh) at this repo's root issues a real `/v1/chat/completions` decode and asserts `(choices[0].message.content // choices[0].message.reasoning_content) != null` AND `usage.completion_tokens >= 1`. The disjunction over content lanes is load-bearing on this stack: with `--reasoning-parser qwen3` enabled (§8.2), the first generated tokens route to `reasoning_content` until `</think>` is observed, so a 1-token probe lands its proof-of-decode in `reasoning_content` while `content` stays `null`. Either lane non-null is a real "engine decoded" signal.
-
-```bash
-# Step 1: install the script on the host (not inside the container —
-# `docker restart` runs from the host).
-sudo install -m 0755 health_probe.sh /usr/local/bin/qwen36_deep_probe.sh
-
-# Step 2: confirm the probe exits 0 once against the running container.
-/usr/local/bin/qwen36_deep_probe.sh && echo "deep probe OK"
-
-# Step 3: install a recurring schedule. Cron line: 60 s cadence, retry
-# once after 5 s, restart on second consecutive failure.
-sudo tee /etc/cron.d/qwen36_deep_probe >/dev/null <<'CRON'
-* * * * * root /usr/local/bin/qwen36_deep_probe.sh \
-  || (sleep 5 && /usr/local/bin/qwen36_deep_probe.sh) \
-  || docker restart qwen36
-CRON
-```
-
-systemd-timer equivalent (substitute for the cron line if your host uses systemd timers): `OnUnitActiveSec=60s` unit running the same `||`-chained command.
-
-### 8.5 Set up the §7.5 model_emit_warning forwarder
-
-Patch §7.5 emits one structured WARNING per request whose reasoning contains `<tool_call>` markup, with `marker_count` reporting how many substrings were seen (rate is single-digit % under agentic workloads). The line is machine-parseable by design: `model_emit_warning kind=tool_call_in_reasoning reasoning_len=<int> marker_count=<int>`. By default it lands in `docker logs` and stays there. [`host_logs/qwen36_warning_forwarder.py`](host_logs/qwen36_warning_forwarder.py) tails `docker logs -f`, parses each line with a strict regex anchored on the patch's exact format string (line 84 of the patch source), and appends one JSON Lines record per event to `/var/log/qwen36/warnings.jsonl`. A line that matches the marker prefix but fails the full regex is treated as a LOUD parse error: it goes to stderr/journald and increments `parse_errors` in the state file — silent drops are precisely what makes monitoring useless.
-
-JSONL schema, one object per line:
-
-```
-{"ts": "<ISO-8601 UTC>", "kind": "tool_call_in_reasoning", "reasoning_len": <int>, "marker_count": <int>, "raw": "<original docker line>"}
-```
-
-Install (idempotent — rerun safe):
+Two host-side services live in [`host_ops/`](host_ops/) and are installed together by [`host_ops/install.sh`](host_ops/install.sh):
 
 ```bash
-sudo bash host_logs/install.sh
+sudo bash host_ops/install.sh
 ```
 
-That copies the script to `/usr/local/bin/`, the unit to `/etc/systemd/system/`, creates `/var/log/qwen36/` and `/var/lib/qwen36/`, runs `systemctl daemon-reload`, and enables/starts the service. Verify:
+The installer copies the scripts to `/usr/local/bin/`, the units to `/etc/systemd/system/`, creates `/var/log/qwen36/` + `/var/lib/qwen36/`, runs `systemctl daemon-reload`, and enables/starts both bundles. Idempotent — re-run after editing any file in [`host_ops/`](host_ops/) to redeploy. Source-of-truth for what the installer does and how to verify lives in the script header itself; the units are documented in their own files. The two bundles below differ in runtime mode (forwarder is a long-running daemon; probe is a periodically-fired one-shot) but share the same in-repo source-of-truth pattern: a `.service` unit (plus a `.timer` for the probe), idempotent installation, journal-integrated logging.
 
-```bash
-systemctl status qwen36-warning-forwarder.service
-journalctl -u qwen36-warning-forwarder -f
-tail -f /var/log/qwen36/warnings.jsonl
-cat /var/lib/qwen36/forwarder_state.json   # events_total, restart_count, parse_errors
+#### 8.4.1 Wedge-recovery deep-liveness probe
+
+Files: [`host_ops/qwen36_deep_probe.sh`](host_ops/qwen36_deep_probe.sh) (the probe), [`host_ops/qwen36-deep-probe.service`](host_ops/qwen36-deep-probe.service) (one-shot, retry-and-restart logic inline in `ExecStart`), [`host_ops/qwen36-deep-probe.timer`](host_ops/qwen36-deep-probe.timer) (`OnUnitActiveSec=60s`).
+
+WHAT — issues a real `/v1/chat/completions` decode and asserts `(choices[0].message.content // choices[0].message.reasoning_content) != null` AND `usage.completion_tokens >= 1`. The disjunction over content lanes is load-bearing on this stack: with `--reasoning-parser qwen3` enabled (§8.2), the first generated token routes to `reasoning_content` until `</think>` is observed, so a 1-token probe lands its proof-of-decode in `reasoning_content` while `content` stays `null`. Either lane non-null is a real "engine decoded" signal.
+
+WHEN — every 60 seconds; on probe failure the unit retries once after a 5-second pause, and on a second consecutive failure issues `docker restart qwen36`. The retry-and-restart logic is encoded inline in [`qwen36-deep-probe.service`](host_ops/qwen36-deep-probe.service)'s `ExecStart` so the wedge-recovery semantics are visible in one file (no shell-`||` line buried elsewhere).
+
+WHY — `--health-cmd 'curl -fsS http://127.0.0.1:8001/health'` from §8.2 detects the API-server process being dead but NOT engine wedges where the HTTP layer answers `/health` with 200 while EngineCore is stuck (CUDA hang, deadlocked allocator, livelocked scheduler — see vLLM forum thread *"V1 Engine child process dies unnoticed; check_health() is a no-op"*). This probe catches those.
+
+#### 8.4.2 §7.5 `model_emit_warning` forwarder
+
+Files: [`host_ops/qwen36_warning_forwarder.py`](host_ops/qwen36_warning_forwarder.py) (the daemon), [`host_ops/qwen36-warning-forwarder.service`](host_ops/qwen36-warning-forwarder.service) (`Type=simple`, restart-on-failure).
+
+WHAT — tails `docker logs -f qwen36`, parses each `model_emit_warning kind=tool_call_in_reasoning reasoning_len=N marker_count=M` WARNING (the §7.5 patch's exact format string at [`monkey_patch_tool_call_in_think_detector.py:84`](monkey_patch_tool_call_in_think_detector.py#L84)) with a strict regex anchored end-to-end, and appends one JSON Lines record per event to `/var/log/qwen36/warnings.jsonl`. A line that matches the marker prefix but fails the full regex is treated as a LOUD parse error: it goes to stderr/journald and increments `parse_errors` in the state file at `/var/lib/qwen36/forwarder_state.json` — silent drops would defeat the point. Schema, one object per line:
+
+```
+{"ts":"<ISO-8601 UTC>","kind":"tool_call_in_reasoning","reasoning_len":<int>,"marker_count":<int>,"raw":"<verbatim docker line>"}
 ```
 
-Sample query — tool-call-in-reasoning events in the last hour:
+WHEN — continuous (long-running daemon, restarted by systemd on failure). `kill -HUP` rotates the output file in place (logrotate-compatible); `kill -TERM` graceful-shuts with a `shutdown: events=N restarts=M parse_errors=K` banner to stderr.
 
-```bash
-HOUR_AGO="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S)"
-jq -r --arg t "$HOUR_AGO" 'select(.ts > $t)' /var/log/qwen36/warnings.jsonl | wc -l
-```
+WHY — §7.5 emits one structured WARNING per request whose reasoning contains `<tool_call>` markup (community-reported rate is single-digit % under agentic workloads). Without this forwarder the WARNINGs land in `docker logs` and stay there — no way to query "how many tool-call-in-reasoning events fired in the last hour" or alert on a rate spike. The §7.5 patch only wraps the non-streaming reasoning parser path; with streaming clients (Qwen Code Command-Line-Interface streams by default) the detector may not see production traffic and the forwarder may report low or zero rates from streaming workloads — see §7.5 for the carve-out's rationale.
 
-Without systemd: run `python3 host_logs/qwen36_warning_forwarder.py --output … --state …` directly, or fold it into your own supervisor. `--no-stdout` suppresses the JSON line on stdout when only file output is wanted. `kill -HUP $(pgrep -f qwen36_warning_forwarder)` rotates the output file in place; `kill -TERM` graceful-shuts with a `shutdown: events=N restarts=M parse_errors=K` banner to stderr.
-
-### 8.6 Production-ready checklist
+### 8.5 Production-ready checklist
 
 Sign off all of these before declaring the deployment ready:
 
@@ -676,7 +653,7 @@ Sign off all of these before declaring the deployment ready:
 | **B13** | Thinking-mode toggle ground truth (2026-04-29) | **Toggle is empirically strict at production T=0.6 when wired correctly** | 95-trial sweep at T=0.6 with **top-level** `chat_template_kwargs.enable_thinking=false`: **0 leaks** across (a) 30 trials matrix of easy/medium/hard difficulties × T=0/T=0.6, (b) 30 trials prompt-length sweep at 5K/30K/60K/100K/130K/150K targets (132,618 actual tokens at the 150K cell), (c) 20 trials math/code/retrieval intents including a 148K-token RULER single-needle. Cross-engine bug citations re-examined: vllm #30477 was a user-error (wrong `extra_body` wire shape), #40816 is a streaming-only bug on a different model size, sglang/llama.cpp issues are engine-specific. **Critical wire-shape finding**: vLLM's request schema has `extra="allow"`, so `extra_body={"chat_template_kwargs": {...}}` in raw HTTP is silently dropped — the OpenAI Python SDK unwraps `extra_body` client-side, but raw `curl` does not. Earlier in-session payloads using the `extra_body`-nested shape were silent no-ops; the apparent "leakage" they showed was the model thinking under the un-overridden server default and the parser routing `max_tokens`-truncated thinking (no `</think>`) to `reasoning_content` per its documented contract at `vllm/reasoning/qwen3_reasoning_parser.py:75-93`. Sub-agent E artifacts at `/tmp/qwen36_research/thinking_mode_ground_truth_2026-04-29/`. |
 | **B14** | Patch 9 (tool-role media preserve) live empirical confirmation (2026-04-29) | **Validated end-to-end** | Sent a 4-turn conversation `system → user → assistant(tool_calls) → tool` with the `tool` message's content as a 2-element list `[{type:text}, {type:image_url}]` carrying `disc5_imgs/img1.png` (793×224, ~155 vision tokens). HTTP 200; model response **"Query=Hi!, Reasoning panel, AI assistant interface"** (accurately describes the screenshot). **Smoking gun: 164-token prompt-token delta** between list-with-image (258 prompt tokens) and a plain-string negative control (94 prompt tokens). The 164-token delta matches the expected ~155 vision tokens for a 793×224 image plus framing — direct, unambiguous evidence that the image data flowed through the multimodal renderer despite being inside a `role:"tool"` message. Plain-string control hallucinates an empty UI, no vision tokens. Engine `/health=200` throughout. Triple-live artefacts at `/tmp/qwen36_research/triple_live_2026-04-28/`. |
 | **B15** | `add_vision_id` decision + content-format autodetect interaction (2026-04-29) | **Not training-load-bearing AND inert on this deployment until `content_format='openai'` is set** | (i) Training-side: Qwen3.6-VL model card L690-691 frames `add_vision_id` as opt-in convenience ("helpful to add labels … users can control this behavior"); canonical default example L725-728 omits it; the technical report does not mention the flag — flipping the server default is not training-fidelity-required. (ii) Live wire test: per-request `chat_template_kwargs.add_vision_id=true` (top-level, the B13 shape) produces token sequences **byte-identical** to the server default for 1/2/3-image requests via both `/tokenize` and `/v1/chat/completions`; full-prompt decode shows no `Picture N: ` prefix in either shape. n=1 multi-image ordinal probe (`THIRD image only` → `BLUE TEST`): both shapes correctly identify the third image; identical prompt_tokens (488). The override is silently dropped. (iii) Root cause: vLLM `_detect_content_format` (`renderers/hf.py:230-244`) walks the chat-template AST for top-level `for X in message['content']` loops; our `chat_template.jinja:6-7` performs the iteration inside the `render_content` macro and the detector misses it, returning `'string'` (`hf.py:271`; boot log `[hf.py:314] Detected the chat template content format to be 'string'`). Under `'string'`, `chat_utils.py:1382-1421` flattens multi-image content to a single string before the template runs, bypassing the `add_vision_id` branch (`chat_template.jinja:6-18`). To activate `add_vision_id`, add `--chat-template-content-format openai` to §8.2 (also makes `chat_template_kwargs.add_vision_id` per-request toggle work). **Decision: leave `add_vision_id` off** — opt-in by training, n=1 ordinal probe shows the model resolves multi-image grounding correctly without it, and the cost (~5 extra text tokens per image, total token budget) is unjustified for our workload mix. Sub-agent G artifacts at `/tmp/qwen36_research/add_vision_id_2026-04-29/`. |
-| **B16** | 130K–152K needle gap closure + §8.4 wedge-recovery cron operational status (2026-04-29) | **9/9 PASS recall verified; cron + probe NOT installed on this host** | (i) Needle: 9-cell matrix at temperature 0, top-level `chat_template_kwargs.enable_thinking=false`, `max_tokens=60`, fresh per-trial random suffixes, deterministic `[entry NNNNNN] <topic>` filler over a 12-topic Qwen-stack pool. Three lengths × three depths: `L130K_D{10,50,90}` (actual prompt 129 903–130 136), `L145K_D{10,50,90}` (144 925–145 071), `L152K_D{10,50,90}` (151 044–151 074). All 9 cells return verbatim `The secret token is XYZ123-<suffix>` with `finish_reason=stop`. Latencies 50–62 s per cell (130K cold ~50 s, 145K ~59 s, 151K ~62 s); engine `/health=200` throughout. The originally-`152K`-targeted cells were re-targeted to 151 000 user-text tokens because the original target=152 000 calibrated to user-text 152 023–152 091 and the chat-template framing tipped framed-prompt + `max_tokens=60` over the 152 000 cap (HTTP 400 with validator-reported `at least 151 941 input tokens`). The 151K cells exercise 99.4% of context length and complement §11 B12's single-needle 148 337-token cold-prefill probe; the strict 152 000 cap is a function of `prompt + max_tokens ≤ max_model_len` per `renderers/params.py:411-425` (B9-(e)). (ii) §8.4 wedge-recovery cron / probe script: `crontab -l` returns "no crontab for user"; `/etc/cron.d/qwen36_deep_probe` absent; no `qwen36*` `systemctl list-timers`; `/usr/local/bin/qwen36_deep_probe.sh` does not exist. Source `health_probe.sh` is present and executable in the repo. README §8.4 install steps were never executed on this host — the §8.6 production-readiness checklist row at line 629 ("`/usr/local/bin/qwen36_deep_probe.sh` returns 0") therefore currently fails for an operational reason, not a code reason. Sub-agent H artifacts at `/tmp/qwen36_research/needle_gap_2026-04-29/`. |
+| **B16** | 130K–152K needle gap closure + §8.4 wedge-recovery service operational status (2026-04-29) | **9/9 PASS recall verified; host_ops bundle ready in repo, install via `sudo bash host_ops/install.sh`** | (i) Needle: 9-cell matrix at temperature 0, top-level `chat_template_kwargs.enable_thinking=false`, `max_tokens=60`, fresh per-trial random suffixes, deterministic `[entry NNNNNN] <topic>` filler over a 12-topic Qwen-stack pool. Three lengths × three depths: `L130K_D{10,50,90}` (actual prompt 129 903–130 136), `L145K_D{10,50,90}` (144 925–145 071), `L152K_D{10,50,90}` (151 044–151 074). All 9 cells return verbatim `The secret token is XYZ123-<suffix>` with `finish_reason=stop`. Latencies 50–62 s per cell (130K cold ~50 s, 145K ~59 s, 151K ~62 s); engine `/health=200` throughout. The originally-`152K`-targeted cells were re-targeted to 151 000 user-text tokens because the original target=152 000 calibrated to user-text 152 023–152 091 and the chat-template framing tipped framed-prompt + `max_tokens=60` over the 152 000 cap (HTTP 400 with validator-reported `at least 151 941 input tokens`). The 151K cells exercise 99.4% of context length and complement §11 B12's single-needle 148 337-token cold-prefill probe; the strict 152 000 cap is a function of `prompt + max_tokens ≤ max_model_len` per `renderers/params.py:411-425` (B9-(e)). (ii) §8.4 wedge-recovery service: this audit found cron + probe script were not installed on the host (`crontab -l` empty, `/etc/cron.d/qwen36_deep_probe` absent, `/usr/local/bin/qwen36_deep_probe.sh` did not exist). At the time the install path was a multi-step manual recipe in §8.4 prose with the cron entry living only as a heredoc inside the README — that drift-prone shape was the root cause. Restructured the deployment surface as a single in-repo `host_ops/` bundle (script + systemd `.service` + `.timer`, no cron) with one idempotent installer (`sudo bash host_ops/install.sh`); §8.4 rewritten to link the artefacts and explain WHAT/WHEN/WHY rather than embed install commands. The §8.5 production-readiness checklist asserts `systemctl is-active qwen36-deep-probe.timer == active` and a one-shot `qwen36_deep_probe.sh` exit-0; running the installer once on this host closes the operational gap. While restructuring, also fixed a wire-shape bug in the probe script (was using `extra_body`-nested `chat_template_kwargs` which raw curl silently drops per §11 B13; now top-level — though the existing `(content // reasoning_content)` disjunction was masking the no-op). Sub-agent H artifacts at `/tmp/qwen36_research/needle_gap_2026-04-29/`. |
 | **B17** | `preserve_thinking=true` provenance + §5.7 wording audit (2026-04-29) | **Default kept; wording tightened to remove unsupported claims** | The prior §5.7 wording asserted Qwen3.6 was "RL-trained expecting reasoning to persist across turns" and that `preserve_thinking=true` is "load-bearing for multi-turn agentic correctness". Source audit (Sub-agent J): the Qwen3.6-27B HF model card actually says "**additionally trained** to preserve and leverage thinking traces from historical messages" and "particularly beneficial for agent scenarios" (Qwen3.6-27B-README.md L811, L839; identical wording on Qwen3.6-35B-A3B). The Qwen-Agent reference deployment in the same model card (L869) sets `preserve_thinking=True` for DashScope and vLLM/SGLang. Predecessor Qwen3 (Qwen3-32B model card "Best Practices" → "No Thinking Content in History") explicitly recommended STRIPPING `<think>` from history — Qwen3.6 is a deliberate inversion. **Critical caveat**: there is no published controlled ablation of `true` vs `false`; the only public empirical claim is `badlogic/pi-mono#3325` (single-user anecdote, Qwen3.6-35B-A3B + LM Studio, empty-arg tool calls after 2–3 turns without the flag), and two follow-ups (`badlogic/pi-mono#3479`, `jundot/omlx#900`) report `preserve_thinking=true` necessary but not always sufficient. vLLM is mechanism-only — the `--default-chat-template-kwargs` plumbing was introduced by PR #31343 (commit `dc837bc23`, 2025-12-30) as a generic feature predating Qwen3.6, so the recommendation is Qwen-canonical, not vLLM-canonical. Decision: keep the server default `preserve_thinking=true` (Qwen-recommended), tighten §5.7 to cite the model-card text verbatim and label the failure-mode evidence as a single anecdote. Sub-agent J artifacts at `/tmp/qwen36_research/preserve_thinking_research_2026-04-29/` (eight verbatim-excerpt evidence files). |
 
 What remains: B1 schema-variation corpus and B7 multi-needle RULER. Neither is gated by the patches; both depend on workload-specific fixtures.
@@ -714,7 +691,6 @@ Each is tracked; none urgent.
 ├── README.md                                              # this document
 ├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 10 patches then runpys vLLM
 ├── sitecustomize.py                                       # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
-├── health_probe.sh                                        # §8.4 — host-side deep liveness probe; engine-decoded-a-token check
 ├── monkey_patch_reasoning_field_ingest.py                 # §7.1 — accept reasoning_content on inbound assistant messages
 ├── monkey_patch_qwen3_coder.py                            # §7.2 — parser crash fix on truncated <parameter=
 ├── monkey_patch_hybrid_kv_allocator.py                    # §7.3 — hybrid-KV boot-log under-reporting fix (PR #40384 backport)
@@ -725,13 +701,16 @@ Each is tracked; none urgent.
 ├── monkey_patch_request_memory_snapshot.py                # §7.8 — startup snapshot check stops double-counting vLLM's own init footprint
 ├── monkey_patch_tool_role_media_preserve.py               # §7.9 — preserve list-shaped tool-role content with media so the chat template renders <|vision_start|><|image_pad|><|vision_end|> inside <tool_response>
 ├── monkey_patch_mm_cache_validator_eviction.py            # §7.10 — clear renderer sender mm-cache on validator throw; closes #31404 retry-poison HTTP-500
-├── host_logs/
-│   ├── qwen36_warning_forwarder.py                        # §8.5 — host-side; tails docker logs, parses §7.5 warnings into JSONL
-│   ├── qwen36-warning-forwarder.service                   # §8.5 — systemd unit (Type=simple, After=docker.service)
-│   └── install.sh                                         # §8.5 — idempotent installer for script + unit + dirs
+├── host_ops/                                              # §8.4 — host-side ops bundle; install via `sudo bash host_ops/install.sh`
+│   ├── qwen36_deep_probe.sh                               # §8.4.1 — wedge-recovery probe (one-shot; engine-decoded-a-token check)
+│   ├── qwen36-deep-probe.service                          # §8.4.1 — systemd unit (Type=oneshot; retry+`docker restart` inline in ExecStart)
+│   ├── qwen36-deep-probe.timer                            # §8.4.1 — fires the .service every 60s (OnUnitActiveSec=60s)
+│   ├── qwen36_warning_forwarder.py                        # §8.4.2 — long-running daemon; tails docker logs, parses §7.5 WARNINGs into JSONL
+│   ├── qwen36-warning-forwarder.service                   # §8.4.2 — systemd unit (Type=simple, restart-on-failure)
+│   └── install.sh                                         # §8.4 — idempotent installer for both bundles
 └── tests/
     ├── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
-    └── test_warning_forwarder.py                          # §8.5 forwarder unit tests (no docker; pure Python)
+    └── test_warning_forwarder.py                          # §8.4.2 forwarder unit tests (no docker; pure Python)
 ```
 
 Twelve Python files (10 patches + launcher + sitecustomize) plus the host-side probe shell script, the host-side warning forwarder bundle (`host_logs/`), and two test files.

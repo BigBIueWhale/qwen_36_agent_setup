@@ -12,7 +12,7 @@ call at ``monkey_patch_tool_call_in_think_detector.py:83-88``). The
 warning lands in vLLM's stderr, which docker captures via the
 ``json-file`` log driver — but nothing extracts it. Operators have no
 way to query "how many tool-call-in-reasoning events fired in the last
-hour" or alert on a sudden rate spike. README §8.4 has long mentioned
+hour" or alert on a sudden rate spike. README §8.4.2 has long mentioned
 the gap; this script closes it.
 
 What it does

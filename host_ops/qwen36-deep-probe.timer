@@ -1,0 +1,18 @@
+[Unit]
+# Fires qwen36-deep-probe.service every 60 seconds. The first fire is 60s
+# after boot (delays through the qwen36 container's CUDA-init), and
+# subsequent fires are spaced 60s apart, regardless of how long the
+# previous probe took (OnUnitActiveSec=60s). Persistent=true means a
+# missed window after a host reboot is replayed once at boot.
+Description=Qwen3.6 wedge-recovery deep-liveness probe (60s timer)
+Documentation=file:///etc/systemd/system/qwen36-deep-probe.service
+Requires=qwen36-deep-probe.service
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+Unit=qwen36-deep-probe.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

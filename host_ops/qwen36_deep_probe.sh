@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # qwen36 deep liveness probe — exits 0 if the engine actually decoded a
-# token, 1 otherwise. NOT bind-mounted into the container; the cron /
-# systemd unit calling this lives on the host so `docker restart` works.
-#
-# Usage example (host crontab, 60s cadence with 2-failure restart):
-#   * * * * * /usr/local/bin/qwen36_deep_probe.sh \
-#     || (sleep 5 && /usr/local/bin/qwen36_deep_probe.sh) \
-#     || docker restart qwen36
+# token, 1 otherwise. Lives on the host (NOT bind-mounted into the
+# container) so the systemd unit calling this can `docker restart`
+# the container if the engine wedges. Driven by
+# `host_ops/qwen36-deep-probe.{service,timer}` (installed via
+# `host_ops/install.sh`); the unit's ExecStart wraps this script with the
+# retry-and-restart fallback.
 set -Eeuo pipefail
 
 URL="${QWEN36_PROBE_URL:-http://127.0.0.1:8001/v1/chat/completions}"
@@ -15,13 +14,17 @@ MODEL="${QWEN36_PROBE_MODEL:-Qwen3.6-27B-AWQ}"
 
 # enable_thinking:false avoids §5.6 thinking-mode loop pathology on probes.
 # temperature=0 + max_tokens=1 makes the response deterministic and short.
+# Wire shape: `chat_template_kwargs` MUST be at the TOP LEVEL of the JSON
+# body — vLLM's request schema has `extra="allow"`, so an `extra_body`-
+# nested wrapper is silently dropped over raw HTTP (the OpenAI Python SDK
+# unwraps `extra_body` client-side, but raw curl does not — see §5.7 / §11 B13).
 PAYLOAD=$(cat <<EOF
 {
   "model": "${MODEL}",
   "messages": [{"role":"user","content":"ping"}],
   "max_tokens": 1,
   "temperature": 0,
-  "extra_body": {"chat_template_kwargs": {"enable_thinking": false}}
+  "chat_template_kwargs": {"enable_thinking": false}
 }
 EOF
 )
