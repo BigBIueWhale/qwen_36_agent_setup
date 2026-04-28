@@ -138,6 +138,32 @@ def _expected_tag_from(patch_module: ModuleType) -> str:
     return expected_tag
 
 
+_MAX_PATCH_CHAIN_DEPTH: int = 16
+
+
+def _find_in_patch_chain(fn: object, expected_tag: str) -> object | None:
+    """Walk the ``__wrapped_original__`` chain looking for a wrapper
+    whose ``__qwen36_patch__`` tag equals ``expected_tag``. Returns the
+    matching wrapper or None.
+
+    Two of our patches (§7.1 reasoning_ingest and §7.9 tool_role_media)
+    target the same vLLM symbol (``_parse_chat_message_content``); whichever
+    installs LAST owns the outermost attribute, so a tag-only check on
+    the outermost would falsely refuse the inner patch. Walk the chain
+    instead — each correctly-installed patch stamps its own wrapper with
+    a distinct tag, and the chain composition order does not affect
+    semantic correctness because each guards a disjoint role branch.
+    """
+    walker = fn
+    for _ in range(_MAX_PATCH_CHAIN_DEPTH):
+        if walker is None:
+            return None
+        if getattr(walker, "__qwen36_patch__", None) == expected_tag:
+            return walker
+        walker = getattr(walker, "__wrapped_original__", None)
+    return None
+
+
 def _verify_target_carries_tag(
     target_obj: object,
     attr_name: str,
@@ -149,7 +175,10 @@ def _verify_target_carries_tag(
     """Verify a class/module attribute bears the patch tag via both
     ``getattr`` and ``inspect.getattr_static`` — disagreement means a
     metaclass shim is shadowing the install. Also verifies
-    ``__wrapped_original__`` is present (forging defense)."""
+    ``__wrapped_original__`` is present (forging defense). The expected
+    tag may live on the OUTERMOST wrapper or on any inner wrapper of
+    the ``__wrapped_original__`` chain (see :func:`_find_in_patch_chain`
+    for why)."""
     installed_dynamic = getattr(target_obj, attr_name, None)
     if installed_dynamic is None:
         raise PatchVerificationError(
@@ -164,28 +193,38 @@ def _verify_target_carries_tag(
             f"{target_description}.{attr_name}: {exc!r}."
         ) from exc
 
-    dynamic_tag = getattr(installed_dynamic, "__qwen36_patch__", None)
-    static_tag = getattr(installed_static, "__qwen36_patch__", None)
-    if dynamic_tag != expected_tag:
+    if installed_dynamic is not installed_static:
         raise PatchVerificationError(
             f"[{_LAUNCHER_TAG}] {patch_module_name!r}: "
-            f"{target_description}.{attr_name} carries tag {dynamic_tag!r}, "
-            f"expected {expected_tag!r} (clobbered by sibling patch or "
-            f"vLLM import side-effect)."
+            f"dynamic and static lookups of {target_description}.{attr_name} "
+            f"disagree (metaclass shim shadowing install)."
         )
-    if static_tag != expected_tag:
+
+    dynamic_match = _find_in_patch_chain(installed_dynamic, expected_tag)
+    static_match = _find_in_patch_chain(installed_static, expected_tag)
+    if dynamic_match is None:
+        outermost_tag = getattr(installed_dynamic, "__qwen36_patch__", None)
         raise PatchVerificationError(
             f"[{_LAUNCHER_TAG}] {patch_module_name!r}: "
-            f"inspect.getattr_static sees {static_tag!r} on "
-            f"{target_description}.{attr_name}, expected {expected_tag!r} "
+            f"{target_description}.{attr_name} chain does not include "
+            f"expected tag {expected_tag!r} (outermost tag is "
+            f"{outermost_tag!r}; either the patch failed to install or "
+            f"a sibling clobbered the chain)."
+        )
+    if static_match is not dynamic_match:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] {patch_module_name!r}: "
+            f"static-chain match for {expected_tag!r} on "
+            f"{target_description}.{attr_name} disagrees with dynamic "
             f"(metaclass shim shadowing install)."
         )
 
-    if getattr(installed_dynamic, "__wrapped_original__", None) is None:
+    if getattr(dynamic_match, "__wrapped_original__", None) is None:
         raise PatchVerificationError(
             f"[{_LAUNCHER_TAG}] {patch_module_name!r}: "
-            f"{target_description}.{attr_name} bears tag but lacks "
-            f"__wrapped_original__ — forged tag or patch rewritten."
+            f"{target_description}.{attr_name} wrapper carrying "
+            f"{expected_tag!r} lacks __wrapped_original__ — forged tag "
+            f"or patch rewritten."
         )
 
 
@@ -629,21 +668,26 @@ def _verify_request_memory_snapshot(patch_module: ModuleType) -> None:
     )
 
 
-def _verify_tool_media_autosplit(patch_module: ModuleType) -> None:
-    """Verify ``monkey_patch_tool_media_autosplit`` wrapped both
-    ``parse_chat_messages`` and ``parse_chat_messages_async`` on
-    ``vllm.entrypoints.chat_utils``.
+def _verify_tool_role_media_preserve(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_tool_role_media_preserve`` wrapped
+    ``vllm.entrypoints.chat_utils._parse_chat_message_content``.
 
-    Tag-only check at the launcher: the patch's own Phases 4 and 6
-    carry behavioural verification — five synthetic message-list
-    probes covering text+media split, media-only tool, text-only
-    tool (identity passthrough), string-content tool (idempotency
-    under double-application), and non-tool message with media
-    (out-of-remit no-op), plus an idempotency probe asserting that
-    re-applying the transform on its own output is identity. Re-doing
-    that here would duplicate the patch's load-bearing verification —
-    the launcher need only confirm the install propagated to BOTH
-    targets via ``getattr`` and ``inspect.getattr_static``.
+    Note: patch 1 (``monkey_patch_reasoning_field_ingest``) ALSO targets
+    this same function (different role branch — assistant vs tool), so
+    the wrapper chain may have multiple patches stacked at this address.
+    We only verify the OUTERMOST wrapper carries our tag; the previous
+    patch's tag will be on ``__wrapped_original__``. The
+    install-order-determined identity of the outermost wrapper is what
+    request handlers actually call into; that is what must carry the
+    tag this verifier checks for.
+
+    Tag-only check at the launcher: the patch's own Phase 4 carries
+    behavioural verification — five synthetic content probes covering
+    text+image preserve, image-only preserve, text-only no-op,
+    string-content no-op, and unknown-type filtering — and Phase 6
+    runs ``getattr`` + ``inspect.getattr_static`` agreement at the
+    install site. Re-doing that here would duplicate the patch's
+    load-bearing verification.
     """
     expected_tag = _expected_tag_from(patch_module)
     try:
@@ -653,14 +697,13 @@ def _verify_tool_media_autosplit(patch_module: ModuleType) -> None:
             f"[{_LAUNCHER_TAG}] cannot import vllm.entrypoints.chat_utils "
             f"for verification: {exc!r}"
         ) from exc
-    for funnel_name in ("parse_chat_messages", "parse_chat_messages_async"):
-        _verify_target_carries_tag(
-            _chat_utils_mod,
-            funnel_name,
-            expected_tag,
-            patch_module_name=patch_module.__name__,
-            target_description="vllm.entrypoints.chat_utils",
-        )
+    _verify_target_carries_tag(
+        _chat_utils_mod,
+        "_parse_chat_message_content",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="vllm.entrypoints.chat_utils",
+    )
 
 
 # --------------------------------------------------------------------
@@ -689,13 +732,15 @@ _PATCH_MODULES: tuple[str, ...] = (
     # _parse_xml_function_call method on the same class — but ordering
     # is defensive: a future regression where one clobbers the other
     # would be visible to the launcher's tag verifier).
-    # tool_media_autosplit wraps the OUTER funnel
-    # (parse_chat_messages / parse_chat_messages_async) while
-    # reasoning_field_ingest wraps the INNER per-message function
-    # (_parse_chat_message_content) — they compose cleanly because the
-    # outer wrapper splits the messages list first, then the original
-    # parse_chat_messages calls the inner wrapper per (already-split)
-    # message.
+    # tool_role_media_preserve wraps the SAME inner per-message
+    # _parse_chat_message_content function as reasoning_field_ingest,
+    # but on a DISJOINT role branch (role=="tool" vs role=="assistant").
+    # Composition is order-independent: each wrapper handles only its
+    # own role and delegates to whatever it captured at install time
+    # (the previous wrapper or the original). The __wrapped_original__
+    # chain walk in tool_role_media_preserve's Phase 1 lets the
+    # landmark check operate on the original body regardless of how
+    # many patches have stacked at this address.
     "monkey_patch_qwen3_coder",
     "monkey_patch_hybrid_kv_allocator",
     "monkey_patch_reasoning_field_egress",
@@ -704,7 +749,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_default_sampling_params",
     "monkey_patch_qwen3_coder_grammar",
     "monkey_patch_request_memory_snapshot",
-    "monkey_patch_tool_media_autosplit",
+    "monkey_patch_tool_role_media_preserve",
 )
 
 _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
@@ -716,7 +761,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_default_sampling_params": _verify_default_sampling_params,
     "monkey_patch_qwen3_coder_grammar": _verify_qwen3_coder_grammar,
     "monkey_patch_request_memory_snapshot": _verify_request_memory_snapshot,
-    "monkey_patch_tool_media_autosplit": _verify_tool_media_autosplit,
+    "monkey_patch_tool_role_media_preserve": _verify_tool_role_media_preserve,
 }
 
 

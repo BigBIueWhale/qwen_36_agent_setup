@@ -842,7 +842,7 @@ def section_6_launcher() -> None:
         "monkey_patch_default_sampling_params",
         "monkey_patch_qwen3_coder_grammar",
         "monkey_patch_request_memory_snapshot",
-        "monkey_patch_tool_media_autosplit",
+        "monkey_patch_tool_role_media_preserve",
     )
     for name in expected_modules:
         run.expect_in(
@@ -973,7 +973,7 @@ def section_9_no_silent_failures() -> None:
         "monkey_patch_tool_call_in_think_detector.py": 0,
         "monkey_patch_default_sampling_params.py": 0,
         "monkey_patch_qwen3_coder_grammar.py": 0,
-        "monkey_patch_tool_media_autosplit.py": 0,
+        "monkey_patch_tool_role_media_preserve.py": 0,
     }
     for path in patch_files:
         try:
