@@ -1068,9 +1068,9 @@ def section_10_sitecustomize_and_readme() -> None:
     readme_src = readme_path.read_text()
 
     # README §8.2 must contain the sitecustomize bind-mount and the
-    # --host 127.0.0.1 flag in the docker run block. Find the docker
-    # run command (between ```bash ... ```), then check it contains
-    # both strings.
+    # network-namespace boundary that keeps EngineCore's ZMQ IPC ports
+    # off the host's interfaces. Find the docker run command (between
+    # ```bash ... ```), then check it contains the expected flags.
     docker_run_re = re.compile(
         r"```bash\s*\n(docker run.*?)```", re.DOTALL
     )
@@ -1087,14 +1087,28 @@ def section_10_sitecustomize_and_readme() -> None:
             "sitecustomize.py:/opt/patches/sitecustomize.py:ro",
             docker_run,
         )
+        # 2026-04-28: switched from `--network host` to bridge networking
+        # with an explicit host-loopback publish. With --network host, the
+        # EngineCore subprocess's ZMQ IPC port (and any other internal RPC
+        # vLLM opens) binds to the host's all-interfaces, which on a
+        # publicly-routable machine = the public IP. Bridge networking
+        # gives the container its own network namespace; only the explicit
+        # publish crosses to the host, and only on 127.0.0.1.
         run.expect_in(
-            "README §8.2 docker run includes --host 127.0.0.1",
-            "--host 127.0.0.1",
+            "README §8.2 docker run publishes only on host loopback",
+            "-p 127.0.0.1:8001:8001",
             docker_run,
         )
-        # The §8.2 command must NOT bind to 0.0.0.0 anywhere.
         run.expect_not_in(
-            "README §8.2 docker run does NOT bind to 0.0.0.0",
+            "README §8.2 docker run does NOT use --network host",
+            "--network host",
+            docker_run,
+        )
+        # The vLLM CLI must bind on 0.0.0.0 *inside the container's*
+        # network namespace so the publish DNAT can reach it. This is the
+        # container's own private interface, not a host interface.
+        run.expect_in(
+            "README §8.2 docker run binds vLLM CLI to 0.0.0.0 INSIDE the container",
             "--host 0.0.0.0",
             docker_run,
         )
