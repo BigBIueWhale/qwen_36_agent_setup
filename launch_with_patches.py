@@ -537,11 +537,11 @@ def _verify_reasoning_field_ingest(patch_module: ModuleType) -> None:
 
 
 def _verify_tool_call_in_think_detector(patch_module: ModuleType) -> None:
-    """Verify ``monkey_patch_tool_call_in_think_detector`` wrapped the
-    non-streaming ``extract_reasoning`` method on ``Qwen3ReasoningParser``.
-    Streaming is intentionally unwrapped (the metric is a model-side
-    property, not per-modality) — only ``extract_reasoning`` carries
-    the tag.
+    """Verify ``monkey_patch_tool_call_in_think_detector`` wrapped BOTH
+    ``extract_reasoning`` (non-streaming) AND
+    ``extract_reasoning_streaming`` on ``Qwen3ReasoningParser``. Both
+    surfaces emit byte-identical WARNINGs so a single forwarder regex
+    covers both code paths.
     """
     expected_tag = _expected_tag_from(patch_module)
     try:
@@ -555,6 +555,13 @@ def _verify_tool_call_in_think_detector(patch_module: ModuleType) -> None:
     _verify_target_carries_tag(
         Qwen3ReasoningParser,
         "extract_reasoning",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="Qwen3ReasoningParser",
+    )
+    _verify_target_carries_tag(
+        Qwen3ReasoningParser,
+        "extract_reasoning_streaming",
         expected_tag,
         patch_module_name=patch_module.__name__,
         target_description="Qwen3ReasoningParser",

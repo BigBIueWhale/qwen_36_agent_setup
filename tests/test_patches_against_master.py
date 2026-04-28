@@ -682,12 +682,15 @@ def section_4_ingest() -> None:
 
 
 def section_5_detector() -> None:
-    """Patch 5 — tool_call_in_think_detector. Wraps non-streaming
-    extract_reasoning only; streaming intentionally not wrapped (model-
-    side rate is not per-modality).
+    """Patch 5 — tool_call_in_think_detector. Wraps BOTH
+    ``extract_reasoning`` (non-streaming) AND ``extract_reasoning_streaming``
+    so the WARNING fires regardless of delivery modality. Same byte-
+    identical format string from both wrappers (one log forwarder regex
+    covers both code paths).
     """
     run.section("5. monkey_patch_tool_call_in_think_detector.py")
     patch_path = PATCH_DIR / "monkey_patch_tool_call_in_think_detector.py"
+    patch_src = patch_path.read_text()
     parser_src = (VLLM_DIR / "vllm/reasoning/qwen3_reasoning_parser.py").read_text()
     base_src = (VLLM_DIR / "vllm/reasoning/basic_parsers.py").read_text()
 
@@ -706,29 +709,82 @@ def section_5_detector() -> None:
     # Patch tag.
     expected_tag = patch_constant(patch_path, "_PATCH_TAG")
     run.expect_eq(
-        "_PATCH_TAG is the v1 detector tag",
+        "_PATCH_TAG is the v2 detector tag (wraps both surfaces)",
         expected_tag,
-        "qwen36-agent-setup-tool-call-in-think-detector-v1",
+        "qwen36-agent-setup-tool-call-in-think-detector-v2",
     )
 
-    # Non-streaming landmark substring is still our anchor since we're
-    # wrapping extract_reasoning non-streaming.
-    landmark = patch_constant(patch_path, "_NONSTREAMING_LANDMARK")
+    # Non-streaming landmark substring still anchors extract_reasoning.
+    ns_landmark = patch_constant(patch_path, "_NONSTREAMING_LANDMARK")
     run.expect_in(
         "non-streaming landmark present in master",
-        landmark,
+        ns_landmark,
+        parser_src,
+    )
+
+    # Streaming landmark substring anchors extract_reasoning_streaming.
+    s_landmark = patch_constant(patch_path, "_STREAMING_LANDMARK")
+    run.expect_in(
+        "streaming landmark present in master",
+        s_landmark,
         parser_src,
     )
 
     # extract_reasoning signature unchanged at the pin.
-    sig = vllm_function_signature(
+    ns_sig = vllm_function_signature(
         "vllm/reasoning/qwen3_reasoning_parser.py",
         "Qwen3ReasoningParser.extract_reasoning",
     )
     run.expect_eq(
         "extract_reasoning signature",
-        sig,
+        ns_sig,
         ["self", "model_output", "request"],
+    )
+
+    # extract_reasoning_streaming signature unchanged at the pin.
+    s_sig = vllm_function_signature(
+        "vllm/reasoning/qwen3_reasoning_parser.py",
+        "Qwen3ReasoningParser.extract_reasoning_streaming",
+    )
+    run.expect_eq(
+        "extract_reasoning_streaming signature",
+        s_sig,
+        [
+            "self",
+            "previous_text",
+            "current_text",
+            "delta_text",
+            "previous_token_ids",
+            "current_token_ids",
+            "delta_token_ids",
+        ],
+    )
+
+    # Both wrappers must use the same shared _WARNING_FORMAT constant —
+    # this is what the host_ops/qwen36_warning_forwarder.py regex anchors
+    # on. If the two wrappers ever drifted to different format strings,
+    # the forwarder would silently miss one half of events.
+    run.expect_in(
+        "shared _WARNING_FORMAT constant defined",
+        '_WARNING_FORMAT: str = (',
+        patch_src,
+    )
+    # The forwarder anchors on this exact phrase; both wrappers funnel
+    # through _WARNING_FORMAT and must contain it (verified by the
+    # constant being a single source of truth).
+    run.expect_in(
+        "_WARNING_FORMAT contains the forwarder-required prefix",
+        "model_emit_warning kind=tool_call_in_reasoning",
+        patch_src,
+    )
+
+    # Both wrappers must reference _WARNING_FORMAT (proves the byte-
+    # identical-format property is structural, not coincidental).
+    nonstream_uses = patch_src.count("_WARNING_FORMAT,\n")
+    run.expect_eq(
+        "both wrappers funnel through the shared _WARNING_FORMAT constant",
+        nonstream_uses,
+        2,
     )
 
 
