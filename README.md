@@ -22,7 +22,7 @@ This README documents a specific, pinned, reproducible deployment. Every choice 
 | Maximum concurrency at full max-len | **1.13×** at the §8.2 production flags (one full-context request fits with ~13% slack — `monkey_patch_hybrid_kv_allocator.py:335`) |
 | `preserve_thinking` | Set as server-wide default via `--default-chat-template-kwargs '{"preserve_thinking": true}'` |
 | MTP speculative decoding | OFF (head present in the AWQ checkpoint as BF16 but auto-skipped at load; §5.3) |
-| Patches in this repo | 8 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
+| Patches in this repo | 9 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
 
 ---
 
@@ -202,7 +202,18 @@ The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.1 inge
 }
 ```
 
-`splitToolMedia: true` is **also load-bearing**. Qwen-Code commit `414b330` (#3617) added a per-message-split path for tool-result media, but defaults to `false`; with the default, MCP-returned screenshots and `read_file`-emitted images stay packed in the `role: "tool"` content array, where vLLM's `chat_utils.py:1549-1564` reduces tool content to `"\n".join(text_items)` — silently dropping every image. Enable the split on the client OR (recommended) fold the auto-split into a future server-side patch.
+`splitToolMedia: true` on the client is **redundant** with patch §7.9 installed (the auto-split closes the silent image-drop server-side for ALL clients regardless of the per-client flag); enabling it on the client is harmless but no longer load-bearing. Without patch §7.9, qwen-code commit `414b330` (#3617)'s per-message-split path is the only mitigation: with its default `false`, MCP-returned screenshots and `read_file`-emitted images stay packed in the `role: "tool"` content array, where vLLM's `chat_utils.py:1549-1564` reduces tool content to `"\n".join(text_items)` — silently dropping every image.
+
+### 5.9 Chat-template invariants the operator must respect
+
+Six hard invariants from the shipped `chat_template.jinja` and Qwen3.6 model code. Violations either raise at render time (HTTP 500) or silently degrade quality.
+
+1. **System messages cannot contain images.** `chat_template.jinja:9-10` raises `'System message cannot contain images.'`; Qwen3.6 was trained with text-only system prompts.
+2. **System messages cannot contain video.** `chat_template.jinja:20-21` raises analogously.
+3. **Tool messages render text-only.** `chat_template.jinja:33` raises `'Unexpected item type in content.'` on any non-text part. Tool-result media must travel via a follow-up `role: "user"` message — closed automatically by patch §7.9.
+4. **`add_vision_id` defaults to `false`.** The optional `Picture N: ` / `Video N: ` prefix for multi-image grounding (`chat_template.jinja:15-17, 26-28`) is OFF unless the operator sets `add_vision_id: true` via `--default-chat-template-kwargs`. ~5 extra text tokens per image when on; useful only for ordinal-index comparisons.
+5. **Qwen3.6 does NOT support EVS** (efficient video sampling). `vllm/model_executor/models/qwen3_5.py:578` declares `supports_multimodal_pruning = False`; `--video-pruning-rate > 0` raises `NotImplementedError`. Don't set the flag.
+6. **Multimodal cache content-hash dedup** is automatic. vLLM's `encoder_cache` is keyed by `mm_hash` derived from image bytes; agent loops re-sending byte-identical images get free encoder hits. Steady-state encoder cost is one forward per UNIQUE image, not per request.
 
 ---
 
@@ -252,11 +263,19 @@ Qwen3.6 occasionally emits `<tool_call>...</tool_call>` markup inside `<think>..
 
 **Affects us**: yes — it caps the achievable KV pool at gmu=~0.98 minus the engine's init delta, leaving roughly 0.32 GiB of reachable KV unclaimable without patching. **Resolution**: §7.8.
 
+### 6.8 Tool-role media silently dropped at chat_utils ingest [Class A — vLLM internal inconsistency]
+
+`vllm/entrypoints/chat_utils.py:1549-1564`'s `role == "tool"` branch reduces any list-shaped tool message content to `"\n".join(text_items)`. Every non-text content part (`image_url`, `audio_url`, `video_url`, `file`, `input_image`, `image_pil`, `image_embeds`, `audio_embeds`, `input_audio`) is silently discarded before the chat template runs. Compounding the bug: the per-content-part dispatcher upstream of the role-gate registered each media part with the `MultiModalItemTracker` *before* the reducer ran, so the encoder forwards data the rendered prompt never references — silent encoder/template desync, the same class A internal-inconsistency shape as §6.1 (the ingest path's "what counts as reasoning" disagreement with the chat template's view).
+
+**Affects us**: yes — any client that returns tool media (MCP screenshots, `read_file`-emitted images, agent screenshots) is affected. The Qwen Code CLI's `splitToolMedia: true` is a client-side mirror of the server fix and is the only out-of-the-box mitigation absent a server patch; defaults to `false`.
+
+**Resolution**: §7.9. Closes the silent drop server-side for ALL clients regardless of `splitToolMedia` setting.
+
 ---
 
 ## 7. The patches in this repo
 
-Eight monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patches 3 and 8; see §7.S). There is no client-side code in this repo.
+Nine monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patches 3 and 8; see §7.S). There is no client-side code in this repo.
 
 Each patch addresses a specific defect named in §6 (or, for patches 6 and 7, a §5 design requirement) and only that defect. Each strictly validates its target's structure via landmarks, refuses to apply on any landmark mismatch with a typed exception that names the exact landmark that failed, stamps `__qwen36_patch__` on every target, and verifies via both `getattr` and `inspect.getattr_static` that its install took effect. The patch file itself is the source of truth; this section is a contract index.
 
@@ -270,7 +289,8 @@ Each patch addresses a specific defect named in §6 (or, for patches 6 and 7, a 
 | 6 | [`monkey_patch_default_sampling_params.py`](monkey_patch_default_sampling_params.py) | §5.6 — server-side enforcement of Qwen3.6 sampling Best Practices for fields the client did not explicitly send |
 | 7 | [`monkey_patch_qwen3_coder_grammar.py`](monkey_patch_qwen3_coder_grammar.py) | §5.6 / agentic-correctness — server-side xgrammar `structural_tag` constraint on tool emission; flips `supports_required_and_named=False` to close a latent JSON-list-path bug |
 | 8 | [`monkey_patch_request_memory_snapshot.py`](monkey_patch_request_memory_snapshot.py) | §6.7 — make the startup snapshot check stop double-counting vLLM's own init footprint as "external pressure" |
-| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 8 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
+| 9 | [`monkey_patch_tool_media_autosplit.py`](monkey_patch_tool_media_autosplit.py) | §6.8 — split `role: "tool"` content with media into a follow-up `role: "user"` message at ingest; closes silent image-drop for ALL clients regardless of qwen-code `splitToolMedia` setting |
+| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 9 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
 | S | [`sitecustomize.py`](sitecustomize.py) | CPython auto-imports this from `PYTHONPATH=/opt/patches` at every interpreter startup — including the spawned EngineCore subprocess — so patches 3 and 8's targets are live in EngineCore's own `sys.modules` |
 
 ### 7.1 Patch 1 — `monkey_patch_reasoning_field_ingest.py`
@@ -314,21 +334,33 @@ Does NOT fix the `<tool_call>`-in-`<think>` model OOD case (§6.5 / patch 5). Th
 
 Replaces `vllm.v1.worker.utils.request_memory` to fix the §6.7 semantic bug. The original compares `requested_memory = total × gmu` against `init_snapshot.free_memory`; we compare against `init_snapshot.free_memory + INIT_SLACK` instead, where `INIT_SLACK` is a generous bound on vLLM's own post-init CUDA-context footprint (1 GiB by default; tunable via `QWEN36_VLLM_INIT_SLACK_MIB` env var for hosts whose footprint differs). The replacement returns a byte-identical `int` to all downstream consumers (`gpu_worker.py:421-424`'s `available_kv_cache_memory_bytes` math is unchanged); only the gate threshold changes. The original safety intent — fail loud when EXTERNAL processes consume significant GPU memory — is preserved: the patch still raises if external pressure exceeds the slack. Three import-time behavioural probes prove (a) the buggy predicate is still present in the image (forces a re-audit if upstream landed a fix), (b) the patched function returns the expected `ceil(total × gmu)` on the failure-mode probe, (c) a negative-control probe with external pressure > slack still raises. Without this patch, `--gpu-memory-utilization 0.98` is unreachable on this stack — boot fails with `Free memory on device cuda:0 (30.85/31.36 GiB) on startup is less than desired GPU memory utilization (0.98, 30.73 GiB)` even on an exclusive dGPU. **Removal trigger**: vLLM upstream rewrites `request_memory` to either measure pre-init or accept a slack parameter; the buggy `init_snapshot.free_memory < requested_memory` predicate is the landmark — any rewrite changes its shape and forces this patch to refuse.
 
+### 7.9 Patch 9 — `monkey_patch_tool_media_autosplit.py`
+
+Wraps the **outer funnel** `parse_chat_messages` and `parse_chat_messages_async` (`vllm/entrypoints/chat_utils.py:1600,1636`) with a pre-ingest pass that splits any `role: "tool"` message containing media parts into two messages: the original tool message with content reduced to its text-only parts (`tool_call_id` preserved), followed by a synthetic `role: "user"` message carrying ONLY the media parts. No text shim is added — qwen-code's shim is a strict-OpenAI workaround, not a model-quality requirement; Qwen3.6's chat template renders media-only user content cleanly. The wrapped wrapper composes with patch §7.1 (the inner-per-message `_parse_chat_message_content` wrapper) — patch 9 splits the messages list first, then the original `parse_chat_messages` calls patch 1's wrapper per (already-split) message.
+
+The split is idempotent (re-applying the transform on its own output is identity by reference — already-split tool messages are text-only and the synthesized user message has no media parts of an unrendered shape) and preserves the chat-template invariant (§5.9 fact 3) that tool messages are text-only. The `multi_step_tool` reverse-walk at `chat_template.jinja:67-77` correctly identifies the synthetic user message as the last user query because its rendered content (a media marker, not text) does NOT start with `<tool_response>`. The split also restores encoder/template alignment: the `MultiModalItemTracker` registration now flows through the user message that the rendered prompt actually references.
+
+Phase 4 carries five behavioural probes — text+media split, media-only tool, text-only tool (identity passthrough), string-content tool (idempotency under double-application), non-tool message with media (out-of-remit no-op) — plus a reflexive idempotency probe asserting two passes equal one pass by reference. Phase 6 verifies install via `getattr` and `inspect.getattr_static` on both targets.
+
+Closes §6.8 server-side for ALL clients regardless of qwen-code's `splitToolMedia` setting; `splitToolMedia: true` on the client becomes redundant (still harmless — its output already hits the patch's no-op branches).
+
+**Removal trigger**: vLLM upstream rewrites the `role:"tool"` content reducer at `vllm/entrypoints/chat_utils.py:1549-1564` to preserve media (or hoist the media into a follow-up message itself). The buggy `"\n".join(texts) if texts else ""` predicate is the landmark — any reshape changes its body and forces this patch to refuse.
+
 ### 7.L Launcher — `launch_with_patches.py`
 
 Container entrypoint, replacing `["vllm", "serve"]` with `["python", "/opt/patches/launch.py", "serve", ...]`. Imports every registered patch in `_PATCH_MODULES` order, runs the per-patch `_PATCH_VERIFICATION` verifier for each (re-imports the relevant vLLM target FROM SCRATCH and asserts the install took effect), then hands off to vLLM's CLI via `runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__", alter_sys=True)`. Required because `PYTHONSTARTUP` does not fire under non-interactive entrypoints.
 
-Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5, 6, 7, 8 carry tag-only launcher verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications carry the load-bearing functional verification (the egress patch's wire-dump check; the ingest patch's static-lookup check; patch 6's five behavioural cases at Phase 7; patch 7's four behavioural cases at Phase 9 plus a load-bearing `xgr.Grammar.from_structural_tag` round-trip; patch 8's three behavioural probes — original-raises-on-buggy-input, patched-accepts-on-same-input, patched-still-raises-on-external-pressure), so duplicating it here would only double the surface area. Patch 7's launcher verifier additionally asserts `Qwen3CoderToolParser.supports_required_and_named is False`.
+Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5, 6, 7, 8, 9 carry tag-only launcher verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications carry the load-bearing functional verification (the egress patch's wire-dump check; the ingest patch's static-lookup check; patch 6's five behavioural cases at Phase 7; patch 7's four behavioural cases at Phase 9 plus a load-bearing `xgr.Grammar.from_structural_tag` round-trip; patch 8's three behavioural probes — original-raises-on-buggy-input, patched-accepts-on-same-input, patched-still-raises-on-external-pressure; patch 9's five behavioural probes at Phase 4 — text+media, media-only, text-only, string-content, and non-tool message-list cases — plus a reflexive idempotency probe), so duplicating it here would only double the surface area. Patch 7's launcher verifier additionally asserts `Qwen3CoderToolParser.supports_required_and_named is False`.
 
 Three pre-flight checks run BEFORE the per-patch import loop: sitecustomize-present (refuse if Debian's stub got loaded instead of ours), registry drift (refuse if `sitecustomize._PATCH_MODULES != launch_with_patches._PATCH_MODULES`), and a subprocess install probe (`subprocess.run([sys.executable, "-c", PROBE])` to confirm a freshly-spawned interpreter sees patched targets). All three are load-bearing for patch 3 — without them, the spawned EngineCore silently runs unpatched code while the launcher reports success. **Load order** matters: `reasoning_field_egress` (patch 4) must come before any patch that constructs `DeltaMessage` at request time, since the rebuild changes Pydantic's compiled schema.
 
 ### 7.S sitecustomize loader — `sitecustomize.py`
 
-vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the eight patches, **patches 3 and 8** target EngineCore-resident code (`monkey_patch_hybrid_kv_allocator` for the KV-cache reporting path, `monkey_patch_request_memory_snapshot` for the worker's startup `request_memory` check); patches 1, 2, 4, 5, 6, 7 target API-server-resident code and become live in PID 1 directly. Without `sitecustomize`, patches 3 and 8 are silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator for patch 3 is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~37K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~149K tokens). For patch 8 the discriminator is whether the boot ValueError fires at gmu > ~0.984 (unpatched, snapshot-check too strict) or the engine reaches "Application startup complete" (patched).
+vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the nine patches, **patches 3 and 8** target EngineCore-resident code (`monkey_patch_hybrid_kv_allocator` for the KV-cache reporting path, `monkey_patch_request_memory_snapshot` for the worker's startup `request_memory` check); patches 1, 2, 4, 5, 6, 7, 9 target API-server-resident code and become live in PID 1 directly (chat_utils' `parse_chat_messages` runs in the request handler, never in EngineCore). Without `sitecustomize`, patches 3 and 8 are silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator for patch 3 is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~37K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~149K tokens). For patch 8 the discriminator is whether the boot ValueError fires at gmu > ~0.984 (unpatched, snapshot-check too strict) or the engine reaches "Application startup complete" (patched).
 
 CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interpreter startup, including spawned children. With `PYTHONPATH=/opt/patches`, `site.py` finds our file, which imports each patch in launcher order. Each patch's strict landmark check runs in EngineCore too; any refusal aborts startup loudly. The same flow runs in PID 1 — sitecustomize installs the patches, `launch.py` then hits cache via `importlib.import_module(...)`. Each patch's module-level code fires once.
 
-**Load-bearing for**: patches 3 and 8. **Defense-in-depth for**: patches 1, 2, 4, 5, 6, 7. **Removal trigger**: when both patches 3 and 8 are removed; recommendation is to keep for defense-in-depth.
+**Load-bearing for**: patches 3 and 8. **Defense-in-depth for**: patches 1, 2, 4, 5, 6, 7, 9. **Removal trigger**: when both patches 3 and 8 are removed; recommendation is to keep for defense-in-depth.
 
 ---
 
@@ -338,7 +370,7 @@ End-to-end production sequence. Follow §8.1 → §8.5 in order from a fresh clo
 
 ### 8.1 Pull the Docker image (one-time)
 
-**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the eight patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
+**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the nine patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
 
 This is deliberate. Three properties fall out of it:
 
@@ -379,6 +411,7 @@ docker run -d --name qwen36 --gpus all \
   -v "$PWD/monkey_patch_default_sampling_params.py:/opt/patches/monkey_patch_default_sampling_params.py:ro" \
   -v "$PWD/monkey_patch_qwen3_coder_grammar.py:/opt/patches/monkey_patch_qwen3_coder_grammar.py:ro" \
   -v "$PWD/monkey_patch_request_memory_snapshot.py:/opt/patches/monkey_patch_request_memory_snapshot.py:ro" \
+  -v "$PWD/monkey_patch_tool_media_autosplit.py:/opt/patches/monkey_patch_tool_media_autosplit.py:ro" \
   -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
   -e PYTHONPATH=/opt/patches \
@@ -427,11 +460,11 @@ curl -fs http://127.0.0.1:8001/v1/models | jq -e \
 # Step 3: confirm /metrics responds (Prometheus scrape target).
 curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics  # expect 200
 
-# Step 4: confirm all 8 distinct patch tags applied. Each patch loads in
+# Step 4: confirm all 9 distinct patch tags applied. Each patch loads in
 # three processes (PID 1 launcher, pre-flight install probe, EngineCore
 # spawn child) and emits one applied: line per loading, so the un-deduped
-# line count is ~24; dedupe to count distinct tags.
-docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 8
+# line count is ~27; dedupe to count distinct tags.
+docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 9
 ```
 
 ```bash
@@ -505,7 +538,7 @@ systemd-timer equivalent (substitute for the cron line if your host uses systemd
 Sign off all of these before declaring the deployment ready:
 
 - [ ] `docker inspect -f '{{.State.Health.Status}}' qwen36` reports `healthy`.
-- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **8** (the eight distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~24**.
+- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **9** (the nine distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~27**.
 - [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **131072**.
 - [ ] `curl -fs -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics` returns **200**.
 - [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0**.
@@ -572,7 +605,7 @@ Re-evaluate the pinned versions when:
 11. **vLLM rewrites `request_memory()` to either measure pre-init or accept a slack parameter** (the buggy `init_snapshot.free_memory < requested_memory` predicate is the landmark) — remove patch 8.
 12. **vLLM ships workload-aware CUDA-graph capture-size defaults** — drop the `-cc '{"cudagraph_capture_sizes":[...]}'` pin from §8.2.
 13. **vLLM issue #38182 (MTP + prefix cache) closes** — reconsider enabling MTP.
-14. **vLLM auto-splits tool-role media** (image/audio/video parts in `role: "tool"` content arrays into a follow-up user message instead of the current silent flatten-to-text-and-drop at `chat_utils.py:1549-1564`) — clients no longer need `splitToolMedia: true` (§5.8). This is also a candidate for an additional server-side patch in this repo if the upstream fix is slow to land.
+14. **vLLM upstream rewrites the `role:"tool"` content reducer at `vllm/entrypoints/chat_utils.py:1549-1564`** to preserve media (the buggy `"\n".join(texts) if texts else ""` predicate is the landmark) — remove patch 9.
 
 Each is tracked; none urgent.
 
@@ -583,7 +616,7 @@ Each is tracked; none urgent.
 ```
 .
 ├── README.md                                              # this document
-├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 8 patches then runpys vLLM
+├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 9 patches then runpys vLLM
 ├── sitecustomize.py                                       # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
 ├── health_probe.sh                                        # §8.4 — host-side deep liveness probe; engine-decoded-a-token check
 ├── monkey_patch_reasoning_field_ingest.py                 # §7.1 — accept reasoning_content on inbound assistant messages
@@ -594,8 +627,9 @@ Each is tracked; none urgent.
 ├── monkey_patch_default_sampling_params.py                # §7.6 — server-side Qwen3.6 sampling defaults for unset fields
 ├── monkey_patch_qwen3_coder_grammar.py                    # §7.7 — xgrammar structural_tag on tool emission; supports_required_and_named=False
 ├── monkey_patch_request_memory_snapshot.py                # §7.8 — startup snapshot check stops double-counting vLLM's own init footprint
+├── monkey_patch_tool_media_autosplit.py                   # §7.9 — split role:"tool" content with media into a follow-up role:"user" message
 └── tests/
     └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
 ```
 
-Ten Python files (8 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.
+Eleven Python files (9 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.

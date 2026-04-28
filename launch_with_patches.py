@@ -629,6 +629,40 @@ def _verify_request_memory_snapshot(patch_module: ModuleType) -> None:
     )
 
 
+def _verify_tool_media_autosplit(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_tool_media_autosplit`` wrapped both
+    ``parse_chat_messages`` and ``parse_chat_messages_async`` on
+    ``vllm.entrypoints.chat_utils``.
+
+    Tag-only check at the launcher: the patch's own Phases 4 and 6
+    carry behavioural verification — five synthetic message-list
+    probes covering text+media split, media-only tool, text-only
+    tool (identity passthrough), string-content tool (idempotency
+    under double-application), and non-tool message with media
+    (out-of-remit no-op), plus an idempotency probe asserting that
+    re-applying the transform on its own output is identity. Re-doing
+    that here would duplicate the patch's load-bearing verification —
+    the launcher need only confirm the install propagated to BOTH
+    targets via ``getattr`` and ``inspect.getattr_static``.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.entrypoints import chat_utils as _chat_utils_mod
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import vllm.entrypoints.chat_utils "
+            f"for verification: {exc!r}"
+        ) from exc
+    for funnel_name in ("parse_chat_messages", "parse_chat_messages_async"):
+        _verify_target_carries_tag(
+            _chat_utils_mod,
+            funnel_name,
+            expected_tag,
+            patch_module_name=patch_module.__name__,
+            target_description="vllm.entrypoints.chat_utils",
+        )
+
+
 # --------------------------------------------------------------------
 # Registry. Order matters — see module docstring.
 # --------------------------------------------------------------------
@@ -655,6 +689,13 @@ _PATCH_MODULES: tuple[str, ...] = (
     # _parse_xml_function_call method on the same class — but ordering
     # is defensive: a future regression where one clobbers the other
     # would be visible to the launcher's tag verifier).
+    # tool_media_autosplit wraps the OUTER funnel
+    # (parse_chat_messages / parse_chat_messages_async) while
+    # reasoning_field_ingest wraps the INNER per-message function
+    # (_parse_chat_message_content) — they compose cleanly because the
+    # outer wrapper splits the messages list first, then the original
+    # parse_chat_messages calls the inner wrapper per (already-split)
+    # message.
     "monkey_patch_qwen3_coder",
     "monkey_patch_hybrid_kv_allocator",
     "monkey_patch_reasoning_field_egress",
@@ -663,6 +704,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_default_sampling_params",
     "monkey_patch_qwen3_coder_grammar",
     "monkey_patch_request_memory_snapshot",
+    "monkey_patch_tool_media_autosplit",
 )
 
 _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
@@ -674,6 +716,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_default_sampling_params": _verify_default_sampling_params,
     "monkey_patch_qwen3_coder_grammar": _verify_qwen3_coder_grammar,
     "monkey_patch_request_memory_snapshot": _verify_request_memory_snapshot,
+    "monkey_patch_tool_media_autosplit": _verify_tool_media_autosplit,
 }
 
 

@@ -53,6 +53,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_default_sampling_params",
     "monkey_patch_qwen3_coder_grammar",
     "monkey_patch_request_memory_snapshot",
+    "monkey_patch_tool_media_autosplit",
 )
 
 
