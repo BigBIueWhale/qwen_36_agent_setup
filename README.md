@@ -183,8 +183,9 @@ The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.1 inge
 - **Per-image vision-token cap**: `--mm-processor-kwargs '{"max_pixels": 4194304}'` (§8.2) bounds the largest admissible image at 4 megapixels (~2048×2048), which Qwen3-VL tokenizes into at most 4,096 vision tokens (`max_pixels / (patch_size × merge_size)² / merge_size² = max_pixels / 1024`). Without this cap, the default 16,777,216-pixel ceiling lets a single image consume 16,384 KV-pool slots and produces an unbounded `embed_multimodal` activation peak that would OOM `_execute_mm_encoder` unrecoverably with `--skip-mm-profiling` enabled. 4 MP covers screenshots and document images cleanly; photos at 4K resolution are downscaled at preprocessing.
 - **Per-request transient activations** are small (+2–10 MiB measured for 896×896 to 1792×1792 images); absorbed by safety headroom.
 - **Image and video tokens occupy the KV pool**: ~256 tokens for 512×512, ~787 for 896×896, ~3,136 for 1792×1792, up to **4,096 per image at the 4-MP cap above**. Videos scale dramatically — short clips ~750–1,500 tokens; medium clips ~10,000–20,000; long clips can exceed 50,000. Bound video size with `--mm-processor-kwargs '{"video": {"max_frames": 64, "fps": 1}}'` if accepting untrusted clips.
+- **Per-request budget formula** at the 4-MP cap: a request carrying `I` images can hold up to `131,072 − I × 4,096 − ~50 (framing)` tokens of text + system + completion. Reject path: vLLM raises HTTP 400 `"Input length (X) exceeds model's maximum context length (131072)."` at ingest if the total exceeds `--max-model-len`. Engine state intact on rejection.
 
-`--limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'` is **load-bearing**: omitting the flag defaults to 999 per modality, which **crashes the boot** on this nightly + SM 12.0 (post-profiling TensorRT-LLM `throwRuntimeError`). Safe range is `image ∈ {0, 1, 2, 3}`. Audio stays 0: Qwen3.6 is text+vision only.
+`--limit-mm-per-prompt '{"image": 20, "video": 1, "audio": 0}'` is set generously. The flag is **load-bearing for boot** (omitting it defaults to 999 per modality, which crashes the boot on this nightly + SM 12.0 — post-profiling TensorRT-LLM `throwRuntimeError`), but otherwise it is **a pure per-request integer ceiling enforced at `chat_utils.py` ingest, not a memory reservation**. Verified: booting at `image:20` produces byte-identical KV reporting to `image:2` (9.13 GiB / 148,960 tokens / 1.13× concurrency); zero impact on boot, on text-only prompts, or on prompts carrying fewer images than the cap. The crash mode that fires at high N is *post*-profiling, which `--skip-mm-profiling` skips — values that would crash without the flag may also boot here, though we have empirically verified only up to 20. Set generously so realistic agentic flows never bump the ceiling; the cost of a high N is paid only when a request actually submits that many images (linear: each extra image at the 4-MP cap = 4,096 KV tokens, plus a ~1-2 s sequential encoder forward beyond N=2 since `encoder_cache_size = max(mnbt, max_tokens_per_mm_item) = 8,192` only fits two 4-MP images concurrently). Audio stays 0: Qwen3.6 is text+vision only.
 
 **Client-side modality gate hazard**. The Qwen Code CLI's `defaultModalities()` regex falls through to a text-only catch-all for `Qwen3.6-27B-AWQ` (and any `qwen-` model name not matching `qwen3-vl-*`, `qwen3.{5,6}-plus`, `qwen-vl-*`, or `coder-model`). With the default, the CLI's converter replaces every `image_url` part with `[Unsupported image file: …]` text **before the request leaves the client** — vision is silently disabled regardless of server config. Override in `settings.json`:
 
@@ -399,7 +400,7 @@ docker run -d --name qwen36 --gpus all \
   --skip-mm-profiling \
   --mm-processor-kwargs '{"max_pixels": 4194304}' \
   --default-chat-template-kwargs '{"preserve_thinking": true}' \
-  --limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}' \
+  --limit-mm-per-prompt '{"image": 20, "video": 1, "audio": 0}' \
   -cc '{"cudagraph_capture_sizes":[1,2,4,8]}'
 ```
 
@@ -517,7 +518,7 @@ Sign off all of these before declaring the deployment ready:
 | Item | Evidence status |
 |---|---|
 | `<tool_call>`-in-`<think>` rate, thinking-mode loop rate under our AWQ config | `<tool_call>`-in-`<think>` community-reported single-digit-percent; patch §7.5 surfaces it as structured WARNING (`model_emit_warning kind=tool_call_in_reasoning`). **Loop rate** measured 17.4% on Qwen3.5-35B-A3B unquantized; not re-measured under AWQ + BF16-linear-attn + BF16-KV. |
-| Image count boot failure threshold (§5.8) | `image ∈ {0, 1, 2, 3}` boots; `image ∈ {10, 100, 999}` (and the default-999 when flag omitted) crash with TensorRT-LLM `throwRuntimeError`. We did not bisect 4–9; treat 3 as the ceiling. |
+| Image count boot ceiling above `image:20` with `--skip-mm-profiling` | Verified to boot at `image:20` (KV reporting byte-identical to `image:2`); higher values with `--skip-mm-profiling` likely also boot since the crash mode is post-profiling and we skip profiling, but not empirically tested past 20. Without `--skip-mm-profiling`, `image:N ≥ 10` crashes boot via TRT-LLM `throwRuntimeError`. |
 
 ---
 
@@ -548,6 +549,7 @@ Sign off all of these before declaring the deployment ready:
 | **B5** | Streaming correctness | **Validated** | `reasoning_content` round-trips across deltas. |
 | **B6** | Concurrency stress | **Validated** | 4 concurrent at 30K input tokens each fully admitted (peak Running=3, peak KV usage 76.6%, no OOM); 4×10K thinking-on shows 1.50× speedup over serial (peak Running=4). |
 | **B7** | Long-context retrieval | **Validated (single-needle to 99%)** | At 131K `--max-model-len`: needle recalled at 125,661 tokens depth 10%, 125,662 depth 90%, and **129,840 (99.06% of max) at depth 50%** — every recall correct. Earlier 32K @ depth 10/50/90% and 60K @ depth 50% also hold. RULER multi-needle / multi-distractor not exercised. |
+| **B8** | Multi-image + long-context stress | **Validated at the boundary** | At §8.2 production flags: 2× 4-MP images + 115,190-token document = **123,421 prompt tokens (94.2% of `--max-model-len`)** admitted, both images correctly described, needle `AC582B0` retrieved at depth ~50%, GPU memory peak +318 MiB transient (returned to baseline post-request), 8 s warm-cache / 51 s cold. At **133,889 prompt tokens** (over by 2,817): clean HTTP 400 `"Input length (133889) exceeds model's maximum context length (131072)."` at ingest, engine state intact, deep liveness probe still passes. `image:N` ceiling enforced at ingest with HTTP 400 `"At most N image(s) may be provided in one prompt."` and is byte-identical between N=2 and N=20 in KV reporting (`image:N` is a per-request integer cap, not a memory reservation; §5.8). |
 
 What remains: B1 schema-variation corpus and B7 multi-needle RULER. Neither is gated by the patches; both depend on workload-specific fixtures.
 
