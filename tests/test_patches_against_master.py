@@ -832,7 +832,7 @@ def section_6_launcher() -> None:
     run.section("6. launch_with_patches.py — registry consistency")
     launcher_src = (PATCH_DIR / "launch_with_patches.py").read_text()
 
-    # Every patch module is registered in _PATCH_MODULES (the 9 surviving).
+    # Every patch module is registered in _PATCH_MODULES (the 10 surviving).
     expected_modules = (
         "monkey_patch_qwen3_coder",
         "monkey_patch_hybrid_kv_allocator",
@@ -843,6 +843,7 @@ def section_6_launcher() -> None:
         "monkey_patch_qwen3_coder_grammar",
         "monkey_patch_request_memory_snapshot",
         "monkey_patch_tool_role_media_preserve",
+        "monkey_patch_mm_cache_validator_eviction",
     )
     for name in expected_modules:
         run.expect_in(
@@ -963,8 +964,17 @@ def section_9_no_silent_failures() -> None:
 
     # (d) Count REAL ``except Exception`` clauses via AST (not regex,
     # which over-counts string mentions inside docstrings). Each patch's
-    # count must equal a hand-audited budget. The 7-patch suite uses
-    # zero ``except Exception`` clauses anywhere — typed exceptions only.
+    # count must equal a hand-audited budget.
+    #
+    # All but one patch use typed exceptions only. ``mm_cache_validator_
+    # eviction`` carries TWO ``except Exception`` clauses: one in the
+    # production wrapper (eviction itself failing must NEVER mask the
+    # original validator exception the caller is waiting on — best-
+    # effort defense-in-depth) and one in Phase 7's test harness helper
+    # that mirrors the production wrapper's structure. Both are
+    # explicitly load-bearing — narrowing them would either crash the
+    # response path on a downstream renderer bug or leave the test
+    # harness less faithful to the wrapper it is verifying.
     expected_counts = {
         "monkey_patch_qwen3_coder.py": 0,
         "monkey_patch_hybrid_kv_allocator.py": 0,
@@ -973,8 +983,22 @@ def section_9_no_silent_failures() -> None:
         "monkey_patch_tool_call_in_think_detector.py": 0,
         "monkey_patch_default_sampling_params.py": 0,
         "monkey_patch_qwen3_coder_grammar.py": 0,
+        "monkey_patch_request_memory_snapshot.py": 0,
         "monkey_patch_tool_role_media_preserve.py": 0,
+        "monkey_patch_mm_cache_validator_eviction.py": 2,
     }
+    # Sanity: every monkey_patch_*.py file in the repo must have an
+    # entry in this dict. Catches the silent-skip bug where adding a
+    # new patch leaves it unchecked because the dict was never updated.
+    discovered_files = {p.name for p in patch_files}
+    expected_files = set(expected_counts)
+    missing = discovered_files - expected_files
+    extra = expected_files - discovered_files
+    run.expect(
+        "every monkey_patch_*.py is listed in the except-Exception budget",
+        not missing and not extra,
+        f"missing from dict: {sorted(missing)!r}; extra in dict: {sorted(extra)!r}",
+    )
     for path in patch_files:
         try:
             tree = ast.parse(path.read_text())
@@ -1350,6 +1374,212 @@ def section_12_qwen3_coder_grammar() -> None:
 
 
 # --------------------------------------------------------------------
+# Section 13: Patch 10 — mm_cache_validator_eviction AST verification.
+# --------------------------------------------------------------------
+
+
+def section_13_mm_cache_validator_eviction() -> None:
+    """Patch 10 — monkey_patch_mm_cache_validator_eviction. Wraps
+    ``OpenAIServingChat.create_chat_completion`` and on
+    ``ValueError`` / ``VLLMValidationError`` calls
+    ``self.renderer.clear_mm_cache_async()`` to restore the sender↔
+    receiver mm-cache mirror invariant. Verify the expected master-side
+    shape: target class exists; create_chat_completion is async with the
+    expected signature; both load-bearing source landmarks
+    (render_chat_request call + get_max_tokens call) are present in
+    the body; get_max_tokens still raises ValueError; BaseRenderer
+    exposes a no-arg async clear_mm_cache_async; OpenAIServing.__init__
+    still assigns self.renderer = engine_client.renderer.
+    """
+    run.section("13. monkey_patch_mm_cache_validator_eviction.py")
+    patch_path = PATCH_DIR / "monkey_patch_mm_cache_validator_eviction.py"
+    serving_src = (
+        VLLM_DIR / "vllm/entrypoints/openai/chat_completion/serving.py"
+    ).read_text()
+    base_serving_src = (
+        VLLM_DIR / "vllm/entrypoints/openai/engine/serving.py"
+    ).read_text()
+    utils_src = (VLLM_DIR / "vllm/entrypoints/utils.py").read_text()
+    renderer_src = (VLLM_DIR / "vllm/renderers/base.py").read_text()
+    exceptions_src = (VLLM_DIR / "vllm/exceptions.py").read_text()
+
+    # Patch tag.
+    expected_tag = patch_constant(patch_path, "_PATCH_TAG")
+    run.expect_eq(
+        "_PATCH_TAG is the v1 mm-cache-validator-eviction tag",
+        expected_tag,
+        "qwen36-agent-setup-mm-cache-validator-eviction-v1",
+    )
+
+    # Target class still defined in the expected module.
+    run.expect_in(
+        "OpenAIServingChat still defined in chat_completion.serving",
+        "class OpenAIServingChat(",
+        serving_src,
+    )
+    run.expect_in(
+        "OpenAIServing still defined in engine.serving",
+        "class OpenAIServing:",
+        base_serving_src,
+    )
+
+    # The wrapped method's signature.
+    expected_params = patch_constant(patch_path, "_EXPECTED_PARAMS")
+    sig = vllm_function_signature(
+        "vllm/entrypoints/openai/chat_completion/serving.py",
+        "OpenAIServingChat.create_chat_completion",
+    )
+    run.expect_eq(
+        "OpenAIServingChat.create_chat_completion signature",
+        sig,
+        list(expected_params),
+    )
+
+    # Verify the method is declared async at master.
+    serving_tree = ast.parse(serving_src)
+    chat_cls_node: ast.ClassDef | None = None
+    for node in ast.walk(serving_tree):
+        if isinstance(node, ast.ClassDef) and node.name == "OpenAIServingChat":
+            chat_cls_node = node
+            break
+    run.expect(
+        "OpenAIServingChat class exists in master at the pinned commit",
+        chat_cls_node is not None,
+        "chat_completion/serving.py does not declare class OpenAIServingChat",
+    )
+    if chat_cls_node is not None:
+        method_node: ast.AsyncFunctionDef | ast.FunctionDef | None = None
+        for sub in chat_cls_node.body:
+            if (
+                isinstance(sub, (ast.AsyncFunctionDef, ast.FunctionDef))
+                and sub.name == "create_chat_completion"
+            ):
+                method_node = sub
+                break
+        run.expect(
+            "OpenAIServingChat declares create_chat_completion",
+            method_node is not None,
+            "method missing in subclass body",
+        )
+        if method_node is not None:
+            run.expect(
+                "create_chat_completion is async (AsyncFunctionDef)",
+                isinstance(method_node, ast.AsyncFunctionDef),
+                f"got {type(method_node).__name__} — wrapper's await-and-"
+                f"catch contract requires async",
+            )
+
+    # Both source landmarks must still be present in the method body.
+    render_landmark = patch_constant(patch_path, "_RENDER_LANDMARK")
+    run.expect_in(
+        "render_chat_request landmark present in create_chat_completion",
+        render_landmark,
+        serving_src,
+    )
+    get_max_tokens_landmark = patch_constant(
+        patch_path, "_GET_MAX_TOKENS_LANDMARK"
+    )
+    run.expect_in(
+        "get_max_tokens landmark present in create_chat_completion",
+        get_max_tokens_landmark,
+        serving_src,
+    )
+
+    # get_max_tokens still raises ValueError (the typed exception we catch).
+    raise_landmark = patch_constant(
+        patch_path, "_GET_MAX_TOKENS_RAISE_LANDMARK"
+    )
+    run.expect_in(
+        "get_max_tokens still raises ValueError at master",
+        raise_landmark,
+        utils_src,
+    )
+
+    # OpenAIServing.__init__ still assigns self.renderer = engine_client.renderer.
+    # This is what makes the wrapper's `self.renderer.clear_mm_cache_async()`
+    # call work. If upstream factors out the attribute, the wrapper's
+    # defensive shape-check fires and the eviction is a no-op (with a
+    # warning) — but at install time we want to refuse instead.
+    run.expect_in(
+        "OpenAIServing.__init__ still assigns self.renderer = engine_client.renderer",
+        "self.renderer = engine_client.renderer",
+        base_serving_src,
+    )
+
+    # BaseRenderer exposes async clear_mm_cache_async with signature (self).
+    run.expect_in(
+        "BaseRenderer still defines clear_mm_cache_async",
+        "async def clear_mm_cache_async(self)",
+        renderer_src,
+    )
+
+    # VLLMValidationError still extends ValueError.
+    run.expect_in(
+        "VLLMValidationError still extends ValueError",
+        "class VLLMValidationError(ValueError)",
+        exceptions_src,
+    )
+
+    # AST-level check: the production wrapper's exception-catch contract.
+    # Catches the drift scenario where someone relaxes the except clause
+    # to `Exception` (which would mask actual bugs and bypass the wrapper's
+    # documented "only validator throws trigger eviction" guarantee). The
+    # Phase 7 behavioural cases test the patch's STRUCTURAL TWIN built by
+    # _build_test_wrapper, not the production wrapper directly — that's
+    # acceptable because the wrappers are documented as identical, but
+    # we verify that identity here at the AST level.
+    patch_tree = ast.parse(patch_path.read_text())
+    wrapper_node: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(patch_tree):
+        if (
+            isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_create_chat_completion_with_mm_cache_eviction"
+        ):
+            wrapper_node = node
+            break
+    run.expect(
+        "patch defines async _create_chat_completion_with_mm_cache_eviction",
+        wrapper_node is not None,
+        "wrapper async function not found in patch source",
+    )
+    if wrapper_node is not None:
+        # Find the outer try/except that owns the eviction logic.
+        try_nodes = [n for n in wrapper_node.body if isinstance(n, ast.Try)]
+        run.expect_eq(
+            "wrapper has exactly one top-level try/except",
+            len(try_nodes),
+            1,
+        )
+        if try_nodes:
+            handlers = try_nodes[0].handlers
+            run.expect_eq(
+                "wrapper's try has exactly one except handler",
+                len(handlers),
+                1,
+            )
+            if handlers:
+                exc_type = handlers[0].type
+                # The catch must be a tuple of exactly (ValueError,
+                # VLLMValidationError). Reject `except Exception`,
+                # `except ValueError` alone, etc.
+                run.expect(
+                    "wrapper catches a tuple of exception types",
+                    isinstance(exc_type, ast.Tuple),
+                    f"got {type(exc_type).__name__ if exc_type else 'None'} — "
+                    f"the catch must be `except (ValueError, VLLMValidationError)`",
+                )
+                if isinstance(exc_type, ast.Tuple):
+                    caught_names = [
+                        elt.id for elt in exc_type.elts if isinstance(elt, ast.Name)
+                    ]
+                    run.expect_eq(
+                        "wrapper catches exactly (ValueError, VLLMValidationError)",
+                        sorted(caught_names),
+                        ["VLLMValidationError", "ValueError"],
+                    )
+
+
+# --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 
@@ -1370,6 +1600,7 @@ def main() -> int:
         section_5_detector,
         section_11_default_sampling_params,
         section_12_qwen3_coder_grammar,
+        section_13_mm_cache_validator_eviction,
         section_6_launcher,
         section_6b_logger_naming,
         section_9_no_silent_failures,

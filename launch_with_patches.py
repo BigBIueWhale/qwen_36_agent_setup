@@ -706,6 +706,43 @@ def _verify_tool_role_media_preserve(patch_module: ModuleType) -> None:
     )
 
 
+def _verify_mm_cache_validator_eviction(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_mm_cache_validator_eviction`` wrapped
+    ``OpenAIServingChat.create_chat_completion``.
+
+    Tag-only check at the launcher: the patch's own Phase 7 carries
+    behavioural verification — five harness cases covering ValueError
+    eviction, VLLMValidationError eviction, RuntimeError no-eviction
+    (negative control), happy-path no-eviction (negative control), and
+    a missing-renderer defensive path that re-raises without crashing.
+    Each case drives the wrapper via asyncio.run on a stub
+    OpenAIServingChat with a counter-incrementing
+    clear_mm_cache_async, so the wrapper's contract is exercised end-
+    to-end at import time. Re-doing that here would duplicate the
+    patch's load-bearing verification — the launcher need only confirm
+    the install propagated to the target via both attribute lookup and
+    ``inspect.getattr_static``.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import "
+            f"vllm.entrypoints.openai.chat_completion.serving."
+            f"OpenAIServingChat for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        OpenAIServingChat,
+        "create_chat_completion",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="OpenAIServingChat",
+    )
+
+
 # --------------------------------------------------------------------
 # Registry. Order matters — see module docstring.
 # --------------------------------------------------------------------
@@ -741,6 +778,13 @@ _PATCH_MODULES: tuple[str, ...] = (
     # chain walk in tool_role_media_preserve's Phase 1 lets the
     # landmark check operate on the original body regardless of how
     # many patches have stacked at this address.
+    # mm_cache_validator_eviction wraps OpenAIServingChat.
+    # create_chat_completion (a unique target — no other patch in this
+    # registry touches that surface), so ordering vs the other patches
+    # is unconstrained. Listed last because its wrap is the OUTERMOST
+    # call frame in the chat-completions request path, so installing it
+    # last keeps the boot-log sequence reading "inner→outer" on
+    # request-flow targets.
     "monkey_patch_qwen3_coder",
     "monkey_patch_hybrid_kv_allocator",
     "monkey_patch_reasoning_field_egress",
@@ -750,6 +794,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_qwen3_coder_grammar",
     "monkey_patch_request_memory_snapshot",
     "monkey_patch_tool_role_media_preserve",
+    "monkey_patch_mm_cache_validator_eviction",
 )
 
 _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
@@ -762,6 +807,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_qwen3_coder_grammar": _verify_qwen3_coder_grammar,
     "monkey_patch_request_memory_snapshot": _verify_request_memory_snapshot,
     "monkey_patch_tool_role_media_preserve": _verify_tool_role_media_preserve,
+    "monkey_patch_mm_cache_validator_eviction": _verify_mm_cache_validator_eviction,
 }
 
 

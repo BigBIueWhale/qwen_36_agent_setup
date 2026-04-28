@@ -22,7 +22,7 @@ This README documents a specific, pinned, reproducible deployment. Every choice 
 | Maximum concurrency at full max-len | **1.06×** at the §8.2 production flags (one 152K request fits with ~6% slack — `monkey_patch_hybrid_kv_allocator.py:336`) |
 | `preserve_thinking` and `enable_thinking` | Both set true server-wide via `--default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}'` (§5.7) |
 | MTP speculative decoding | OFF (head present in the AWQ checkpoint as BF16 but auto-skipped at load; §5.3) |
-| Patches in this repo | 9 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
+| Patches in this repo | 10 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
 
 ---
 
@@ -281,11 +281,25 @@ Compounding the bug: the per-content-part dispatcher upstream of the role-gate r
 
 **Resolution**: §7.9. Closes the silent strip server-side for ALL clients regardless of `splitToolMedia` setting; the rendered prompt matches Qwen3-VL training shape.
 
+### 6.9 Validator throws after sender mm-cache populate poison the receiver assertion [Class A — vLLM internal inconsistency]
+
+The chat-completions request path populates the renderer's `MultiModalProcessorSenderCache` (`vllm/multimodal/cache.py:379-434`) at `vllm/entrypoints/openai/chat_completion/serving.py:251` (`await self.render_chat_request(request)` runs `mm_processor.apply()`, which inserts the per-image mm_hash into the sender LRU). The same `create_chat_completion` then validates the length budget at `serving.py:284` (`get_max_tokens` raises `ValueError` from `vllm/entrypoints/utils.py:182` when input_length exceeds max_model_len). The renderer's own `apply_length_check` validator at `vllm/renderers/params.py:411-428` raises `VLLMValidationError` (`vllm/exceptions.py:9` — extends `ValueError`) on the symmetric over-budget condition. Either throw exits the request handler before the engine IPC fires, leaving the API-server's sender cache populated for hash H while the EngineCore's `MultiModalReceiverCache` (`cache.py:614-647`) has no entry for H. **Sender↔receiver mirror invariant broken.**
+
+The next request carrying the same image hits the sender's IPC-saving short-circuit at `cache.py:415-416` (`return None, prompt_updates` — sender thinks engine has it). Engine's `preprocess_add_request` at `vllm/v1/engine/core.py:765-777` calls `mm_receiver_cache.get_and_update_features` (`cache.py:573-592`), which loops to `get_and_update_item` at `cache.py:636-647`. Hash H absent + payload data is None → `assert mm_item is not None, f"Expected a cached item for {mm_hash=}"` at line 644 fires. The `try/except Exception` at `core.py:1448-1452` catches it and routes through `_handle_request_preproc_error` (`core.py:1533-1540`): logs `"Unexpected error pre-processing request <id>"` and ships HTTP 500 (`"EngineCore encountered an issue. See stack trace for the root cause."`) back to the client. The poison persists for the lifetime of the sender LRU entry — thousands of requests under default `mm_processor_cache_gb`; potentially hours of agentic-workload churn for a hot image.
+
+**User-visible failure**: a request goes over budget → HTTP 400 (correct). Operator clicks "Retry" with the same image and a smaller prompt → **HTTP 500**. Engine `/health=200` for most of the failure window; only after enough preprocessing-error accumulation does liveness flip. There is no API-level workaround.
+
+Empirically reproduced in `/tmp/qwen36_research/mm_cache_bug_2026-04-28/repro_v6.py` (Subagent A, 2026-04-28). Sequence (per `repro_v6_results.json`): step 1 (`prompt 153,666 tokens > 152,000` + image) → HTTP 400 in 0.46 s; step 2 (clean small request, same image) → **HTTP 500 in 0.06 s** with the receiver-cache assertion in engine logs; step 3 (different image, large again) → HTTP 500 plus `/health=503` (engine degraded). Class A — vLLM is breaking its own sender↔receiver cache invariant on a path it owns end-to-end.
+
+**Upstream status (2026-04-28)**: issue #31404 open against the receiver-cache assertion (different trigger, same end state). Draft PR #34749 attempts to soften the assertion to a typed error but is unmerged AND does not clear sender state on the rejecting path — even if merged, it would convert silent poisoning into LOUD errors, but the same retry would still fail because the sender↔receiver mirror is still broken. The fix has to clear sender state at the rejection site, not soften the engine-side assertion downstream.
+
+**Affects us**: yes. Vision-bearing agentic workflows (MCP screenshots, screenshot-driven Computer Use) are the highest-exposure path because they reuse a small set of images across many turns. **Resolution**: §7.10.
+
 ---
 
 ## 7. The patches in this repo
 
-Nine monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patches 3 and 8; see §7.S). There is no client-side code in this repo.
+Ten monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patches 3 and 8; see §7.S). There is no client-side code in this repo.
 
 Each patch addresses a specific defect named in §6 (or, for patches 6 and 7, a §5 design requirement) and only that defect. Each strictly validates its target's structure via landmarks, refuses to apply on any landmark mismatch with a typed exception that names the exact landmark that failed, stamps `__qwen36_patch__` on every target, and verifies via both `getattr` and `inspect.getattr_static` that its install took effect. The patch file itself is the source of truth; this section is a contract index.
 
@@ -300,7 +314,8 @@ Each patch addresses a specific defect named in §6 (or, for patches 6 and 7, a 
 | 7 | [`monkey_patch_qwen3_coder_grammar.py`](monkey_patch_qwen3_coder_grammar.py) | §5.6 / agentic-correctness — server-side xgrammar `structural_tag` constraint on tool emission; flips `supports_required_and_named=False` to close a latent JSON-list-path bug |
 | 8 | [`monkey_patch_request_memory_snapshot.py`](monkey_patch_request_memory_snapshot.py) | §6.7 — make the startup snapshot check stop double-counting vLLM's own init footprint as "external pressure" |
 | 9 | [`monkey_patch_tool_role_media_preserve.py`](monkey_patch_tool_role_media_preserve.py) | §6.8 — preserve list-shaped tool-role content with media so the chat template renders `<|vision_start|><|image_pad|><|vision_end|>` markers natively inside `<tool_response>`; closes silent image-strip for ALL clients regardless of qwen-code `splitToolMedia` setting |
-| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 9 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
+| 10 | [`monkey_patch_mm_cache_validator_eviction.py`](monkey_patch_mm_cache_validator_eviction.py) | §6.9 / #31404 — clear renderer sender mm-cache when a length validator throws after the sender was populated; closes the validator-poisons-cache HTTP-500 retry pathology |
+| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 10 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
 | S | [`sitecustomize.py`](sitecustomize.py) | CPython auto-imports this from `PYTHONPATH=/opt/patches` at every interpreter startup — including the spawned EngineCore subprocess — so patches 3 and 8's targets are live in EngineCore's own `sys.modules` |
 
 ### 7.1 Patch 1 — `monkey_patch_reasoning_field_ingest.py`
@@ -362,21 +377,33 @@ Closes §6.8 server-side for ALL clients regardless of qwen-code's `splitToolMed
 
 **Removal trigger**: vLLM upstream rewrites the `role:"tool"` content reducer at `vllm/entrypoints/chat_utils.py:1549-1564` to preserve list content. The buggy `"\n".join(texts) if texts else ""` predicate is the landmark — any reshape changes its body and forces this patch to refuse.
 
+### 7.10 Patch 10 — `monkey_patch_mm_cache_validator_eviction.py`
+
+Wraps `OpenAIServingChat.create_chat_completion` (`vllm/entrypoints/openai/chat_completion/serving.py:229-…`). On `ValueError` or `VLLMValidationError` (the typed exceptions the two length-budget validators emit at `vllm/entrypoints/utils.py:182` and `vllm/renderers/params.py:418`), calls `self.renderer.clear_mm_cache_async()` and re-raises the original exception unchanged. The eviction restores the sender↔receiver mm-cache mirror invariant that the validator throw broke (sender populated by `render_chat_request` at line 251, validator throws before the engine IPC fires at lines 284-303). Without the eviction, the next request carrying the same image hash hits the engine's `MultiModalReceiverCache` assertion at `vllm/multimodal/cache.py:644` and gets HTTP 500. **The poison persists for the lifetime of the sender LRU entry** — thousands of requests, easily several hours of agentic-workload churn for a hot image. Closing it server-side is the only API-level fix.
+
+`self.renderer` is set in `OpenAIServing.__init__` (the base class, `vllm/entrypoints/openai/engine/serving.py:157`) as `engine_client.renderer` — the same `BaseRenderer` instance the API server's `OpenAIServingRender` wraps (`vllm/entrypoints/openai/api_server.py:369-371` constructs the latter with `renderer=engine_client.renderer`). The sender cache lives on that instance; clearing via `self.renderer` is equivalent to clearing via `self.openai_serving_render.renderer` and reaches the same object. Catching `(ValueError, VLLMValidationError)` is intentionally redundant — `VLLMValidationError` extends `ValueError` per `vllm/exceptions.py:9`, but naming both at the call site documents intent and forces a re-audit on upstream type-hierarchy refactors. We do **not** catch generic `Exception` — that would mask actual bugs that should bubble up. Defensive shape validation in the wrapper itself: if the renderer or its `clear_mm_cache_async` method has drifted (a future subclass that does its own thing), the wrapper logs a structured WARNING and re-raises the original exception — never less safe than upstream.
+
+Phase 7 behavioural probes drive five harness cases via `asyncio.run` on a stub `OpenAIServingChat` whose `renderer.clear_mm_cache_async` is a counter-incrementing async method: (1) inner raises `ValueError` (mirrors `get_max_tokens` path) → counter == 1; (2) inner raises `VLLMValidationError` (mirrors `apply_length_check` path) → counter == 1; (3) inner raises `RuntimeError` (negative control — non-validator exceptions must NOT trigger eviction) → counter == 0; (4) inner returns cleanly (negative control — happy path must pass through with counter == 0); (5) defensive — `self.renderer` attribute missing → wrapper does NOT crash and original `ValueError` still propagates. The five cases run at import time and the patch refuses install on any failure.
+
+**Scope vs upstream**: issue #31404 tracks a different trigger of the same end state (open). Draft PR #34749 attempts to soften the receiver-cache assertion to a typed error but is unmerged AND does not clear sender state on the rejecting path — even if it merged, it would convert silent poisoning into LOUD errors but the same retry would still fail because the sender↔receiver mirror is still broken; the next request still tries to short-circuit on a hash the engine doesn't know about. **Our patch is at the right layer** because the fix has to clear sender cache state at the rejection site, not soften the engine-side assertion downstream.
+
+**Removal trigger**: vLLM upstream lands a fix that clears sender cache state on validator rejection (currently issue #31404 / draft PR #34749). The buggy behaviour is `serving.py:251` populating the sender cache before `serving.py:284`'s `get_max_tokens` validator can throw — any upstream restructuring that either (a) defers sender insertion until after all length validation succeeds or (b) wires a typed `finally`-block eviction into the rejecting path satisfies the removal trigger; the wrapper would then become redundant.
+
 ### 7.L Launcher — `launch_with_patches.py`
 
 Container entrypoint, replacing `["vllm", "serve"]` with `["python", "/opt/patches/launch.py", "serve", ...]`. Imports every registered patch in `_PATCH_MODULES` order, runs the per-patch `_PATCH_VERIFICATION` verifier for each (re-imports the relevant vLLM target FROM SCRATCH and asserts the install took effect), then hands off to vLLM's CLI via `runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__", alter_sys=True)`. Required because `PYTHONSTARTUP` does not fire under non-interactive entrypoints.
 
-Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5, 6, 7, 8, 9 carry tag-only launcher verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications carry the load-bearing functional verification (the egress patch's wire-dump check; the ingest patch's static-lookup check; patch 6's five behavioural cases at Phase 7; patch 7's four behavioural cases at Phase 9 plus a load-bearing `xgr.Grammar.from_structural_tag` round-trip; patch 8's three behavioural probes — original-raises-on-buggy-input, patched-accepts-on-same-input, patched-still-raises-on-external-pressure; patch 9's five behavioural probes at Phase 4 directly testing the pure filter function — text+image preserves order, image-only preserves single element, text-only returns None (no intervention), string content returns None, and unknown-type filtering with both no-media-passthrough and media-present-filter sub-cases), so duplicating it here would only double the surface area. Patch 7's launcher verifier additionally asserts `Qwen3CoderToolParser.supports_required_and_named is False`.
+Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5, 6, 7, 8, 9, 10 carry tag-only launcher verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications carry the load-bearing functional verification (the egress patch's wire-dump check; the ingest patch's static-lookup check; patch 6's five behavioural cases at Phase 7; patch 7's four behavioural cases at Phase 9 plus a load-bearing `xgr.Grammar.from_structural_tag` round-trip; patch 8's three behavioural probes — original-raises-on-buggy-input, patched-accepts-on-same-input, patched-still-raises-on-external-pressure; patch 9's five behavioural probes at Phase 4 directly testing the pure filter function — text+image preserves order, image-only preserves single element, text-only returns None (no intervention), string content returns None, and unknown-type filtering with both no-media-passthrough and media-present-filter sub-cases; patch 10's five harness cases at Phase 7 driving the wrapper via `asyncio.run` against a stub `OpenAIServingChat` — `ValueError` triggers eviction, `VLLMValidationError` triggers eviction, `RuntimeError` does NOT trigger eviction, happy-path passes through with no eviction, missing-renderer defensively skips eviction without crashing), so duplicating it here would only double the surface area. Patch 7's launcher verifier additionally asserts `Qwen3CoderToolParser.supports_required_and_named is False`.
 
 Three pre-flight checks run BEFORE the per-patch import loop: sitecustomize-present (refuse if Debian's stub got loaded instead of ours), registry drift (refuse if `sitecustomize._PATCH_MODULES != launch_with_patches._PATCH_MODULES`), and a subprocess install probe (`subprocess.run([sys.executable, "-c", PROBE])` to confirm a freshly-spawned interpreter sees patched targets). All three are load-bearing for patch 3 — without them, the spawned EngineCore silently runs unpatched code while the launcher reports success. **Load order** matters: `reasoning_field_egress` (patch 4) must come before any patch that constructs `DeltaMessage` at request time, since the rebuild changes Pydantic's compiled schema.
 
 ### 7.S sitecustomize loader — `sitecustomize.py`
 
-vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the nine patches, **patches 3 and 8** target EngineCore-resident code (`monkey_patch_hybrid_kv_allocator` for the KV-cache reporting path, `monkey_patch_request_memory_snapshot` for the worker's startup `request_memory` check); patches 1, 2, 4, 5, 6, 7, 9 target API-server-resident code and become live in PID 1 directly (chat_utils' `parse_chat_messages` runs in the request handler, never in EngineCore). Without `sitecustomize`, patches 3 and 8 are silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator for patch 3 is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~37K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~149K tokens). For patch 8 the discriminator is whether the boot ValueError fires at gmu > ~0.984 (unpatched, snapshot-check too strict) or the engine reaches "Application startup complete" (patched).
+vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the ten patches, **patches 3 and 8** target EngineCore-resident code (`monkey_patch_hybrid_kv_allocator` for the KV-cache reporting path, `monkey_patch_request_memory_snapshot` for the worker's startup `request_memory` check); patches 1, 2, 4, 5, 6, 7, 9, 10 target API-server-resident code and become live in PID 1 directly (chat_utils' `parse_chat_messages` and `OpenAIServingChat.create_chat_completion` both run in the request handler, never in EngineCore). Without `sitecustomize`, patches 3 and 8 are silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator for patch 3 is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~37K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~149K tokens). For patch 8 the discriminator is whether the boot ValueError fires at gmu > ~0.984 (unpatched, snapshot-check too strict) or the engine reaches "Application startup complete" (patched).
 
 CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interpreter startup, including spawned children. With `PYTHONPATH=/opt/patches`, `site.py` finds our file, which imports each patch in launcher order. Each patch's strict landmark check runs in EngineCore too; any refusal aborts startup loudly. The same flow runs in PID 1 — sitecustomize installs the patches, `launch.py` then hits cache via `importlib.import_module(...)`. Each patch's module-level code fires once.
 
-**Load-bearing for**: patches 3 and 8. **Defense-in-depth for**: patches 1, 2, 4, 5, 6, 7, 9. **Removal trigger**: when both patches 3 and 8 are removed; recommendation is to keep for defense-in-depth.
+**Load-bearing for**: patches 3 and 8. **Defense-in-depth for**: patches 1, 2, 4, 5, 6, 7, 9, 10. **Removal trigger**: when both patches 3 and 8 are removed; recommendation is to keep for defense-in-depth.
 
 ---
 
@@ -386,7 +413,7 @@ End-to-end production sequence. Follow §8.1 → §8.5 in order from a fresh clo
 
 ### 8.1 Pull the Docker image (one-time)
 
-**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the nine patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
+**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the ten patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
 
 This is deliberate. Three properties fall out of it:
 
@@ -428,6 +455,7 @@ docker run -d --name qwen36 --gpus all \
   -v "$PWD/monkey_patch_qwen3_coder_grammar.py:/opt/patches/monkey_patch_qwen3_coder_grammar.py:ro" \
   -v "$PWD/monkey_patch_request_memory_snapshot.py:/opt/patches/monkey_patch_request_memory_snapshot.py:ro" \
   -v "$PWD/monkey_patch_tool_role_media_preserve.py:/opt/patches/monkey_patch_tool_role_media_preserve.py:ro" \
+  -v "$PWD/monkey_patch_mm_cache_validator_eviction.py:/opt/patches/monkey_patch_mm_cache_validator_eviction.py:ro" \
   -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
   -e PYTHONPATH=/opt/patches \
@@ -476,11 +504,11 @@ curl -fs http://127.0.0.1:8001/v1/models | jq -e \
 # Step 3: confirm /metrics responds (Prometheus scrape target).
 curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics  # expect 200
 
-# Step 4: confirm all 9 distinct patch tags applied. Each patch loads in
+# Step 4: confirm all 10 distinct patch tags applied. Each patch loads in
 # three processes (PID 1 launcher, pre-flight install probe, EngineCore
 # spawn child) and emits one applied: line per loading, so the un-deduped
-# line count is ~27; dedupe to count distinct tags.
-docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 9
+# line count is ~30; dedupe to count distinct tags.
+docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 10
 ```
 
 ```bash
@@ -554,7 +582,7 @@ systemd-timer equivalent (substitute for the cron line if your host uses systemd
 Sign off all of these before declaring the deployment ready:
 
 - [ ] `docker inspect -f '{{.State.Health.Status}}' qwen36` reports `healthy`.
-- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **9** (the nine distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~27**.
+- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **10** (the ten distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~30**.
 - [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **152000**.
 - [ ] `curl -fs -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics` returns **200**.
 - [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0**.
@@ -601,6 +629,7 @@ Sign off all of these before declaring the deployment ready:
 | **B8** | Multi-image + long-context stress | **Validated at the boundary** | At §8.2 production flags: 2× 4-MP images + 115,190-token document = **123,421 prompt tokens (94.2% of `--max-model-len`)** admitted, both images correctly described, needle `AC582B0` retrieved at depth ~50%, GPU memory peak +318 MiB transient (returned to baseline post-request), 8 s warm-cache / 51 s cold. At **133,889 prompt tokens** (over by 2,817): clean HTTP 400 `"Input length (133889) exceeds model's maximum context length (131072)."` at ingest, engine state intact, deep liveness probe still passes. `image:N` ceiling enforced at ingest with HTTP 400 `"At most N image(s) may be provided in one prompt."` and is byte-identical between N=2 and N=20 in KV reporting (`image:N` is a per-request integer cap, not a memory reservation; §5.8). |
 | **B9** | OOM / admission boundary sweep (2026-04-28, prior config mnbt=8192/max-len=131K) | **Validated boundaries; ONE real OOM found and fixed** | (a) **20× 4-MP synthetic images + 36K text = 118,261 prompt tokens, no client `max_tokens`**: HTTP 200 in 320 s, image correctly described, VRAM flat. (b) **20× 4-MP + 66K text = 146,651 prompt tokens (over) + `max_tokens=200`**: HTTP 400 in 0.221 s from `entrypoints/utils.py:174-185`, engine `/health=200` after. (c) **Long-decode under thinking** (4,848-token prompt + `max_tokens=126,128`, ran 287.8 s, 20,465 generated, finish=stop): VRAM held flat at 32,054/56 for 4m48s. (d) **Exact admission boundary**: last-accepted `max_tokens=31,088` for a 99,984-token prompt. (e) **`prompt + max_tokens > max_model_len`** rejected via `renderers/params.py:411-425`. (f) **CRITICAL: 20× 4-MP REAL Webb Pillars-of-Creation crops + 47K text = 129K prompt** at mnbt=8192 → `torch.OutOfMemoryError: Tried to allocate 262.00 MiB. Of which 257.88 MiB is free` — LM-prefill MLP buffer `(s≈7884, intermediate=17408)` fp16 tipped over by 4 MiB. Engine crashed cleanly via `EngineDeadError`, container auto-restarted via `--restart unless-stopped`. **Root cause**: at mnbt=8192 the prefill MLP buffer is ~285 MiB; combined with weight pages, KV-block fills, and encoder cache for 20-image expansions, the runtime activation peak exceeded the ~280 MiB workspace headroom. **Fix**: drop mnbt to 4096 (next row). Artifacts: `/tmp/qwen36_research/oom_admission_tests_2026-04-28/`, `/tmp/qwen36_research/oom_image_aggressive_2026-04-28/`. |
 | **B10** | RULER-style multi-needle at the new 152K ceiling (2026-04-28) | **STRONG_PASS at the new boundary** | At §8.2 production flags (mnbt=4096, max-model-len=152000): (a) **5 needles + 50 distractors at 135,986 prompt tokens (warm)**: 5/5 correct in correct ascending depth order in 19.9 s. (b) **7 needles + 100 distractors + 6% fake-`[REF-CODE]`-marker traps + asymmetric depths (12/24/38/51/65/79/92) + reverse-depth output, 133,867 prompt tokens (cold cache after `docker restart`)**: 7/7 correct in correct reverse order in 87.3 s end-to-end. (c) **Same hardness pushed to 148,337 prompt tokens (97.6% of max-model-len, cold)**: all 7 codes correctly enumerated in reasoning content (model's thought stream printed all seven correct codes); decode truncated by max_tokens=2000 mid-output but grading on reasoning-content scores **STRONG_PASS**. Cold-prefill throughput at mnbt=4096 measured at ~2,400–2,480 tokens/s; ~10–15% slower than mnbt=8192 (which would have OOMed anyway). Engine `healthy`, `/health=200` after every test. Artifacts at `/tmp/qwen36_research/ruler_150k_2026-04-28/`. |
+| **B11** | Validator-poisons-mm-cache empirical reproduction (2026-04-28) | **Bug reproduced against unpatched; patch §7.10 carries Phase 7 stub-harness verification; live retry-with-same-image re-test pending next deployment** | Three-step probe at `/tmp/qwen36_research/mm_cache_bug_2026-04-28/repro_v6.py` (Subagent A) against the unpatched container. Step 1: large prompt (`153,666 tokens > 152,000`) + image → HTTP 400 in 0.46 s with `"Input length (153,666) exceeds model's maximum context length (152000)."` (correct rejection from `entrypoints/utils.py:182`); engine `/health=200`. Step 2: clean small prompt + same image → **HTTP 500 in 0.06 s** with `"EngineCore encountered an issue. See stack trace for the root cause."`; engine logs show `AssertionError: Expected a cached item for mm_hash='0f21b…'` from `vllm/multimodal/cache.py:644`; engine `/health=200` (still looks healthy). Step 3: clean prompt + different image → HTTP 500; engine `/health=503` (now degraded). The poison persists for the lifetime of the sender LRU entry — covered by §6.9 / §7.10. Results captured at `repro_v6_results.json`. Patch §7.10's Phase 7 behavioural probes verify the eviction logic in isolation against a stub `OpenAIServingChat` at every container boot; an end-to-end re-run of `repro_v6.py` against the patched container is the load-bearing live confirmation, scheduled for the next deployment cycle. |
 
 What remains: B1 schema-variation corpus and B7 multi-needle RULER. Neither is gated by the patches; both depend on workload-specific fixtures.
 
@@ -624,6 +653,7 @@ Re-evaluate the pinned versions when:
 12. **vLLM ships workload-aware CUDA-graph capture-size defaults** — drop the `-cc '{"cudagraph_capture_sizes":[...]}'` pin from §8.2.
 13. **vLLM issue #38182 (MTP + prefix cache) closes** — reconsider enabling MTP.
 14. **vLLM upstream rewrites the `role:"tool"` content reducer at `vllm/entrypoints/chat_utils.py:1549-1564`** to preserve media (the buggy `"\n".join(texts) if texts else ""` predicate is the landmark) — remove patch 9.
+15. **vLLM upstream lands a fix that clears sender cache state on validator rejection** — currently issue #31404 / draft PR #34749. Either (a) defers the sender-cache populate at `serving.py:251` until after all length validation succeeds, or (b) wires a typed `finally`-block eviction into the rejecting path. Either satisfies the removal trigger — remove patch 10.
 
 Each is tracked; none urgent.
 
@@ -634,7 +664,7 @@ Each is tracked; none urgent.
 ```
 .
 ├── README.md                                              # this document
-├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 9 patches then runpys vLLM
+├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 10 patches then runpys vLLM
 ├── sitecustomize.py                                       # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
 ├── health_probe.sh                                        # §8.4 — host-side deep liveness probe; engine-decoded-a-token check
 ├── monkey_patch_reasoning_field_ingest.py                 # §7.1 — accept reasoning_content on inbound assistant messages
@@ -646,8 +676,9 @@ Each is tracked; none urgent.
 ├── monkey_patch_qwen3_coder_grammar.py                    # §7.7 — xgrammar structural_tag on tool emission; supports_required_and_named=False
 ├── monkey_patch_request_memory_snapshot.py                # §7.8 — startup snapshot check stops double-counting vLLM's own init footprint
 ├── monkey_patch_tool_role_media_preserve.py               # §7.9 — preserve list-shaped tool-role content with media so the chat template renders <|vision_start|><|image_pad|><|vision_end|> inside <tool_response>
+├── monkey_patch_mm_cache_validator_eviction.py            # §7.10 — clear renderer sender mm-cache on validator throw; closes #31404 retry-poison HTTP-500
 └── tests/
     └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
 ```
 
-Eleven Python files (9 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.
+Twelve Python files (10 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.
