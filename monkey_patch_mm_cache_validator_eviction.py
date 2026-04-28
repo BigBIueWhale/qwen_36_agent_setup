@@ -18,9 +18,7 @@ response is the generic ``EngineCore encountered an issue. See stack
 trace for the root cause.`` shape, which points at the engine while
 the actual bug lives in the API server's renderer.
 
-Empirical reproduction at ``/tmp/qwen36_research/mm_cache_bug_2026-04-28
-/repro_v6.py`` (Subagent A, 2026-04-28). Sequence captured at
-``repro_v6_results.json``:
+Empirical reproduction (2026-04-28). Sequence:
 
 * **Step 1 (poison)**: `text + image, prompt 153,666 tokens > 152,000`.
   `render_chat_request` runs `mm_processor.apply()` (image hashed and
