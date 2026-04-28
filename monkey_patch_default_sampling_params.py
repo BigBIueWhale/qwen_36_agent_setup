@@ -3,30 +3,60 @@
 Why this patch must exist
 -------------------------
 
-vLLM honours whatever sampling fields the client sends. Qwen3.6 has a
-"Best Practices" sampling block on its model card whose values matter
-load-bearingly: at the vLLM defaults (``temperature=1.0`` only when
-nothing is supplied, ``presence_penalty=0.0`` always, ``top_p=1.0``,
-``top_k=0``, ``min_p=0.0``) the model exhibits a thinking-mode loop
-pathology measured at 17.4% truncation on Qwen3.5-35B-A3B's
-LiveCodeBench (27.5% on hard problems). Alibaba ships
-``presence_penalty=1.5`` as the documented mitigation, plus the
-sampling-shape combo (``temperature=1.0, top_p=0.95, top_k=20,
-min_p=0.0, repetition_penalty=1.0, max_tokens=16384``). README §5.6.
+vLLM honours whatever sampling fields the client sends. The official
+QuantTrio/Qwen3.6-27B-AWQ HuggingFace model card publishes a "Best
+Practices" sampling block for thinking mode, with a separate
+*precise-coding-mode* set of values explicitly recommended for math
+and coding tasks. **This deployment uses the precise-coding values
+because the standing workload is autonomous agentic coding** (per
+README §1) — and the values across the two modes share five of seven
+fields anyway:
 
-Default-clients (OpenAI Python SDK, OpenAI-compatible TypeScript SDKs,
-the Qwen Code CLI, Qwen-Agent) do not send Qwen3.6's recommended
-sampling defaults. Without this patch, the agent backend operates in
-the broken-by-default region every time a client omits the fields.
+  - ``temperature=0.6`` (precise coding/math); ``=1.0`` is the
+    "general tasks" alternative for free-form generation
+  - ``top_p=0.95``
+  - ``top_k=20``
+  - ``min_p=0.0``
+  - ``presence_penalty=0.0``
+  - ``repetition_penalty=1.0``
+  - ``max_tokens=81920`` (the official math/programming-competition
+    recommendation; ``32768`` is the standard-query alternative for
+    cheaper requests). Both are well within
+    ``max_position_embeddings=262144`` — the model is trained to think
+    this long; no quality cliff.
 
-This patch enforces the Qwen3.6 thinking-mode defaults SERVER-SIDE
-for fields the client did NOT explicitly send. **Only fills defaults
-for unset fields** — if the client EXPLICITLY sends ``temperature=0.6``
-("precise coding mode"), 0.6 is preserved. The detection primitive is
-Pydantic v2's ``BaseModel.model_fields_set`` (set of field names that
-were assigned during validation; excludes class defaults), which is
-load-bearing-verified at import time on a real
-``ChatCompletionRequest`` instance constructed with no sampling fields.
+Default-clients (the OpenAI Python SDK, the OpenAI-compatible
+TypeScript SDKs, the Qwen Code CLI in standard config, Qwen-Agent) do
+not send these fields at all — verified empirically against
+``qwen-code/packages/core/src/core/openaiContentGenerator/pipeline.ts``
+(the ``addParameterIfDefined`` helper at lines 411-432 skips every
+sampling field unless the user explicitly configured it). Without this
+patch the agent backend operates with vLLM's generic defaults
+(``temperature=1.0``, ``top_p=1.0``, ``top_k=0``, ``min_p=0.0``,
+``presence_penalty=0.0``) — way out of distribution for Qwen3.6
+thinking mode.
+
+Note on ``presence_penalty``: an earlier version of this patch enforced
+``presence_penalty=1.5`` based on Alibaba's documented mitigation for
+the Qwen3.5-35B-A3B-MoE thinking-mode loop pathology (17.4% truncation
+on LiveCodeBench). **That recommendation does NOT apply to
+Qwen3.6-27B-AWQ.** The official Qwen3.6 model card publishes
+``presence_penalty=0.0``; the QuantTrio AWQ recipe additionally
+preserves ``linear_attn.in_proj_a/b`` at BF16, which `cpatonn`'s
+HF discussion #2 found "significantly better on the infinite loop
+issue" vs full INT4 (README §3.1). The empirical loop rate on this
+specific config is in §11's known-unknowns — but the official
+recommendation is unambiguous and we follow it.
+
+This patch enforces the Qwen3.6 precise-coding thinking-mode defaults
+SERVER-SIDE for fields the client did NOT explicitly send. **Only fills
+defaults for unset fields** — if a client explicitly sends
+``temperature=1.0`` ("general tasks mode"), 1.0 is preserved. The
+detection primitive is Pydantic v2's ``BaseModel.model_fields_set``
+(set of field names that were assigned during validation; excludes
+class defaults), which is load-bearing-verified at import time on a
+real ``ChatCompletionRequest`` instance constructed with no sampling
+fields.
 
 Target: ``vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionRequest.to_sampling_params``
 at vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce``. The wrapper
@@ -57,16 +87,25 @@ from vllm.sampling_params import SamplingParams
 _PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
 _PATCH_TAG: str = "qwen36-agent-setup-default-sampling-params-v1"
 
-# Qwen3.6 Best Practices, thinking-mode / agentic-correct defaults.
-# README §5.6. Mirrors the model-card "Best Practices" block.
+# Qwen3.6 official Best Practices: thinking-mode, precise-coding/math values.
+# Source: huggingface.co/QuantTrio/Qwen3.6-27B-AWQ "Best Practices" block.
+# README §5.6. ``temperature=1.0`` (general tasks) is the alternative;
+# clients send it explicitly when they want free-form generation rather
+# than precise reasoning. ``max_tokens=81920`` is the official
+# recommendation for highly complex math / programming-competition
+# outputs — well within ``max_position_embeddings=262144`` and within
+# the model's trained ability (no quality cliff vs the 32768 standard).
+# We default high because the workload is autonomous agentic coding +
+# math; clients that want shorter caps send a smaller value and
+# ``min(qwen_default, current)`` picks the smaller.
 QWEN36_DEFAULTS: dict[str, float | int] = {
-    "temperature": 1.0,
+    "temperature": 0.6,
     "top_p": 0.95,
     "top_k": 20,
     "min_p": 0.0,
-    "presence_penalty": 1.5,
+    "presence_penalty": 0.0,
     "repetition_penalty": 1.0,
-    "max_tokens": 16384,
+    "max_tokens": 81920,
 }
 
 # Source landmark — substring required in the wrapped method body so
@@ -249,7 +288,7 @@ def _to_sampling_params_with_qwen36_defaults(
     method receives an already-bounded ``max_tokens`` arg (capped at
     ``model_max_len - input_len`` by the serving layer's
     ``get_max_tokens``); to never EXCEED that cap, we apply the Qwen3.6
-    16384 default as ``min(qwen_default, current)``, never as a raw
+    81920 default as ``min(qwen_default, current)``, never as a raw
     overwrite.
     """
     sampling = _original(self, max_tokens, default_sampling_params)
@@ -309,7 +348,7 @@ _require(
 # Case 1: client sent NO sampling fields. All Qwen3.6 defaults must apply.
 _req_unset = _RequestCls(model="probe", messages=[])
 _sp_unset = _req_unset.to_sampling_params(
-    max_tokens=200_000,  # large; verifies the max_tokens cap to 16384 fires
+    max_tokens=200_000,  # large; verifies the max_tokens cap to 81920 fires
     default_sampling_params={},
 )
 _require(
@@ -350,7 +389,7 @@ for _name, _expected in QWEN36_DEFAULTS.items():
 
 # Case 3: max_tokens cap is min(qwen_default, current), never an
 # unconditional overwrite. Use a small `max_tokens` arg to prove we do
-# not raise it from 1024 to 16384 when the model_max_len cap is small.
+# not raise it from 1024 to 81920 when the model_max_len cap is small.
 _req_unset_2 = _RequestCls(model="probe", messages=[])
 _sp_capped = _req_unset_2.to_sampling_params(
     max_tokens=1024,
@@ -363,24 +402,26 @@ _require(
     f"layer's already-applied cap.",
 )
 
-# Case 4: explicit presence_penalty=0.0 (i.e. precise-coding mode) is
-# preserved — pydantic field's class default is 0.0 but explicit
-# assignment still appears in model_fields_set.
-_req_pp_zero = _RequestCls(model="probe", messages=[], presence_penalty=0.0)
-_sp_pp_zero = _req_pp_zero.to_sampling_params(
+# Case 4: explicit presence_penalty=1.5 (the older Qwen3.5-35B-A3B
+# anti-loop value) is preserved — proves that an explicit non-default
+# value bypasses our patch's preserve-precise-coding default of 0.0.
+# Discriminative because the new Qwen3.6 default IS 0.0 — using 0.0
+# here would not distinguish "explicit preserved" from "default applied".
+_req_pp_explicit = _RequestCls(model="probe", messages=[], presence_penalty=1.5)
+_sp_pp_explicit = _req_pp_explicit.to_sampling_params(
     max_tokens=4096,
     default_sampling_params={},
 )
 _require(
-    _sp_pp_zero.presence_penalty == 0.0,
-    f"Phase 7 case 4: explicit presence_penalty=0.0 was overridden to "
-    f"{_sp_pp_zero.presence_penalty!r}; the patch is ignoring "
+    _sp_pp_explicit.presence_penalty == 1.5,
+    f"Phase 7 case 4: explicit presence_penalty=1.5 was overridden to "
+    f"{_sp_pp_explicit.presence_penalty!r}; the patch is ignoring "
     f"`model_fields_set` for non-None-default fields.",
 )
 
 # Case 5: explicit max_completion_tokens (the OpenAI-recommended field
 # name) is also recognized as "client expressed an opinion" so we do
-# not impose the 16384 cap.
+# not impose the 81920 cap.
 _req_mct = _RequestCls(model="probe", messages=[], max_completion_tokens=2048)
 _sp_mct = _req_mct.to_sampling_params(
     max_tokens=2048,

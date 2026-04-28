@@ -20,7 +20,7 @@ This README documents a specific, pinned, reproducible deployment. Every choice 
 | KV pool available | 9.13 GiB at gmu=0.98 with `--skip-mm-profiling` and `--mm-processor-kwargs '{"max_pixels": 4194304}'`, `--max-num-batched-tokens 8192`. Boot log: `GPU KV cache size: ~148,960 tokens` (patch 3 installed; unpatched §6.3 would display ~37K) |
 | Per-token attention KV at BF16 | `4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes = 65,536 bytes/token` (16 GiB at the model's native 262K context) |
 | Maximum concurrency at full max-len | **1.13×** at the §8.2 production flags (one full-context request fits with ~13% slack — `monkey_patch_hybrid_kv_allocator.py:335`) |
-| `preserve_thinking` | Set as server-wide default via `--default-chat-template-kwargs '{"preserve_thinking": true}'` |
+| `preserve_thinking` and `enable_thinking` | Both set true server-wide via `--default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}'` (§5.7) |
 | MTP speculative decoding | OFF (head present in the AWQ checkpoint as BF16 but auto-skipped at load; §5.3) |
 | Patches in this repo | 9 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
 
@@ -163,16 +163,20 @@ vLLM issue #39584 asserts `len(tool_calls)==1` in the Responses API streaming pa
 
 ### 5.6 Sampling parameters
 
-Per the Qwen3.6 model card "Best Practices" block. Thinking-mode agentic use:
-`temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, max_tokens=16384`. Precise coding / low-variance tool args: `temperature=0.6, presence_penalty=0.0`, rest unchanged.
+Per the official QuantTrio/Qwen3.6-27B-AWQ HuggingFace model card "Best Practices" block, thinking-mode precise-coding/math values: `temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, max_tokens=81920`. The "general tasks" thinking-mode alternative uses `temperature=1.0` (rest unchanged); 81,920 is the official recommendation for **highly complex math / programming-competition outputs** and is well inside `max_position_embeddings=262144` — no quality cliff vs the 32K-standard-queries alternative. Standing workload here is autonomous agentic coding + math, so we default high.
 
-**Patch §7.6 enforces these defaults server-side** for fields the client did NOT explicitly send (Pydantic v2 `model_fields_set`); explicit client values pass through unchanged, so the precise-coding alternative still works by sending `temperature=0.6, presence_penalty=0.0` from the client. `presence_penalty=1.5` is Alibaba's shipped mitigation for the Qwen3-family thinking-mode loop pathology (LiveCodeBench: 17.4% of 1,400 outputs truncated with no `</think>`, 27.5% on hard problems) — load-bearing whether or not the client sends it. May cause language mixing and slight perf decrease per Qwen's docs. Community alternative: `min_p=0.2` with `temperature=1.0` (drop `presence_penalty` back to 0). `max_tokens=16384` gives headroom against the truncation crash mode patched in §7.2. Qwen3.6 does NOT support soft `/think` or `/nothink` switches — thinking mode is controlled exclusively via `chat_template_kwargs`.
+**Patch §7.6 enforces these defaults server-side** for fields the client did NOT explicitly send (Pydantic v2 `model_fields_set`); explicit client values pass through unchanged, so a client that wants free-form generation sends `temperature=1.0` and that wins. Verified empirically against `qwen-code/packages/core/src/core/openaiContentGenerator/pipeline.ts:411-432` — the `addParameterIfDefined` helper there sends NONE of these fields unless the user has explicitly configured them, so the patch lands on every default-config qwen-code request.
 
-### 5.7 `preserve_thinking=true` as a server-side default
+Earlier patch versions enforced `presence_penalty=1.5` based on Alibaba's documented mitigation for the **Qwen3.5-35B-A3B-MoE** thinking-mode loop pathology (LiveCodeBench: 17.4% of 1,400 outputs truncated). That recommendation does NOT apply to **Qwen3.6-27B-AWQ**: the official Qwen3.6 model card publishes `presence_penalty=0.0`, and the QuantTrio AWQ recipe additionally preserves `linear_attn.in_proj_a/b` at BF16 (§3.1), which `cpatonn`'s HF discussion #2 found *"significantly better on the infinite loop issue"* vs full INT4. Empirical loop rate on this specific config is in §11's known-unknowns; we follow Alibaba's published recommendation.
 
-`--default-chat-template-kwargs '{"preserve_thinking": true}'` sets `preserve_thinking=true` as a server-wide default. The Qwen3.6 chat template only emits `<think>` blocks from historical assistant turns when `preserve_thinking=true`; otherwise only the most recent assistant turn retains its `<think>`. The model was RL-trained expecting reasoning to persist across turns; stripping it degrades tool-argument correctness after 2–3 turns (`badlogic/pi-mono#3325`).
+Qwen3.6 does NOT support soft `/think` or `/nothink` switches — thinking mode is controlled exclusively via `chat_template_kwargs.enable_thinking`. We default it server-side to `true` (§5.7) so every default-config request lands in thinking mode.
 
-`enable_thinking` is *not* set server-side — clients pass `"chat_template_kwargs": {"enable_thinking": true}` in the request body when they want thinking on.
+### 5.7 `preserve_thinking=true` and `enable_thinking=true` as server-side defaults
+
+`--default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}'` sets both as server-wide chat-template kwargs. Both are explicitly set:
+
+- **`preserve_thinking=true`** — the Qwen3.6 chat template only emits `<think>` blocks from historical assistant turns when this is true; otherwise only the most recent assistant turn retains its `<think>` (template line 100). The model was RL-trained expecting reasoning to persist across turns; stripping it degrades tool-argument correctness after 2–3 turns (`badlogic/pi-mono#3325`). **Load-bearing for multi-turn agentic correctness.**
+- **`enable_thinking=true`** — functionally equivalent to leaving it unset because the chat template at line 149 only suppresses thinking on explicit `false` (default behaviour is on), but setting it explicitly locks intent at the server. Clients can still opt out per-request by sending `"chat_template_kwargs": {"enable_thinking": false}` for cheap non-thinking tool calls; the request-level override beats the server default.
 
 The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.1 ingest, §6.4 egress) is closed by the §7.1 and §7.4 patches.
 
@@ -231,7 +235,7 @@ Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, 
 
 `vllm/tool_parsers/qwen3coder_tool_parser.py:236` uses unsafe `str.index(">")`. When the model is truncated mid-`<parameter=NAME` (before `>`), `.index()` raises `ValueError`. The exception is caught at lines 320-324 and the parser returns `tools_called=False, tool_calls=[]` — collapsing **every well-formed sibling tool call in the same response**. Sibling code at line 227 already uses the safe `.find()/-1` pattern; line 236 is an internal inconsistency upstream PR #39772 acknowledges.
 
-**Affects us**: yes, whenever a response is truncated by `max_tokens` or by client disconnect mid-generation. **Resolution**: §7.2; complemented by `max_tokens=16384` keeping truncation rare.
+**Affects us**: yes, whenever a response is truncated by `max_tokens` or by client disconnect mid-generation. **Resolution**: §7.2; complemented by `max_tokens=81920` (§5.6) keeping truncation rare.
 
 ### 6.3 Issue #37121 — hybrid-KV scheduler/log under-reports concurrent capacity [Class D — observability bug]
 
@@ -317,7 +321,7 @@ Wraps `Qwen3ReasoningParser.extract_reasoning` (non-streaming **only**) and emit
 
 ### 7.6 Patch 6 — `monkey_patch_default_sampling_params.py`
 
-Wraps `ChatCompletionRequest.to_sampling_params` (`vllm/entrypoints/openai/chat_completion/protocol.py`). Runs the original, then for each Qwen3.6 Best-Practices default (`temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0, max_tokens=16384`) overrides the returned `SamplingParams.<field>` iff `field_name not in request.model_fields_set`. Pydantic v2's `model_fields_set` distinguishes explicit assignments from class defaults (load-bearing — verified at import time on a real `ChatCompletionRequest` with both an unset and a set-to-class-default probe). `max_tokens` is capped at `min(qwen_default, current)` — never raised above the serving layer's already-applied cap. Five behavioral cases run at import time and refuse the patch if any fail. **Removal trigger**: vLLM ships a first-class "model-recommended sampling defaults" mechanism (e.g. `--default-sampling-params` widened to respect `model_fields_set`) and the launch flags adopt it.
+Wraps `ChatCompletionRequest.to_sampling_params` (`vllm/entrypoints/openai/chat_completion/protocol.py`). Runs the original, then for each Qwen3.6 Best-Practices default (`temperature=0.6, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0, max_tokens=81920` — the official precise-coding/math thinking-mode values per §5.6) overrides the returned `SamplingParams.<field>` iff `field_name not in request.model_fields_set`. Pydantic v2's `model_fields_set` distinguishes explicit assignments from class defaults (load-bearing — verified at import time on a real `ChatCompletionRequest` with both an unset and a set-to-class-default probe). `max_tokens` is capped at `min(qwen_default, current)` — never raised above the serving layer's already-applied cap. Five behavioral cases run at import time and refuse the patch if any fail. **Removal trigger**: vLLM ships a first-class "model-recommended sampling defaults" mechanism (e.g. `--default-sampling-params` widened to respect `model_fields_set`) and the launch flags adopt it.
 
 ### 7.7 Patch 7 — `monkey_patch_qwen3_coder_grammar.py`
 
@@ -436,7 +440,7 @@ docker run -d --name qwen36 --gpus all \
   --enable-prefix-caching \
   --skip-mm-profiling \
   --mm-processor-kwargs '{"max_pixels": 4194304}' \
-  --default-chat-template-kwargs '{"preserve_thinking": true}' \
+  --default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}' \
   --limit-mm-per-prompt '{"image": 20, "video": 1, "audio": 0}' \
   -cc '{"cudagraph_capture_sizes":[1,2,4,8]}'
 ```
