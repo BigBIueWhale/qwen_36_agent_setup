@@ -14,14 +14,15 @@ This README documents a specific, pinned, reproducible deployment. Every choice 
 | Quantization format | AWQ INT4 (gemm, group_size=128, zero_point=true), data-free calibration. Vision encoder, `linear_attn.in_proj_a/b`, all `self_attn.{q,k,v}_proj`, layer 0, embeddings, `lm_head`, MTP, norms/conv1d kept BF16 |
 | Runtime | vLLM Docker image `vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba` (build `0.19.2rc1.dev212+g8cd174fa3`, commit `8cd174fa358326d5cc4195446be2ebcd65c481ce`, container CUDA 13.0.2, PyTorch `2.11.0+cu130`, FlashInfer `0.6.8.post1`, transformers `5.6.2`, pydantic `2.13.3`, image built 2026-04-26 05:19 UTC) |
 | KV cache dtype | BF16 (FP8 KV scales are not shipped with this checkpoint; rationale §5.1) |
-| `--max-model-len` | **65,536** |
+| `--max-model-len` | **131,072** |
 | Disk size | 20.36 GiB |
 | VRAM at boot (measured) | 19.78 GiB resident (MTP head auto-skipped via `qwen3_5.py:701-706`'s `skip_prefixes=["mtp."]`) |
-| KV pool available | 5.26 GiB at gmu=0.92 (effective 0.9173 after CUDA-graph profiling), image:2/video:1, `--max-num-batched-tokens 8192`. Boot log: `GPU KV cache size: ~111,328 tokens` (patch 3 installed; unpatched §6.3 would display ~28K) |
+| KV pool available | 9.13 GiB at gmu=0.98 with `--skip-mm-profiling` and `--mm-processor-kwargs '{"max_pixels": 4194304}'`, `--max-num-batched-tokens 8192`. Boot log: `GPU KV cache size: ~148,960 tokens` (patch 3 installed; unpatched §6.3 would display ~37K) |
 | Per-token attention KV at BF16 | `4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes = 65,536 bytes/token` (16 GiB at the model's native 262K context) |
+| Maximum concurrency at full max-len | **1.13×** at the §8.2 production flags (one full-context request fits with ~13% slack — `monkey_patch_hybrid_kv_allocator.py:335`) |
 | `preserve_thinking` | Set as server-wide default via `--default-chat-template-kwargs '{"preserve_thinking": true}'` |
 | MTP speculative decoding | OFF (head present in the AWQ checkpoint as BF16 but auto-skipped at load; §5.3) |
-| Patches in this repo | 7 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
+| Patches in this repo | 8 strict, fail-loud Python monkey-patches (§7), all server-side, loaded before `vllm serve` starts. Zero client-side code |
 
 ---
 
@@ -34,7 +35,7 @@ Five non-negotiable correctness requirements:
 1. **Tool calling that actually works in multi-turn agent loops** — no silent failures.
 2. **Preserved thinking across tool turns** — historical `<think>` blocks remain visible to the model on subsequent turns.
 3. **Vision input at full preprocessing fidelity** — vision encoder kept BF16; HF `Qwen3VLImageProcessor` semantics preserved.
-4. **65,536-token `--max-model-len` at BF16 KV cache precision** (FP8 KV rejected; §5.1).
+4. **131,072-token `--max-model-len` at BF16 KV cache precision** (FP8 KV rejected; §5.1).
 5. **Stability over a marginal throughput gain** — MTP off; rationale §5.3.
 
 Every software pin, every launch flag, every server-side monkey-patch in this repo exists to uphold them simultaneously.
@@ -45,7 +46,7 @@ Every software pin, every launch flag, every server-side monkey-patch in this re
 
 | Component | Spec | Why it matters |
 |---|---|---|
-| GPU | NVIDIA RTX 5090, 32 GB VRAM | Largest consumer Blackwell card. 32 GB is the binding constraint: dictates 4-bit AWQ weights and `--max-model-len 65536`. |
+| GPU | NVIDIA RTX 5090, 32 GB VRAM | Largest consumer Blackwell card. 32 GB is the binding constraint: dictates 4-bit AWQ weights and the §3 `--max-model-len` ceiling. |
 | GPU compute capability | SM 12.0 (Blackwell consumer) | Native FP4 tensor cores (unused by AWQ, used by FlashInfer where dispatched). |
 | Host OS | Linux (not WSL2) | dxgkrnl on WSL2 does not expose Blackwell's native FP8 tensor cores. |
 | Host CUDA | 13.0 (runtime) | Image's PyTorch links against CUDA 12.9 — runs on host CUDA 13.0 via NVIDIA's forward-compat layer. |
@@ -111,7 +112,7 @@ Qwen3.6-27B is a **dense** vision-language model with a hybrid attention pattern
   - **16 full (softmax) attention layers** at indices 3, 7, 11, …, 63 — the only layers whose KV cache grows with context.
   - **48 Gated DeltaNet** linear-attention layers — fixed-size recurrent state, does not grow with context.
 - **Attention config of full layers**: `num_attention_heads=24`, `num_key_value_heads=4`, `head_dim=256`, `hidden_size=5120`, `intermediate_size=17408`. GQA with low KV-head count keeps per-token KV small.
-- **Native context**: `max_position_embeddings=262144` (we cap at 65,536 for VRAM reasons).
+- **Native context**: `max_position_embeddings=262144` (we cap at 131,072; rationale §5.2).
 - **Vocabulary**: `vocab_size=248320`.
 - **Rotary positional embedding**: M-RoPE; used for both text and vision tokens.
 - **Vision encoder**: 27-layer Qwen3-VL tower, BF16, bundled into the main checkpoint.
@@ -127,13 +128,15 @@ The hybrid attention pattern is why the KV-cache memory math diverges from a pur
 
 `--kv-cache-dtype auto` (resolves to BF16). FP8 KV halves KV memory but requires per-tensor or per-head scaling factors to preserve numerical range. Qwen3.6-27B-AWQ does not ship calibrated FP8 KV scales — vLLM falls back to scale=1.0, which is the documented cause of mild long-context quality drift. SGLang's docs flag the same hazard: *"these FP8 checkpoints do not include pre-calibrated KV cache scaling factors; SGLang defaults to scale 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks."* For a reasoning model in an agentic pipeline this is unacceptable. Rotation-based low-bit KV (TurboQuant) does not yet support hybrid attention + GDN architectures in vLLM.
 
-### 5.2 Max context length: 65,536 tokens
+### 5.2 Max context length: 131,072 tokens
 
-`--max-model-len 65536`. The byte budget on a 32 GiB card after weights + activations + CUDA-graph profiling + vision profiling reservation leaves ~5.26 GiB for KV at gmu=0.92 with `--max-num-batched-tokens 8192`. At per-token attention KV of 65,536 bytes/token for 27B (4 KV heads × 256 head_dim × 2 (K+V) × 16 attn layers × 2 bytes), one full-context request fits with ~30% headroom. Boot log reports `GPU KV cache size: ~28K tokens` unpatched (under-reported by ~4× due to the §6.3 hybrid-KV bug); with patch 3 installed → **111,328 tokens** under the §8.2 production flags. The model's native 262K context would require 16.0 GiB of attention-only KV — does not fit on this card without dropping precision.
+`--max-model-len 131072`. The byte budget on a 32 GiB card at gmu=0.98 with `--skip-mm-profiling` (vision capability preserved at runtime; §5.8) and `--max-num-batched-tokens 8192` leaves **9.13 GiB** for KV — the boot log reports `GPU KV cache size: 148,960 tokens` (patch 3 §7.3 installed; the unpatched line would read ~37K under #6.3). At the per-token attention KV pinned in §3 (65,536 bytes/token), one full-context request fits with **1.13× concurrency** — the maximum we can keep without crossing into runtime-OOM territory. The model's native 262K context would need 16.0 GiB of attention-only KV; that doesn't fit without dropping precision (FP8 KV rejected, §5.1).
 
-`--max-num-batched-tokens 8192` is the right setting for a 32 GiB Blackwell card. vLLM's activation-memory profiler reserves ~3.16 KV-pool tokens for every +1 batched-token slot the scheduler can admit; 8192 vs 16384 gives back **~26K KV-pool tokens** to actual request capacity. The hard ceiling is ~22,692 batched tokens — above that, `scheduler_reserve_full_isl=True` rejects 65K-context admissions outright. The H100-derived 16384 default sized for 70 GiB-class hardware would buy ~200 ms saved on a single 60K-token cold-prefill (one extra prefill chunk) at the cost of dropping that 26K of KV pool; warm-path agent latency (90%+ prefix-cache hits) is invariant to the budget. Cold-session 60K-fresh prompts pay the extra chunk **once per session**.
+`--gpu-memory-utilization 0.98`. The hard ceiling on this hardware is `floor(free_memory / total_memory × 100) / 100 = 0.98` — vLLM's snapshot check at `vllm/v1/worker/utils.py:412` compares `requested = total × gmu` against `init_snapshot.free_memory`, which is taken **after** vLLM's own ~510 MiB CUDA-context init (PyTorch + cuBLAS/cuDNN + FlashAttention v2 + NIXL). That semantic — penalising vLLM for its own footprint — is closed by patch §7.8, which lets us cleanly land at 0.98. Beyond 0.98 (i.e. gmu=0.99) the runtime hits a torch.compile MLP-buffer OOM under fragmentation (272 MiB allocation needed, ~200 MiB physically free); 0.98 leaves ~520 MiB of slack and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (§8.2) eliminates the fragmentation pattern.
 
-`--gpu-memory-utilization 0.92` is the empirical knee: lower wastes pool, higher risks Triton-warmup OOM.
+`--max-num-batched-tokens 8192`. vLLM's `_dummy_run(max_num_tokens, is_profile=True)` reserves activation peak ~linear in this number for the LM forward; the encoder-cache budget is `max(mnbt, max_tokens_per_mm_item)` so reducing mnbt below 16,384 does **not** shrink encoder memory (it stays at the per-image cap). 8192 is the auto-default sweet spot: prefill is chunked (33 chunks for one 130K-token cold prompt vs 17 at 16384) but the saved ~200-400 MiB of LM-activation peak is needed to clear gmu=0.98 with safety. Warm-path agent latency (90%+ prefix-cache hits) is invariant to the budget; cold-session full-context prefills pay the extra chunks **once per session**.
+
+The admission gate (`scheduler_reserve_full_isl=True`, default) refuses any request whose ISL doesn't fit in the free KV pool — chunking is *within*-request, not *across* — so for a single in-flight max-len request to admit cleanly the pool must hold the full ISL. 148,960 ≥ 131,072 with ~17K slack — the 1.13× concurrency above.
 
 ### 5.3 MTP speculative decoding: OFF
 
@@ -176,17 +179,35 @@ The separate `reasoning` vs `reasoning_content` wire-format mismatch (§6.1 inge
 ### 5.8 Multimodal cost accounting
 
 - **Vision encoder weights** (~0.83 GiB) are always resident in VRAM, whether or not any request contains an image. Subsumed into the boot weights footprint.
-- **Vision encoder profiling reservation** (~1.56 GiB) is paid at boot if `--limit-mm-per-prompt` admits any image or video modality. Binary switch: `image: 1` and `image: 3` pay the same tax. Setting `{image: 0, video: 0, audio: 0}` reclaims it.
+- **Vision encoder profiling at boot is intentionally skipped** via `--skip-mm-profiling` (§8.2). The flag bypasses `gpu_model_runner.profile_run()`'s encoder dummy pass (`vllm/v1/worker/gpu_model_runner.py:5754-5817`), reclaiming ~1.56 GiB of profiler reservation that maps to ~25.6K KV tokens. **Runtime vision is unaffected** — `_execute_mm_encoder` runs on demand on real images and writes into `encoder_cache[mm_hash]`. The flag's only safety cost is that vLLM no longer measures the encoder peak at boot, so it cannot cross-check that runtime peaks fit. We mitigate by capping per-image vision tokens (next bullet) so the runtime peak is bounded; the bound holds inside the gmu=0.98 budget.
+- **Per-image vision-token cap**: `--mm-processor-kwargs '{"max_pixels": 4194304}'` (§8.2) bounds the largest admissible image at 4 megapixels (~2048×2048), which Qwen3-VL tokenizes into at most 4,096 vision tokens (`max_pixels / (patch_size × merge_size)² / merge_size² = max_pixels / 1024`). Without this cap, the default 16,777,216-pixel ceiling lets a single image consume 16,384 KV-pool slots and produces an unbounded `embed_multimodal` activation peak that would OOM `_execute_mm_encoder` unrecoverably with `--skip-mm-profiling` enabled. 4 MP covers screenshots and document images cleanly; photos at 4K resolution are downscaled at preprocessing.
 - **Per-request transient activations** are small (+2–10 MiB measured for 896×896 to 1792×1792 images); absorbed by safety headroom.
-- **Image and video tokens occupy the KV pool**: ~256 tokens for 512×512, ~787 for 896×896, ~3,136 for 1792×1792, up to ~16,384 per image at the processor cap. Videos scale dramatically — short clips ~750–1,500 tokens; medium clips ~10,000–20,000; long clips can exceed 50,000. Bound video size with `--mm-processor-kwargs '{"video": {"max_frames": 64, "fps": 1}}'` if accepting untrusted clips.
+- **Image and video tokens occupy the KV pool**: ~256 tokens for 512×512, ~787 for 896×896, ~3,136 for 1792×1792, up to **4,096 per image at the 4-MP cap above**. Videos scale dramatically — short clips ~750–1,500 tokens; medium clips ~10,000–20,000; long clips can exceed 50,000. Bound video size with `--mm-processor-kwargs '{"video": {"max_frames": 64, "fps": 1}}'` if accepting untrusted clips.
 
 `--limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}'` is **load-bearing**: omitting the flag defaults to 999 per modality, which **crashes the boot** on this nightly + SM 12.0 (post-profiling TensorRT-LLM `throwRuntimeError`). Safe range is `image ∈ {0, 1, 2, 3}`. Audio stays 0: Qwen3.6 is text+vision only.
+
+**Client-side modality gate hazard**. The Qwen Code CLI's `defaultModalities()` regex falls through to a text-only catch-all for `Qwen3.6-27B-AWQ` (and any `qwen-` model name not matching `qwen3-vl-*`, `qwen3.{5,6}-plus`, `qwen-vl-*`, or `coder-model`). With the default, the CLI's converter replaces every `image_url` part with `[Unsupported image file: …]` text **before the request leaves the client** — vision is silently disabled regardless of server config. Override in `settings.json`:
+
+```json
+{
+  "model": {
+    "name": "Qwen3.6-27B-AWQ",
+    "generationConfig": {
+      "modalities": { "image": true, "video": true },
+      "splitToolMedia": true,
+      "contextWindowSize": 131072
+    }
+  }
+}
+```
+
+`splitToolMedia: true` is **also load-bearing**. Qwen-Code commit `414b330` (#3617) added a per-message-split path for tool-result media, but defaults to `false`; with the default, MCP-returned screenshots and `read_file`-emitted images stay packed in the `role: "tool"` content array, where vLLM's `chat_utils.py:1549-1564` reduces tool content to `"\n".join(text_items)` — silently dropping every image. Enable the split on the client OR (recommended) fold the auto-split into a future server-side patch.
 
 ---
 
 ## 6. vLLM issues — complete enumeration and per-issue disposition
 
-Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, **C**. Infrastructure bug, or **D**. Client-interop bug. The five surviving §6 entries each correspond to one §7 patch in the same numerical slot.
+Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, **C**. Infrastructure bug, or **D**. Client-interop bug. Each §6 entry pairs with one §7 patch in the same numerical slot, except §6.6 which is sidestepped by API choice.
 
 ### 6.1 Ingest silently drops `reasoning_content` [Class A — vLLM internal inconsistency]
 
@@ -202,7 +223,7 @@ Each issue below is classified as **A**. Runtime bug, **B**. Model OOD failure, 
 
 ### 6.3 Issue #37121 — hybrid-KV scheduler/log under-reports concurrent capacity [Class D — observability bug]
 
-vLLM's V1 paged KV cache manager forms one `KVCacheGroupSpec` per same-shape layer set. For Qwen3.6-27B that's 4 groups (1 full × 16 + 3 GDN × 16). The byte allocator at `vllm/v1/core/kv_cache_utils.py:1148-1169` allocates a single shared pool sized correctly. The bug is purely in *reporting*: `_report_kv_cache_config:1305-1346` and `get_max_concurrency_for_kv_cache_config:802-820` divide by `len(kv_cache_groups)` (4 for our model), so the displayed `GPU KV cache size: X tokens` and `Maximum concurrency` are ~4× understated. For the 27B-AWQ build: boot log says `GPU KV cache size: ~28K tokens`; with patch 3 installed → `~111K tokens`. Operators sizing `--max-model-len` against the displayed number under-utilize their hardware.
+vLLM's V1 paged KV cache manager forms one `KVCacheGroupSpec` per same-shape layer set. For Qwen3.6-27B that's 4 groups (1 full × 16 + 3 GDN × 16). The byte allocator at `vllm/v1/core/kv_cache_utils.py:1148-1169` allocates a single shared pool sized correctly. The bug is purely in *reporting*: `_report_kv_cache_config:1305-1346` and `get_max_concurrency_for_kv_cache_config:802-820` divide by `len(kv_cache_groups)` (4 for our model), so the displayed `GPU KV cache size: X tokens` and `Maximum concurrency` are ~4× understated. For the 27B-AWQ build under §8.2 production flags: boot log says `GPU KV cache size: ~37K tokens` unpatched; with patch 3 installed → `~149K tokens`. Operators sizing `--max-model-len` against the displayed number under-utilize their hardware.
 
 **Upstream status (2026-04-28)**: issue #37121 open since 2026-03-15. PR #40384 (narrow scheduler-reporting fix, our backport source) and competing PR #40694 both open. PR #37429 (broader byte-level redesign) blocked on RFC.
 
@@ -224,11 +245,17 @@ Qwen3.6 occasionally emits `<tool_call>...</tool_call>` markup inside `<think>..
 
 `vllm/entrypoints/openai/responses/serving.py:1377` has a hardcoded `assert len(delta_message.tool_calls) == 1`. **Affects us**: no — we use Chat Completions.
 
+### 6.7 Startup snapshot check semantically double-counts vLLM's own init footprint [Class C — infrastructure bug]
+
+`vllm/v1/worker/utils.py:412-421`'s `request_memory()` raises `ValueError` whenever `init_snapshot.free_memory < total_memory * gpu_memory_utilization`. The intent — refuse to come up if external CUDA processes are starving the device — is correct, but the implementation is semantically wrong: `init_snapshot` is taken **inside the EngineCore worker after** PyTorch CUDA-context init, cuBLAS/cuDNN init, FlashAttention v2 workspace, and NIXL collectives have already allocated ~510 MiB on this stack. That ~510 MiB is part of vLLM's own footprint — accounted for downstream as `non_torch_memory + torch_peak_increase` and reserved out of `requested_memory` anyway — yet the check counts it as "external pressure" and refuses any `gpu_memory_utilization > ~0.984` on a single-tenant exclusive GPU. Operators with iGPU + dGPU layouts (the dGPU is exclusive) cannot land at gmu close to 1.0 even though no other process is using the card.
+
+**Affects us**: yes — it caps the achievable KV pool at gmu=~0.98 minus the engine's init delta, leaving roughly 0.32 GiB of reachable KV unclaimable without patching. **Resolution**: §7.8.
+
 ---
 
 ## 7. The patches in this repo
 
-Seven monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patch 3; see §7.S). There is no client-side code in this repo.
+Eight monkey-patches plus one container-entrypoint launcher plus one sitecustomize loader. Every patch is **server-side**, loaded into the vLLM Python process by `launch_with_patches.py` (in PID 1) and re-loaded by `sitecustomize.py` in spawned EngineCore subprocesses (load-bearing for patches 3 and 8; see §7.S). There is no client-side code in this repo.
 
 Each patch addresses a specific defect named in §6 (or, for patches 6 and 7, a §5 design requirement) and only that defect. Each strictly validates its target's structure via landmarks, refuses to apply on any landmark mismatch with a typed exception that names the exact landmark that failed, stamps `__qwen36_patch__` on every target, and verifies via both `getattr` and `inspect.getattr_static` that its install took effect. The patch file itself is the source of truth; this section is a contract index.
 
@@ -241,8 +268,9 @@ Each patch addresses a specific defect named in §6 (or, for patches 6 and 7, a 
 | 5 | [`monkey_patch_tool_call_in_think_detector.py`](monkey_patch_tool_call_in_think_detector.py) | §6.5 / #39056 — detect `<tool_call>` emitted inside `<think>`, structured WARNING |
 | 6 | [`monkey_patch_default_sampling_params.py`](monkey_patch_default_sampling_params.py) | §5.6 — server-side enforcement of Qwen3.6 sampling Best Practices for fields the client did not explicitly send |
 | 7 | [`monkey_patch_qwen3_coder_grammar.py`](monkey_patch_qwen3_coder_grammar.py) | §5.6 / agentic-correctness — server-side xgrammar `structural_tag` constraint on tool emission; flips `supports_required_and_named=False` to close a latent JSON-list-path bug |
-| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 7 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
-| S | [`sitecustomize.py`](sitecustomize.py) | CPython auto-imports this from `PYTHONPATH=/opt/patches` at every interpreter startup — including the spawned EngineCore subprocess — so patch 3's targets are live in EngineCore's own `sys.modules` |
+| 8 | [`monkey_patch_request_memory_snapshot.py`](monkey_patch_request_memory_snapshot.py) | §6.7 — make the startup snapshot check stop double-counting vLLM's own init footprint as "external pressure" |
+| L | [`launch_with_patches.py`](launch_with_patches.py) | Container entrypoint that imports the 8 patches in order, runs per-patch verification, then hands off to `vllm.entrypoints.cli.main` via `runpy.run_module(alter_sys=True)` |
+| S | [`sitecustomize.py`](sitecustomize.py) | CPython auto-imports this from `PYTHONPATH=/opt/patches` at every interpreter startup — including the spawned EngineCore subprocess — so patches 3 and 8's targets are live in EngineCore's own `sys.modules` |
 
 ### 7.1 Patch 1 — `monkey_patch_reasoning_field_ingest.py`
 
@@ -254,7 +282,7 @@ Replaces `Qwen3CoderToolParser._parse_xml_function_call` to use `str.find(">")` 
 
 ### 7.3 Patch 3 — `monkey_patch_hybrid_kv_allocator.py`
 
-Replaces `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config` in `vllm.v1.core.kv_cache_utils`. Both reporting sites divide by `len(kv_cache_groups)` (4 for our model: 1 attn + 3 GDN), making displayed token capacity ~4× understated. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`). Boot-log `GPU KV cache size` goes from `~28K tokens` to `~111K tokens`. Backport semantics, not literal port — the pinned commit's `MambaSpec.max_memory_usage_bytes` signature is `(self, vllm_config)`, not the master signature PR #40384 targets. **Removal trigger**: PR #40384 or PR #40694 merges. **CRITICAL**: remove BEFORE pulling an image with PR #37429 (the broader byte-level redesign) — it changes the tensor layout and the patch's reporting view would no longer be coherent.
+Replaces `get_max_concurrency_for_kv_cache_config` and `_report_kv_cache_config` in `vllm.v1.core.kv_cache_utils`. Both reporting sites divide by `len(kv_cache_groups)` (4 for our model: 1 attn + 3 GDN), making displayed token capacity ~4× understated. Patched to filter `kv_cache_groups` to token-capacity-contributing specs only (`AttentionSpec` always; `MambaSpec` only when `cache_config.mamba_cache_mode == "all"`). Under §8.2 production flags, boot-log `GPU KV cache size` goes from `~37K tokens` to `~149K tokens`. Backport semantics, not literal port — the pinned commit's `MambaSpec.max_memory_usage_bytes` signature is `(self, vllm_config)`, not the master signature PR #40384 targets. **Removal trigger**: PR #40384 or PR #40694 merges. **CRITICAL**: remove BEFORE pulling an image with PR #37429 (the broader byte-level redesign) — it changes the tensor layout and the patch's reporting view would no longer be coherent.
 
 ### 7.4 Patch 4 — `monkey_patch_reasoning_field_egress.py`
 
@@ -281,21 +309,25 @@ Does NOT fix the `<tool_call>`-in-`<think>` model OOD case (§6.5 / patch 5). Th
 
 **Removal triggers**: vLLM merges `Qwen3CoderToolParser.adjust_request` upstream OR ships a `qwen3_xml` parser with grammar enforcement (PR #25028 community recommendation).
 
+### 7.8 Patch 8 — `monkey_patch_request_memory_snapshot.py`
+
+Replaces `vllm.v1.worker.utils.request_memory` to fix the §6.7 semantic bug. The original compares `requested_memory = total × gmu` against `init_snapshot.free_memory`; we compare against `init_snapshot.free_memory + INIT_SLACK` instead, where `INIT_SLACK` is a generous bound on vLLM's own post-init CUDA-context footprint (1 GiB by default; tunable via `QWEN36_VLLM_INIT_SLACK_MIB` env var for hosts whose footprint differs). The replacement returns a byte-identical `int` to all downstream consumers (`gpu_worker.py:421-424`'s `available_kv_cache_memory_bytes` math is unchanged); only the gate threshold changes. The original safety intent — fail loud when EXTERNAL processes consume significant GPU memory — is preserved: the patch still raises if external pressure exceeds the slack. Three import-time behavioural probes prove (a) the buggy predicate is still present in the image (forces a re-audit if upstream landed a fix), (b) the patched function returns the expected `ceil(total × gmu)` on the failure-mode probe, (c) a negative-control probe with external pressure > slack still raises. Without this patch, `--gpu-memory-utilization 0.98` is unreachable on this stack — boot fails with `Free memory on device cuda:0 (30.85/31.36 GiB) on startup is less than desired GPU memory utilization (0.98, 30.73 GiB)` even on an exclusive dGPU. **Removal trigger**: vLLM upstream rewrites `request_memory` to either measure pre-init or accept a slack parameter; the buggy `init_snapshot.free_memory < requested_memory` predicate is the landmark — any rewrite changes its shape and forces this patch to refuse.
+
 ### 7.L Launcher — `launch_with_patches.py`
 
 Container entrypoint, replacing `["vllm", "serve"]` with `["python", "/opt/patches/launch.py", "serve", ...]`. Imports every registered patch in `_PATCH_MODULES` order, runs the per-patch `_PATCH_VERIFICATION` verifier for each (re-imports the relevant vLLM target FROM SCRATCH and asserts the install took effect), then hands off to vLLM's CLI via `runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__", alter_sys=True)`. Required because `PYTHONSTARTUP` does not fire under non-interactive entrypoints.
 
-Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5, 6, 7 carry tag-only launcher verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications carry the load-bearing functional verification (the egress patch's wire-dump check; the ingest patch's static-lookup check; patch 6's five behavioural cases at Phase 7; patch 7's four behavioural cases at Phase 9 plus a load-bearing `xgr.Grammar.from_structural_tag` round-trip), so duplicating it here would only double the surface area. Patch 7's launcher verifier additionally asserts `Qwen3CoderToolParser.supports_required_and_named is False`.
+Verifiers split into two classes. Patches 2 and 3 carry **behavioural** verifiers — they instantiate the patched class with a synthetic input designed to expose the bug and assert the post-patch return value. Patches 1, 4, 5, 6, 7, 8 carry tag-only launcher verifiers (with `getattr` and `inspect.getattr_static` agreement); their patch-internal Phase verifications carry the load-bearing functional verification (the egress patch's wire-dump check; the ingest patch's static-lookup check; patch 6's five behavioural cases at Phase 7; patch 7's four behavioural cases at Phase 9 plus a load-bearing `xgr.Grammar.from_structural_tag` round-trip; patch 8's three behavioural probes — original-raises-on-buggy-input, patched-accepts-on-same-input, patched-still-raises-on-external-pressure), so duplicating it here would only double the surface area. Patch 7's launcher verifier additionally asserts `Qwen3CoderToolParser.supports_required_and_named is False`.
 
 Three pre-flight checks run BEFORE the per-patch import loop: sitecustomize-present (refuse if Debian's stub got loaded instead of ours), registry drift (refuse if `sitecustomize._PATCH_MODULES != launch_with_patches._PATCH_MODULES`), and a subprocess install probe (`subprocess.run([sys.executable, "-c", PROBE])` to confirm a freshly-spawned interpreter sees patched targets). All three are load-bearing for patch 3 — without them, the spawned EngineCore silently runs unpatched code while the launcher reports success. **Load order** matters: `reasoning_field_egress` (patch 4) must come before any patch that constructs `DeltaMessage` at request time, since the rebuild changes Pydantic's compiled schema.
 
 ### 7.S sitecustomize loader — `sitecustomize.py`
 
-vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the seven patches, **only patch 3** (`monkey_patch_hybrid_kv_allocator`) targets EngineCore-resident code; patches 1, 2, 4, 5, 6, 7 target API-server-resident code and become live in PID 1 directly. Without `sitecustomize`, patch 3 is silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~28K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~111K tokens).
+vLLM v1 spawns EngineCore as a `multiprocessing` child process via `spawn` (CUDA forbids `fork` after init). The spawned interpreter does not inherit `sys.modules`. Of the eight patches, **patches 3 and 8** target EngineCore-resident code (`monkey_patch_hybrid_kv_allocator` for the KV-cache reporting path, `monkey_patch_request_memory_snapshot` for the worker's startup `request_memory` check); patches 1, 2, 4, 5, 6, 7 target API-server-resident code and become live in PID 1 directly. Without `sitecustomize`, patches 3 and 8 are silently dead in EngineCore while the launcher's PID-1 verifier reports success. The pass/fail discriminator for patch 3 is the boot-log filename annotation: `[kv_cache_utils.py:NNN]` (unpatched, ~37K tokens) vs `[monkey_patch_hybrid_kv_allocator.py:NNN]` (patched, ~149K tokens). For patch 8 the discriminator is whether the boot ValueError fires at gmu > ~0.984 (unpatched, snapshot-check too strict) or the engine reaches "Application startup complete" (patched).
 
 CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interpreter startup, including spawned children. With `PYTHONPATH=/opt/patches`, `site.py` finds our file, which imports each patch in launcher order. Each patch's strict landmark check runs in EngineCore too; any refusal aborts startup loudly. The same flow runs in PID 1 — sitecustomize installs the patches, `launch.py` then hits cache via `importlib.import_module(...)`. Each patch's module-level code fires once.
 
-**Load-bearing for**: patch 3. **Defense-in-depth for**: patches 1, 2, 4, 5, 6, 7. **Removal trigger**: when patch 3 is removed; recommendation is to keep for defense-in-depth.
+**Load-bearing for**: patches 3 and 8. **Defense-in-depth for**: patches 1, 2, 4, 5, 6, 7. **Removal trigger**: when both patches 3 and 8 are removed; recommendation is to keep for defense-in-depth.
 
 ---
 
@@ -305,7 +337,7 @@ End-to-end production sequence. Follow §8.1 → §8.5 in order from a fresh clo
 
 ### 8.1 Pull the Docker image (one-time)
 
-**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the seven patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
+**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the eight patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
 
 This is deliberate. Three properties fall out of it:
 
@@ -345,9 +377,11 @@ docker run -d --name qwen36 --gpus all \
   -v "$PWD/monkey_patch_tool_call_in_think_detector.py:/opt/patches/monkey_patch_tool_call_in_think_detector.py:ro" \
   -v "$PWD/monkey_patch_default_sampling_params.py:/opt/patches/monkey_patch_default_sampling_params.py:ro" \
   -v "$PWD/monkey_patch_qwen3_coder_grammar.py:/opt/patches/monkey_patch_qwen3_coder_grammar.py:ro" \
+  -v "$PWD/monkey_patch_request_memory_snapshot.py:/opt/patches/monkey_patch_request_memory_snapshot.py:ro" \
   -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \
   -e HF_HUB_ENABLE_HF_TRANSFER=1 \
   -e PYTHONPATH=/opt/patches \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --entrypoint python3 \
   vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
   /opt/patches/launch.py serve \
@@ -355,19 +389,21 @@ docker run -d --name qwen36 --gpus all \
   --revision 9b507bdc9afafb87b7898700cc2a591aa6639461 \
   --served-model-name Qwen3.6-27B-AWQ \
   --host 127.0.0.1 --port 8001 \
-  --max-model-len 65536 \
-  --gpu-memory-utilization 0.92 \
+  --max-model-len 131072 \
+  --gpu-memory-utilization 0.98 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --enable-prefix-caching \
+  --skip-mm-profiling \
+  --mm-processor-kwargs '{"max_pixels": 4194304}' \
   --default-chat-template-kwargs '{"preserve_thinking": true}' \
   --limit-mm-per-prompt '{"image": 2, "video": 1, "audio": 0}' \
   -cc '{"cudagraph_capture_sizes":[1,2,4,8]}'
 ```
 
-Each flag's rationale lives in §5. Load-bearing items: `--limit-mm-per-prompt` (default crashes boot, §5.8); `--max-model-len 65536` (byte budget, §5.2); `--max-num-batched-tokens 8192` (sized to leave one full-context KV slot at gmu=0.92 — the activation-memory profiler reserves ~3.16 KV-pool tokens per +1 batched token, so a higher prefill chunk trades ~3.16× of KV pool for fewer steps on cold long prompts; the hard ceiling at this `--max-model-len` is ~22,692, above which `scheduler_reserve_full_isl=True` rejects 65K-context admissions); `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` (tool calling); `--reasoning-parser qwen3` (server-side `<think>` extraction); `--default-chat-template-kwargs '{"preserve_thinking": true}'` (§5.7); `-cc '{"cudagraph_capture_sizes":[1,2,4,8]}'` (pins the auto-derivation that vLLM produces for `--max-num-seqs 4` at `vllm/config/vllm.py:1434-1586` — drift-immune across image bumps); `--host 127.0.0.1` + `--network host` (loopback-only — do not change to `0.0.0.0` on a publicly-routable host without an authenticating reverse proxy; vLLM has no built-in auth); `sitecustomize.py` bind-mount (load-bearing for patch 3, see §7.S). Operational: `--restart unless-stopped` (auto-recover from engine crash); `--log-opt` rotation (bound docker log disk usage); `--health-cmd` (docker-native shallow liveness against `/health` — for deep wedge detection see §8.4). `--swap-space` is intentionally omitted (popped at LLM-API level and rejected by the CLI argparse in this image).
+Each flag's rationale lives in §5. Load-bearing items: `--max-model-len 131072` and `--gpu-memory-utilization 0.98` (byte budget, §5.2 — gmu=0.98 is reachable only with patch §7.8 installed; without it, the snapshot check refuses anything > ~0.984); `--skip-mm-profiling` paired with `--mm-processor-kwargs '{"max_pixels": 4194304}'` (§5.8 — the cap bounds the runtime encoder peak, which is otherwise unmeasured and unsafe with `--skip-mm-profiling`); `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (eliminates the runtime fragmentation pattern that otherwise hits a 272 MiB MLP-buffer OOM at gmu near 0.98); `--limit-mm-per-prompt` (default crashes boot, §5.8); `--max-num-batched-tokens 8192` (auto-default for our hardware bucket; the encoder cache stays at `max(mnbt, 16384) = 16384` regardless, so reducing mnbt only shrinks LM-activation peak — and that peak is what gmu=0.98 needs to clear; §5.2); `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` (tool calling); `--reasoning-parser qwen3` (server-side `<think>` extraction); `--default-chat-template-kwargs '{"preserve_thinking": true}'` (§5.7); `-cc '{"cudagraph_capture_sizes":[1,2,4,8]}'` (pins the auto-derivation that vLLM produces for `--max-num-seqs 4` at `vllm/config/vllm.py:1434-1586` — drift-immune across image bumps); `--host 127.0.0.1` + `--network host` (loopback-only — do not change to `0.0.0.0` on a publicly-routable host without an authenticating reverse proxy; vLLM has no built-in auth); `sitecustomize.py` bind-mount (load-bearing for patches 3 and 8, see §7.S). Operational: `--restart unless-stopped` (auto-recover from engine crash); `--log-opt` rotation (bound docker log disk usage); `--health-cmd` (docker-native shallow liveness against `/health` — for deep wedge detection see §8.4). `--swap-space` is intentionally omitted (popped at LLM-API level and rejected by the CLI argparse in this image).
 
 ### 8.3 Wait for healthy, run warmup, run smoke test
 
@@ -383,18 +419,18 @@ for i in $(seq 1 60); do
 done
 [ "$status" = "healthy" ] || { echo "qwen36 not healthy: $status"; exit 1; }
 
-# Step 2: confirm /v1/models reports the served name and 65,536 ctx.
+# Step 2: confirm /v1/models reports the served name and 131,072 ctx.
 curl -fs http://127.0.0.1:8001/v1/models | jq -e \
-  '.data[0].id == "Qwen3.6-27B-AWQ" and .data[0].max_model_len == 65536'
+  '.data[0].id == "Qwen3.6-27B-AWQ" and .data[0].max_model_len == 131072'
 
 # Step 3: confirm /metrics responds (Prometheus scrape target).
 curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics  # expect 200
 
-# Step 4: confirm all 7 distinct patch tags applied. Each patch loads in
+# Step 4: confirm all 8 distinct patch tags applied. Each patch loads in
 # three processes (PID 1 launcher, pre-flight install probe, EngineCore
 # spawn child) and emits one applied: line per loading, so the un-deduped
-# line count is ~21; dedupe to count distinct tags.
-docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 7
+# line count is ~24; dedupe to count distinct tags.
+docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 8
 ```
 
 ```bash
@@ -468,8 +504,8 @@ systemd-timer equivalent (substitute for the cron line if your host uses systemd
 Sign off all of these before declaring the deployment ready:
 
 - [ ] `docker inspect -f '{{.State.Health.Status}}' qwen36` reports `healthy`.
-- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **7** (the seven distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~21**.
-- [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **65536**.
+- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **8** (the eight distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~24**.
+- [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **131072**.
 - [ ] `curl -fs -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics` returns **200**.
 - [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0**.
 - [ ] §8.3 step 6 smoke test returns `finish_reason == "tool_calls"` with `tool_calls[0].function.name == "calculator"` (patch §7.7 pins the function name to a registered tool — name hallucination cannot reach the wire). Argument-body schema is **not** xgrammar-enforced (see §7.7 "What this does NOT close"); validate `tool_calls[0].function.arguments` against your schema client-side if the agent needs strict shape.
@@ -501,17 +537,17 @@ Sign off all of these before declaring the deployment ready:
 
 ## 11. Validation status
 
-210-prompt corpus served 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). 2026-04-27 production-flag run (container `qwen36` on `127.0.0.1:8001`, §8.2 flags) closed B4 / B6 / B7 — artifacts under `/tmp/qwen36_research/validation_2026-04-27/`.
+210-prompt corpus served 2026-04-25 (Hebrew + ancient-Egyptian + emoji, 0% true garbling). Production §8.2 flags exercised against container `qwen36` on `127.0.0.1:8001` over 2026-04-27 (B4/B6/B7 close, §8.2 baseline) and 2026-04-28 (high-context expansion to 131K). Artifacts under `/tmp/qwen36_research/validation_2026-04-27/` and `/tmp/qwen36_research/max_context_tests_2026-04-28/`.
 
 | ID | Path | Status | Coverage |
 |---|---|---|---|
 | **B1** | Tool-bearing requests | **Partial** | 5-turn agentic round-trip of `tool_calls[]`; parallel tools, deeply nested params, `anyOf` not yet a dedicated corpus. |
 | **B2** | `<tool_call>`-in-`<think>` | **Detector-validated** | §7.5 emits structured WARNING; retry policy belongs to the agent. |
 | **B3** | Multi-turn `reasoning_content` round-trip | **Validated** | PRESERVE/STRIPPED/CORRUPTED arms distinguishable; 5-turn round-trip. |
-| **B4** | Vision input | **Validated** | 2 real images correctly described (`disc5_imgs/img1.png`, `img2.png`); negative control without image hallucinates unrelated content. |
+| **B4** | Vision input | **Validated** | 2 real images correctly described (`disc5_imgs/img1.png`, `img2.png`); also re-validated under `--skip-mm-profiling` (§5.8) — runtime vision unaffected. Negative control without image hallucinates unrelated content. |
 | **B5** | Streaming correctness | **Validated** | `reasoning_content` round-trips across deltas. |
 | **B6** | Concurrency stress | **Validated** | 4 concurrent at 30K input tokens each fully admitted (peak Running=3, peak KV usage 76.6%, no OOM); 4×10K thinking-on shows 1.50× speedup over serial (peak Running=4). |
-| **B7** | Long-context retrieval | **Validated (single-needle)** | Needle recalled at 32K @ depth 10/50/90% and 60K @ depth 50%; negative control did not invent. RULER multi-needle / multi-distractor not exercised. |
+| **B7** | Long-context retrieval | **Validated (single-needle to 99%)** | At 131K `--max-model-len`: needle recalled at 125,661 tokens depth 10%, 125,662 depth 90%, and **129,840 (99.06% of max) at depth 50%** — every recall correct. Earlier 32K @ depth 10/50/90% and 60K @ depth 50% also hold. RULER multi-needle / multi-distractor not exercised. |
 
 What remains: B1 schema-variation corpus and B7 multi-needle RULER. Neither is gated by the patches; both depend on workload-specific fixtures.
 
@@ -531,8 +567,10 @@ Re-evaluate the pinned versions when:
 8. **Qwen3.6 retraining eliminates the OOD mid-think `<tool_call>` emission** — remove patch 5.
 9. **vLLM ships first-class server-side model-recommended sampling defaults** (e.g., `--default-sampling-params` widened to respect `model_fields_set`) — remove patch 6.
 10. **vLLM merges `Qwen3CoderToolParser.adjust_request` upstream OR ships `qwen3_xml` with grammar enforcement** — remove patch 7.
-11. **vLLM ships workload-aware CUDA-graph capture-size defaults** — drop the `-cc '{"cudagraph_capture_sizes":[...]}'` pin from §8.2.
-12. **vLLM issue #38182 (MTP + prefix cache) closes** — reconsider enabling MTP.
+11. **vLLM rewrites `request_memory()` to either measure pre-init or accept a slack parameter** (the buggy `init_snapshot.free_memory < requested_memory` predicate is the landmark) — remove patch 8.
+12. **vLLM ships workload-aware CUDA-graph capture-size defaults** — drop the `-cc '{"cudagraph_capture_sizes":[...]}'` pin from §8.2.
+13. **vLLM issue #38182 (MTP + prefix cache) closes** — reconsider enabling MTP.
+14. **vLLM auto-splits tool-role media** (image/audio/video parts in `role: "tool"` content arrays into a follow-up user message instead of the current silent flatten-to-text-and-drop at `chat_utils.py:1549-1564`) — clients no longer need `splitToolMedia: true` (§5.8). This is also a candidate for an additional server-side patch in this repo if the upstream fix is slow to land.
 
 Each is tracked; none urgent.
 
@@ -543,7 +581,7 @@ Each is tracked; none urgent.
 ```
 .
 ├── README.md                                              # this document
-├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 7 patches then runpys vLLM
+├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 8 patches then runpys vLLM
 ├── sitecustomize.py                                       # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
 ├── health_probe.sh                                        # §8.4 — host-side deep liveness probe; engine-decoded-a-token check
 ├── monkey_patch_reasoning_field_ingest.py                 # §7.1 — accept reasoning_content on inbound assistant messages
@@ -553,8 +591,9 @@ Each is tracked; none urgent.
 ├── monkey_patch_tool_call_in_think_detector.py            # §7.5 — detect <tool_call> emitted inside <think>; structured WARNING
 ├── monkey_patch_default_sampling_params.py                # §7.6 — server-side Qwen3.6 sampling defaults for unset fields
 ├── monkey_patch_qwen3_coder_grammar.py                    # §7.7 — xgrammar structural_tag on tool emission; supports_required_and_named=False
+├── monkey_patch_request_memory_snapshot.py                # §7.8 — startup snapshot check stops double-counting vLLM's own init footprint
 └── tests/
     └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
 ```
 
-Nine Python files (7 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.
+Ten Python files (8 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.

@@ -52,6 +52,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_tool_call_in_think_detector",
     "monkey_patch_default_sampling_params",
     "monkey_patch_qwen3_coder_grammar",
+    "monkey_patch_request_memory_snapshot",
 )
 
 

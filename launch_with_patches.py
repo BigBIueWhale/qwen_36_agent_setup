@@ -597,6 +597,38 @@ def _verify_qwen3_coder_grammar(patch_module: ModuleType) -> None:
         )
 
 
+def _verify_request_memory_snapshot(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_request_memory_snapshot`` replaced the
+    module-level function ``vllm.v1.worker.utils.request_memory``.
+
+    Tag-only check at the launcher: the patch's own Phases 4 and 7
+    construct synthetic ``MemorySnapshot``-like probes and assert (a)
+    the original raised on the buggy probe (proves the bug landmark is
+    still present in this image), (b) the patched function returns the
+    expected ``ceil(total*gmu)`` for the same probe, and (c) a
+    negative-control probe (external pressure exceeding slack) still
+    raises (proves the original safety intent survives). Re-doing that
+    here would duplicate the patch's load-bearing verification — the
+    launcher need only confirm the install propagated to the target via
+    both attribute lookup and ``inspect.getattr_static``.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.v1.worker import utils as _utils_mod
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import vllm.v1.worker.utils for "
+            f"verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        _utils_mod,
+        "request_memory",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="vllm.v1.worker.utils",
+    )
+
+
 # --------------------------------------------------------------------
 # Registry. Order matters — see module docstring.
 # --------------------------------------------------------------------
@@ -630,6 +662,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_tool_call_in_think_detector",
     "monkey_patch_default_sampling_params",
     "monkey_patch_qwen3_coder_grammar",
+    "monkey_patch_request_memory_snapshot",
 )
 
 _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
@@ -640,6 +673,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_tool_call_in_think_detector": _verify_tool_call_in_think_detector,
     "monkey_patch_default_sampling_params": _verify_default_sampling_params,
     "monkey_patch_qwen3_coder_grammar": _verify_qwen3_coder_grammar,
+    "monkey_patch_request_memory_snapshot": _verify_request_memory_snapshot,
 }
 
 
