@@ -1129,16 +1129,20 @@ def section_10_sitecustomize_and_readme() -> None:
             docker_run,
         )
 
-        # 2026-04-28: prefill batch flag reverted to the 32 GiB-bucket
-        # right value; H100-default 16384 wasted ~26K KV-pool tokens.
+        # 2026-04-28 (later): mnbt dropped to 4096 after the Pillars-of-Creation
+        # 20×4MP test exposed an LM-prefill MLP buffer OOM at mnbt=8192. The
+        # smaller chunk halves the (s≈mnbt, intermediate=17408) fp16 MLP buffer
+        # from ~285→~142 MiB; the freed activation budget at boot reroutes into
+        # the KV pool (9.13→9.9 GiB / 148,960→161,504 tokens), which in turn
+        # enables --max-model-len 131072→152000. README §5.2 / §11 row B9-B10.
         run.expect_in(
-            "README §8.2 docker run uses --max-num-batched-tokens 8192",
-            "--max-num-batched-tokens 8192",
+            "README §8.2 docker run uses --max-num-batched-tokens 4096",
+            "--max-num-batched-tokens 4096",
             docker_run,
         )
         run.expect_not_in(
-            "README §8.2 docker run does NOT use --max-num-batched-tokens 16384",
-            "--max-num-batched-tokens 16384",
+            "README §8.2 docker run does NOT still use --max-num-batched-tokens 8192",
+            "--max-num-batched-tokens 8192",
             docker_run,
         )
 

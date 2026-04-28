@@ -1,22 +1,53 @@
-"""Strict, fail-loud runtime patch for vLLM hybrid-KV scheduler-budget bug #37121.
+"""Strict, fail-loud runtime patch for vLLM hybrid-KV log under-reporting (#37121).
 
-Why this patch must exist: two sites in ``vllm/v1/core/kv_cache_utils.py``
-divide by ``len(kv_cache_groups)`` instead of by attention-only groups —
-``get_max_concurrency_for_kv_cache_config`` at lines 802-820 and
-``_report_kv_cache_config`` at lines 1305-1346. For Qwen3.6-27B (1 full
-attn + 3 GDN-mamba groups = 4 groups) the boot-log line ``GPU KV cache
-size: X tokens`` is **~4× understated** (``28K`` displayed vs. ``~113K``
-actual), and operators sizing ``--max-model-len`` against the displayed
-number under-utilize their hardware. The math is verifiably wrong; PRs
-#40384 / #40694 are the upstream fixes. Backport semantics, not literal
-port — this commit's ``MambaSpec.max_memory_usage_bytes`` signature is
-``(self, vllm_config)``, not master's signature PR #40384 targets.
+Why this patch must exist. Two log functions in
+``vllm/v1/core/kv_cache_utils.py`` divide by
+``len(kv_cache_groups)`` instead of by the count of token-capacity-
+contributing groups — ``get_max_concurrency_for_kv_cache_config``
+at lines 802-820 and ``_report_kv_cache_config`` at lines
+1305-1346. For Qwen3.6-27B (1 full attn group + 3 GDN-mamba groups
+= 4 groups; the GDN groups are O(1) per request under
+``mamba_cache_mode != "all"``) this makes the boot-log lines
+``GPU KV cache size: X tokens`` and ``Maximum concurrency: X.XXx``
+~4× understated — at the §8.2 production flags, ``~37K tokens`` /
+``0.28x`` displayed vs. ``~149K tokens`` / ``1.13x`` after this
+patch. Operators sizing ``--max-model-len`` against the displayed
+numbers under-utilize the card. The math is verifiably wrong;
+the upstream issue is #37121 and PRs #40384 / #40694 are the open
+candidate fixes.
 
-Risk: this patch touches the request-admission accounting path; wrong
-values over-credit capacity → OOM at runtime. Mitigation: refuse
-install on any landmark mismatch, refuse per-call on a malformed
-KVCacheConfig in the admission-path function, and leave upstream's
-correct allocator to do the byte work.
+Where these functions actually sit in the pinned commit. Both are
+reached only from the boot-time log path:
+``unify_kv_cache_configs:1629`` → ``_report_kv_cache_config:1305`` →
+``get_max_concurrency_for_kv_cache_config:802``. Neither is wired
+into the request-admission gate — that is
+``KVCacheManager.can_fit_full_sequence`` at ``kv_cache_manager.py:218``,
+which uses ``block_pool.get_num_free_blocks()`` on the byte-correct
+shared pool and is independent of these reporters. So the
+user-visible effect of the unpatched bug is one wrong number per
+boot — not OOM, not wrong admission, not wrong allocation.
+
+Scope vs PR #40384. PR #40384 in master fixes
+``_report_kv_cache_config`` and a ``Scheduler.__init__`` site that
+computes ``max_num_kv_tokens`` for the routed-experts capturer
+buffer. This patch backports ``_report_kv_cache_config`` *and*
+additionally fixes ``get_max_concurrency_for_kv_cache_config``
+(same divisor pattern, second log line at boot, untouched by PR
+#40384). It deliberately does NOT backport the scheduler.py site:
+that site is gated on ``model_config.enable_return_routed_experts``
+(default ``False`` in ``ModelConfig``) and only fires for MoE
+deployments with routed-expert capture — Qwen3.6-27B is dense and
+we never set the flag. Porting code under an off-by-default gate
+we never trip is churn for no benefit and would only widen the
+patch's removal surface. Backport semantics, not literal port —
+the pinned commit's ``MambaSpec.max_memory_usage_bytes`` signature
+is ``(self, vllm_config)``, not the master signature PR #40384
+targets, so the helper is rebuilt locally rather than imported.
+
+Defensive shape validation in ``_validate_kv_cache_config_shape``
+is kept anyway: cheap, and refuses on a malformed KVCacheConfig
+rather than emit a plausible-but-wrong float if a future upstream
+change ever wires either function into a non-log consumer.
 
 Target: vLLM commit ``8cd174fa358326d5cc4195446be2ebcd65c481ce``.
 **Removal trigger**: PR #40384 or #40694 merges. **CRITICAL**: remove
@@ -72,10 +103,14 @@ _logger = init_logger(f"vllm.qwen36_patches.{__name__}")
 class HybridKvPatchRefusedError(RuntimeError):
     """Precondition for the hybrid-KV patch was violated.
 
-    Raised at import time only. Wrong values on the request-admission
-    path OOM the GPU at request time in a manner that looks like a
-    model-side timeout rather than the accounting bug it actually is —
-    refusing to boot is strictly safer.
+    Raised at import time only. The patched functions are log-only in
+    the pinned commit (call graph in the module docstring), so a wrong
+    value would corrupt the boot-log numbers operators rely on for
+    capacity planning rather than OOM at request time — but a silently
+    wrong boot log is exactly what makes this class of bug hard to
+    notice. Refusing to boot on any landmark drift surfaces the
+    divergence loudly, and forward-protects against the case where a
+    future upstream change wires either function into a non-log path.
     """
 
 
@@ -204,7 +239,8 @@ def _group_contributes_to_token_capacity(
     ``cache_config.mamba_cache_mode == "all"`` (per
     ``MambaSpec.max_memory_usage_bytes`` branch at lines 403-405);
     otherwise Mamba is O(1) per request and excluded. Unknown spec
-    subclass → conservative True (under-credit rather than OOM-risk).
+    subclass → conservative True (under-report the boot-log capacity
+    rather than over-report it).
     """
     spec = group.kv_cache_spec
     if isinstance(spec, AttentionSpec):
@@ -222,9 +258,11 @@ def _group_contributes_to_token_capacity(
 
 
 def _validate_kv_cache_config_shape(kv_cache_config: object, fn: str) -> KVCacheConfig:
-    """Per-call defensive guard for the request-admission function. Refuse
-    on inputs that don't match the contract rather than producing a
-    wrong-but-plausible value.
+    """Per-call defensive shape guard. In the pinned commit both targets
+    are reached only from the boot-time log path, so this validation is
+    future-proofing — refuse on a malformed KVCacheConfig rather than
+    return a plausible-but-wrong float if a future upstream change ever
+    routes either function into a non-log consumer.
     """
     if not isinstance(kv_cache_config, KVCacheConfig):
         raise TypeError(
