@@ -559,7 +559,7 @@ curl -s http://127.0.0.1:8001/v1/chat/completions \
   }' | jq .
 ```
 
-Operational: vLLM exports Prometheus metrics at `/metrics` — scrape for KV cache pressure, queue depth, request latency. Patch §7.5 emits `model_emit_warning kind=tool_call_in_reasoning` to docker logs when the model misbehaves; alert on it via your log-forwarder.
+Operational: vLLM exports Prometheus metrics at `/metrics` — scrape for KV cache pressure, queue depth, request latency. Patch §7.5 emits `model_emit_warning kind=tool_call_in_reasoning` to docker logs when the model misbehaves; the host-side forwarder in §8.5 turns those into structured JSON Lines for alerting and ad-hoc queries.
 
 ### 8.4 Set up the wedge-recovery probe (deep liveness)
 
@@ -584,7 +584,41 @@ CRON
 
 systemd-timer equivalent (substitute for the cron line if your host uses systemd timers): `OnUnitActiveSec=60s` unit running the same `||`-chained command.
 
-### 8.5 Production-ready checklist
+### 8.5 Set up the §7.5 model_emit_warning forwarder
+
+Patch §7.5 emits one structured WARNING per request whose reasoning contains `<tool_call>` markup, with `marker_count` reporting how many substrings were seen (rate is single-digit % under agentic workloads). The line is machine-parseable by design: `model_emit_warning kind=tool_call_in_reasoning reasoning_len=<int> marker_count=<int>`. By default it lands in `docker logs` and stays there. [`host_logs/qwen36_warning_forwarder.py`](host_logs/qwen36_warning_forwarder.py) tails `docker logs -f`, parses each line with a strict regex anchored on the patch's exact format string (line 84 of the patch source), and appends one JSON Lines record per event to `/var/log/qwen36/warnings.jsonl`. A line that matches the marker prefix but fails the full regex is treated as a LOUD parse error: it goes to stderr/journald and increments `parse_errors` in the state file — silent drops are precisely what makes monitoring useless.
+
+JSONL schema, one object per line:
+
+```
+{"ts": "<ISO-8601 UTC>", "kind": "tool_call_in_reasoning", "reasoning_len": <int>, "marker_count": <int>, "raw": "<original docker line>"}
+```
+
+Install (idempotent — rerun safe):
+
+```bash
+sudo bash host_logs/install.sh
+```
+
+That copies the script to `/usr/local/bin/`, the unit to `/etc/systemd/system/`, creates `/var/log/qwen36/` and `/var/lib/qwen36/`, runs `systemctl daemon-reload`, and enables/starts the service. Verify:
+
+```bash
+systemctl status qwen36-warning-forwarder.service
+journalctl -u qwen36-warning-forwarder -f
+tail -f /var/log/qwen36/warnings.jsonl
+cat /var/lib/qwen36/forwarder_state.json   # events_total, restart_count, parse_errors
+```
+
+Sample query — tool-call-in-reasoning events in the last hour:
+
+```bash
+HOUR_AGO="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S)"
+jq -r --arg t "$HOUR_AGO" 'select(.ts > $t)' /var/log/qwen36/warnings.jsonl | wc -l
+```
+
+Without systemd: run `python3 host_logs/qwen36_warning_forwarder.py --output … --state …` directly, or fold it into your own supervisor. `--no-stdout` suppresses the JSON line on stdout when only file output is wanted. `kill -HUP $(pgrep -f qwen36_warning_forwarder)` rotates the output file in place; `kill -TERM` graceful-shuts with a `shutdown: events=N restarts=M parse_errors=K` banner to stderr.
+
+### 8.6 Production-ready checklist
 
 Sign off all of these before declaring the deployment ready:
 
@@ -593,6 +627,7 @@ Sign off all of these before declaring the deployment ready:
 - [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **152000**.
 - [ ] `curl -fs -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics` returns **200**.
 - [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0**.
+- [ ] `systemctl is-active qwen36-warning-forwarder.service` returns **active** and `cat /var/lib/qwen36/forwarder_state.json | jq .parse_errors` returns **0** (a non-zero parse_errors means the §7.5 format string drifted upstream — re-audit before declaring ready).
 - [ ] §8.3 step 6 smoke test returns `finish_reason == "tool_calls"` with `tool_calls[0].function.name == "calculator"` (patch §7.7 pins the function name to a registered tool — name hallucination cannot reach the wire). Argument-body schema is **not** xgrammar-enforced (see §7.7 "What this does NOT close"); validate `tool_calls[0].function.arguments` against your schema client-side if the agent needs strict shape.
 
 ---
@@ -687,8 +722,13 @@ Each is tracked; none urgent.
 ├── monkey_patch_request_memory_snapshot.py                # §7.8 — startup snapshot check stops double-counting vLLM's own init footprint
 ├── monkey_patch_tool_role_media_preserve.py               # §7.9 — preserve list-shaped tool-role content with media so the chat template renders <|vision_start|><|image_pad|><|vision_end|> inside <tool_response>
 ├── monkey_patch_mm_cache_validator_eviction.py            # §7.10 — clear renderer sender mm-cache on validator throw; closes #31404 retry-poison HTTP-500
+├── host_logs/
+│   ├── qwen36_warning_forwarder.py                        # §8.5 — host-side; tails docker logs, parses §7.5 warnings into JSONL
+│   ├── qwen36-warning-forwarder.service                   # §8.5 — systemd unit (Type=simple, After=docker.service)
+│   └── install.sh                                         # §8.5 — idempotent installer for script + unit + dirs
 └── tests/
-    └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
+    ├── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
+    └── test_warning_forwarder.py                          # §8.5 forwarder unit tests (no docker; pure Python)
 ```
 
-Twelve Python files (10 patches + launcher + sitecustomize) plus the host-side probe shell script and one test file.
+Twelve Python files (10 patches + launcher + sitecustomize) plus the host-side probe shell script, the host-side warning forwarder bundle (`host_logs/`), and two test files.
