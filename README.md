@@ -420,11 +420,11 @@ CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interp
 End-to-end production sequence from a fresh clone:
 
 ```bash
-sudo bash install.sh /home/user/.cache/huggingface   # §8.1 + §8.2 + §8.4
+sudo bash install.sh /home/user            # §8.1 + §8.2 + §8.4
 # wait for healthy, then verify per §8.3, then sign off §8.5
 ```
 
-[`install.sh`](install.sh) takes one **required** positional argument: the host directory to bind-mount as the HuggingFace cache (`/root/.cache/huggingface` inside the container). There is no default — `sudo` clobbers `HOME=/root` and silently binding `/root/.cache/huggingface` would force a ~14 GiB model re-download every install. The script refuses to start without the explicit path, with a suggested example. The directory must already exist.
+[`install.sh`](install.sh) takes one **required** positional argument: the host directory to bind-mount at `/root` inside the container. This makes everything the engine writes under `~/.cache/` — HuggingFace model weights (~14 GiB for QuantTrio/Qwen3.6-27B-AWQ), vLLM Triton compile cache (~355 MB), FlashInfer JIT kernel cache, pip cache — persistent across container restarts at zero re-download / re-compile cost. There is no default — `sudo` clobbers `HOME=/root` and silently binding `/root` would lose every cache on every fresh install. The script refuses to start without the explicit path. The directory must already exist. **Security trade-off**: this exposes the entire home directory to the container; for a single-user dev box where you trust the digest-pinned upstream `vllm-openai` image that's acceptable, but on shared boxes narrow the bind to `~/.cache/` instead by editing the docker-run `-v` flag in [`install.sh`](install.sh).
 
 [`install.sh`](install.sh) is the canonical, executable form of §8.1 + §8.2 + §8.4. It pulls the pinned digest, stops+removes any existing `qwen36` container (override-by-design), `docker run`s the canonical config with all bind-mounts, then runs [`host_ops/install.sh`](host_ops/install.sh). [`uninstall.sh`](uninstall.sh) is the inverse: it **validates** the running container's image RepoDigests against the pinned digest, **refuses to act on a digest mismatch** (exits non-zero, leaves everything intact), and otherwise stops + removes the container (preserving the docker image) and runs [`host_ops/uninstall.sh`](host_ops/uninstall.sh). The sections below explain *why* each piece is the way it is; the *what* lives in the scripts.
 

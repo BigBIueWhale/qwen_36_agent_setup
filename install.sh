@@ -6,18 +6,29 @@
 # deep-liveness probe).
 #
 # Usage (from anywhere; the script resolves its own path):
-#     sudo bash install.sh <hf-cache-dir>
+#     sudo bash install.sh <home-dir>
 #
 # Example:
-#     sudo bash install.sh /home/user/.cache/huggingface
+#     sudo bash install.sh /home/user
 #
-# The <hf-cache-dir> argument is REQUIRED — it is the host directory that
-# will be bind-mounted at /root/.cache/huggingface inside the container,
-# which is where vLLM caches downloaded model weights. There is NO default
-# and NO inference (sudo resets HOME=/root, which would silently bind the
-# wrong directory and force a ~14 GiB re-download every time). Pass the
-# correct path explicitly. The directory must already exist; we don't
+# The <home-dir> argument is REQUIRED — it is the host directory that
+# will be bind-mounted at /root inside the container. This makes
+# everything under /home/user/.cache/ (huggingface model weights,
+# vLLM Triton cache, FlashInfer JIT cache, pip cache, etc.) persistent
+# across container restarts at zero re-download / re-compile cost.
+# There is NO default and NO inference (sudo resets HOME=/root, which
+# would silently bind /root and lose all caches every fresh install).
+# Pass the path explicitly. The directory must already exist; we don't
 # create it (creating root-owned dirs in a user's home is a footgun).
+#
+# Security trade-off: this exposes the entire user home directory to
+# the container, not just .cache/. The container runs as root inside
+# the network namespace, so it can read/write any file under <home-dir>
+# (including .ssh, .gnupg, dotfiles). For a single-user dev box where
+# you trust the upstream vllm-openai image, that's acceptable — the
+# image is digest-pinned and runs unmodified. For shared boxes or
+# where the home contains untrusted-process secrets, narrow the bind
+# to ~/.cache/ instead by editing the docker-run -v flag below.
 #
 # Idempotent by design. If a container named ``qwen36`` already exists,
 # this script STOPS AND REMOVES it, then recreates from the pinned image.
@@ -45,35 +56,37 @@ set -Eeuo pipefail
 # -o pipefail: pipeline fails if any stage fails (catches `cmd1 | cmd2` masking)
 
 # ---------------------------------------------------------------------
-# Argument: HF cache directory (required, no default, no inference).
+# Argument: user home directory (required, no default, no inference).
 # ---------------------------------------------------------------------
 
 if [ $# -ne 1 ]; then
     cat >&2 <<EOF
-install.sh: missing required argument: <hf-cache-dir>
+install.sh: missing required argument: <home-dir>
 
 Usage:
-    sudo bash install.sh <hf-cache-dir>
+    sudo bash install.sh <home-dir>
 
 Suggested:
-    sudo bash install.sh /home/user/.cache/huggingface
+    sudo bash install.sh /home/user
 
-The directory must already exist. It is bind-mounted at
-/root/.cache/huggingface inside the container, which is where vLLM
-caches downloaded model weights (~14 GiB for QuantTrio/Qwen3.6-27B-AWQ).
+The directory must already exist. It is bind-mounted at /root inside
+the container, so everything under <home-dir>/.cache/ (HuggingFace
+model weights, vLLM Triton cache, FlashInfer JIT cache, pip cache)
+becomes persistent across container restarts. Without this bind,
+QuantTrio/Qwen3.6-27B-AWQ (~14 GiB) re-downloads every fresh install
+and Triton kernels recompile on every cold start (~10-30 s).
 EOF
     exit 1
 fi
 
-HF_CACHE_DIR="$1"
+HOME_DIR="$1"
 
-if [ ! -d "${HF_CACHE_DIR}" ]; then
+if [ ! -d "${HOME_DIR}" ]; then
     cat >&2 <<EOF
-install.sh: HF cache directory does not exist: ${HF_CACHE_DIR}
+install.sh: home directory does not exist: ${HOME_DIR}
 
-Create it first (as the invoking user, not as root, so the cache is
-owned by the right user):
-    mkdir -p ${HF_CACHE_DIR}
+Create it first (or pass the correct path):
+    mkdir -p ${HOME_DIR}
 EOF
     exit 1
 fi
@@ -87,7 +100,7 @@ fi
 # ---------------------------------------------------------------------
 
 if [ "${EUID}" -ne 0 ]; then
-    echo "install.sh: must run as root (try: sudo bash install.sh ${HF_CACHE_DIR})" >&2
+    echo "install.sh: must run as root (try: sudo bash install.sh ${HOME_DIR})" >&2
     exit 1
 fi
 
@@ -184,12 +197,16 @@ DOCKER_RUN_ARGS=(
     --health-cmd 'curl -fsS http://127.0.0.1:8001/health || exit 1'
     --health-interval=30s --health-timeout=5s --health-retries=3
 
-    # --- HuggingFace model cache (persistent across container life) -
-    # Bind-mounts the explicitly-passed HF_CACHE_DIR (CLI arg) at the
-    # in-container HF cache path. Required-arg-not-defaulted because
-    # sudo clobbers HOME=/root which would silently bind the wrong dir
-    # and force a ~14 GiB re-download.
-    -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
+    # --- User home directory (persistent caches under .cache/) -------
+    # Bind-mounts the explicitly-passed HOME_DIR (CLI arg) at /root
+    # inside the container. Inside, vLLM and friends look at
+    # /root/.cache/{huggingface,vllm,flashinfer,pip}; mapping the
+    # whole home means every cache hits the host filesystem at
+    # <home-dir>/.cache/* and survives container teardown — no
+    # re-download (~14 GiB), no Triton recompile (~10-30 s).
+    # Required-arg-not-defaulted because sudo clobbers HOME=/root
+    # which would silently bind /root and lose all caches.
+    -v "${HOME_DIR}:/root"
 
     # --- sitecustomize.py — load-bearing for patches 3 and 8 --------
     # CPython auto-imports sitecustomize at every interpreter startup
