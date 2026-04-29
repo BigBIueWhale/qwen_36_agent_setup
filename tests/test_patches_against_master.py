@@ -1152,7 +1152,7 @@ def section_10_sitecustomize_and_readme() -> None:
     # off the host's interfaces. Find the docker run command (between
     # ```bash ... ```), then check it contains the expected flags.
     docker_run_re = re.compile(
-        r"```bash\s*\n(docker run.*?)```", re.DOTALL
+        r"```bash\s*\n((?:sudo\s+)?docker run.*?)```", re.DOTALL
     )
     docker_run_matches = docker_run_re.findall(readme_src)
     run.expect_eq(
@@ -1298,6 +1298,57 @@ def section_10_sitecustomize_and_readme() -> None:
     run.expect_in(
         f"README references EXPECTED_COMMIT={EXPECTED_COMMIT[:12]}…",
         EXPECTED_COMMIT,
+        readme_src,
+    )
+
+    # Pinned image digest is referenced in three places — README §8.2,
+    # install.sh, and uninstall.sh. Drift between any two is a bug:
+    # install.sh would launch a container uninstall.sh's validator
+    # would then refuse to remove. Catch divergence here.
+    install_src = (PATCH_DIR / "install.sh").read_text()
+    uninstall_src = (PATCH_DIR / "uninstall.sh").read_text()
+    digest_in_install = re.search(
+        r'IMAGE_DIGEST="(sha256:[0-9a-f]{64})"', install_src
+    )
+    digest_in_uninstall = re.search(
+        r'EXPECTED_DIGEST="(sha256:[0-9a-f]{64})"', uninstall_src
+    )
+    run.expect(
+        "install.sh declares IMAGE_DIGEST as a sha256:... constant",
+        digest_in_install is not None,
+    )
+    run.expect(
+        "uninstall.sh declares EXPECTED_DIGEST as a sha256:... constant",
+        digest_in_uninstall is not None,
+    )
+    if digest_in_install and digest_in_uninstall:
+        run.expect_eq(
+            "install.sh IMAGE_DIGEST == uninstall.sh EXPECTED_DIGEST",
+            digest_in_install.group(1),
+            digest_in_uninstall.group(1),
+        )
+        run.expect_in(
+            "README §8.2 references the same pinned digest",
+            digest_in_install.group(1),
+            readme_src,
+        )
+
+    # The §8.2 docker run block and install.sh's docker run must use the
+    # same container name — if these drift, uninstall.sh's validator
+    # looks for the wrong container.
+    run.expect_in(
+        "install.sh declares CONTAINER_NAME=qwen36",
+        'CONTAINER_NAME="qwen36"',
+        install_src,
+    )
+    run.expect_in(
+        "uninstall.sh declares CONTAINER_NAME=qwen36",
+        'CONTAINER_NAME="qwen36"',
+        uninstall_src,
+    )
+    run.expect_in(
+        "README §8.2 docker run uses --name qwen36",
+        "--name qwen36",
         readme_src,
     )
 

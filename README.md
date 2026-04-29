@@ -419,6 +419,8 @@ CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interp
 
 End-to-end production sequence. Follow §8.1 → §8.5 in order from a fresh clone of this repo. The single canonical `docker run` block lives in §8.2 and is the only `docker run` in this README.
 
+**One-command convenience**: [`install.sh`](install.sh) at the repo root does §8.1 + §8.2 + §8.4 in one go (`sudo bash install.sh`) and is idempotent — re-running stops + removes any existing `qwen36` container and recreates from the pinned digest. [`uninstall.sh`](uninstall.sh) is the inverse: it validates the running `qwen36` container's image against the pinned digest, **refuses to act on a digest mismatch**, then stops + removes the container (preserving the docker image) and runs [`host_ops/uninstall.sh`](host_ops/uninstall.sh). The §8.1 → §8.4 walkthrough below is the same canonical commands the scripts run, kept here for the per-flag rationale.
+
 ### 8.1 Pull the Docker image (one-time)
 
 **There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the ten patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
@@ -432,9 +434,9 @@ This is deliberate. Three properties fall out of it:
 Pull the digest now (one-time per host):
 
 ```bash
-docker pull vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba
+sudo docker pull vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba
 
-docker inspect vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
+sudo docker inspect vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
   --format '{{.Id}} {{.Architecture}}'
 ```
 
@@ -445,7 +447,7 @@ The published `vllm/vllm-openai` images are built by vLLM CI from each commit; w
 Run from the root of this repo (so `$PWD` resolves to the directory holding the patch files). The launcher refuses to come up if `sitecustomize.py` or any registered patch is missing from `/opt/patches/`, so a missed bind-mount fails loud at boot rather than silently at request time.
 
 ```bash
-docker run -d --name qwen36 --gpus all \
+sudo docker run -d --name qwen36 --gpus all \
   --restart unless-stopped \
   -p 127.0.0.1:8001:8001 \
   --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -499,7 +501,7 @@ These commands run in order. Don't proceed past a step that doesn't pass.
 # Step 1: wait for docker State.Health.Status == healthy (60 s typical;
 # patches and weight load take time). Refuse if not healthy in 5 min.
 for i in $(seq 1 60); do
-  status=$(docker inspect -f '{{.State.Health.Status}}' qwen36 2>/dev/null || true)
+  status=$(sudo docker inspect -f '{{.State.Health.Status}}' qwen36 2>/dev/null || true)
   [ "$status" = "healthy" ] && break
   sleep 5
 done
@@ -516,7 +518,7 @@ curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics  # expe
 # three processes (PID 1 launcher, pre-flight install probe, EngineCore
 # spawn child) and emits one applied: line per loading, so the un-deduped
 # line count is ~30; dedupe to count distinct tags.
-docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 10
+sudo docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l   # expect 10
 ```
 
 ```bash
@@ -599,8 +601,8 @@ WHY — §7.5 emits one structured WARNING per request whose reasoning contains 
 
 Sign off all of these before declaring the deployment ready:
 
-- [ ] `docker inspect -f '{{.State.Health.Status}}' qwen36` reports `healthy`.
-- [ ] `docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **10** (the ten distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~30**.
+- [ ] `sudo docker inspect -f '{{.State.Health.Status}}' qwen36` reports `healthy`.
+- [ ] `sudo docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **10** (the ten distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~30**.
 - [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **152000**.
 - [ ] `curl -fs -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics` returns **200**.
 - [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0**.
@@ -690,6 +692,8 @@ Each is tracked; none urgent.
 ```
 .
 ├── README.md                                              # this document
+├── install.sh                                             # §8 — one-command global installer (sudo); pulls image, runs container, installs host_ops bundle
+├── uninstall.sh                                           # §8 — global uninstaller (sudo); validates digest, stops+removes container, runs host_ops/uninstall.sh
 ├── launch_with_patches.py                                 # §7.L — container entrypoint; imports the 10 patches then runpys vLLM
 ├── sitecustomize.py                                       # §7.S — auto-loads patches in EngineCore (and PID 1) at interpreter startup
 ├── monkey_patch_reasoning_field_ingest.py                 # §7.1 — accept reasoning_content on inbound assistant messages
@@ -708,7 +712,8 @@ Each is tracked; none urgent.
 │   ├── qwen36-deep-probe.timer                            # §8.4.1 — fires the .service every 60s (OnUnitActiveSec=60s)
 │   ├── qwen36_warning_forwarder.py                        # §8.4.2 — long-running daemon; tails docker logs, parses §7.5 WARNINGs into JSONL
 │   ├── qwen36-warning-forwarder.service                   # §8.4.2 — systemd unit (Type=simple, restart-on-failure)
-│   └── install.sh                                         # §8.4 — idempotent installer for both bundles
+│   ├── install.sh                                         # §8.4 — idempotent installer for both bundles
+│   └── uninstall.sh                                       # §8.4 — idempotent uninstaller (mirrors install.sh in reverse)
 └── tests/
     ├── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
     └── test_warning_forwarder.py                          # §8.4.2 forwarder unit tests (no docker; pure Python)
