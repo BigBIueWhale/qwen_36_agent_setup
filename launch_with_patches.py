@@ -45,9 +45,15 @@ auditing this file in isolation): ``sitecustomize.py`` bind-mount
 ``monkey_patch_hybrid_kv_allocator`` is silently dead in the EngineCore
 subprocess); ``PYTHONPATH=/opt/patches`` (CPython's ``site.py`` finds
 sitecustomize on it); ``--entrypoint python3`` (overrides the image's
-``[vllm, serve]``); ``--network host`` plus ``--host 127.0.0.1``
-(loopback-only binding so /v1/* and /metrics are not world-accessible);
-``--restart unless-stopped`` (auto-recover from engine crash);
+``[vllm, serve]``); bridge networking with ``-p 127.0.0.1:8001:8001``
+plus ``--host 0.0.0.0`` *inside* the container — the container's own
+network namespace seals every internal vLLM socket (EngineCore ZMQ
+IPC, NIXL, prometheus collector, distributed-init port) and only the
+explicit publish crosses to the host, on host loopback only. **Do
+NOT use ``--network host``** — it shares the host's net namespace and
+exposes EngineCore's IPC port on the host's all-interfaces;
+``--host 127.0.0.1`` does not constrain that, only the OpenAI HTTP
+bind. ``--restart unless-stopped`` (auto-recover from engine crash);
 ``--health-cmd 'curl /health'`` (shallow liveness — deep wedge probe
 lives at ``host_ops/qwen36_deep_probe.sh`` per README §8.4).
 

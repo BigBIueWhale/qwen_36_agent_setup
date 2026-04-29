@@ -24,7 +24,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=qwen36-deep-probe
 
-# Light hardening — the script reads from one localhost HTTP endpoint
+# Light hardening — the script reads from one 127.0.0.1 HTTP endpoint
 # and may invoke `docker restart`. NoNewPrivileges keeps the blast radius
 # bounded; we don't restrict ReadWritePaths because docker.sock access is
 # required for the recovery path.
