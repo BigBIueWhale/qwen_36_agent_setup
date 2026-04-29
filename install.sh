@@ -109,6 +109,62 @@ if [ "${EUID}" -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------------
+# System pre-flight — host capability gates.
+#
+# Fail loud and early on host misconfigurations that would otherwise
+# crash `docker pull` / `docker run` / `launch.py` with cryptic
+# downstream errors. Three terminal checks; each covers multiple
+# failure modes at once, and none rely on string-version parsing or
+# pre-pull smoke containers:
+#
+#   - `docker info` succeeds        → docker installed AND daemon up
+#                                      AND we're authorised to talk to it
+#   - `docker info` lists `nvidia`  → nvidia-container-toolkit registered
+#                                      (without it, --gpus all errors with
+#                                      the cryptic "could not select
+#                                      device driver" mid-`docker run`)
+#   - `nvidia-smi` reports ≥ 30 GiB → driver loaded AND the GPU is large
+#     free on GPU 0                   enough AND nothing else (display
+#                                      compositor, another job) is
+#                                      occupying VRAM that gmu=0.97
+#                                      expects to claim. This single
+#                                      check covers (a) driver missing,
+#                                      (b) sub-32 GiB card, (c) the 5090
+#                                      doubling as the display GPU
+#                                      (§2 + §5.2 assume an iGPU drives
+#                                      the desktop and the 5090 is free).
+# ---------------------------------------------------------------------
+
+docker_runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null) || {
+    echo "install.sh: docker not installed, daemon not running, or permission denied" >&2
+    echo "  Diagnose:  sudo systemctl status docker  &&  docker info" >&2
+    exit 1
+}
+if ! grep -q nvidia <<<"${docker_runtimes}"; then
+    echo "install.sh: docker has no 'nvidia' runtime registered" >&2
+    echo "  Install nvidia-container-toolkit, then:" >&2
+    echo "    sudo nvidia-ctk runtime configure --runtime=docker" >&2
+    echo "    sudo systemctl restart docker" >&2
+    exit 1
+fi
+
+free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -n 1) || {
+    echo "install.sh: nvidia-smi not available — NVIDIA driver not loaded?" >&2
+    exit 1
+}
+if [ -z "${free_mib}" ] || [ "${free_mib}" -lt 30000 ]; then
+    cat >&2 <<EOF
+install.sh: GPU 0 has only ${free_mib:-?} MiB free; need >= 30000 MiB.
+
+This deployment runs at --gpu-memory-utilization 0.97 on a 32 GiB card
+(README §5.2). On smaller cards, or on a 5090 that is also driving the
+host display, vLLM will OOM at boot. If the 5090 is driving your
+display, route the desktop through an integrated GPU and re-run.
+EOF
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
 # REPO_DIR: directory holding this script + the bind-mount sources.
 # Robust against being invoked via symlink or from a different $PWD.
 # ---------------------------------------------------------------------
