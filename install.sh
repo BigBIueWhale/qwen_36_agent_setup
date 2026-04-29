@@ -11,24 +11,22 @@
 # Example:
 #     sudo bash install.sh /home/user
 #
-# The <home-dir> argument is REQUIRED — it is the host directory that
-# will be bind-mounted at /root inside the container. This makes
-# everything under /home/user/.cache/ (huggingface model weights,
-# vLLM Triton cache, FlashInfer JIT cache, pip cache, etc.) persistent
-# across container restarts at zero re-download / re-compile cost.
-# There is NO default and NO inference (sudo resets HOME=/root, which
-# would silently bind /root and lose all caches every fresh install).
-# Pass the path explicitly. The directory must already exist; we don't
-# create it (creating root-owned dirs in a user's home is a footgun).
+# The <home-dir> argument is REQUIRED — it is the host directory whose
+# `.cache/` subdirectory is bind-mounted at /root/.cache inside the
+# container. Only `.cache/` is exposed; the rest of the home directory
+# (dotfiles, .ssh, .gnupg, .aws, .docker, Documents, projects, ...)
+# is NOT visible to the container. This makes every cache vLLM and
+# friends write — HuggingFace model weights, vLLM Triton compile cache,
+# FlashInfer JIT cache, pip cache — persistent across container restarts
+# at zero re-download / re-compile cost.
 #
-# Security trade-off: this exposes the entire user home directory to
-# the container, not just .cache/. The container runs as root inside
-# the network namespace, so it can read/write any file under <home-dir>
-# (including .ssh, .gnupg, dotfiles). For a single-user dev box where
-# you trust the upstream vllm-openai image, that's acceptable — the
-# image is digest-pinned and runs unmodified. For shared boxes or
-# where the home contains untrusted-process secrets, narrow the bind
-# to ~/.cache/ instead by editing the docker-run -v flag below.
+# There is NO default and NO inference (sudo resets HOME=/root, which
+# would silently bind /root/.cache and lose all caches every fresh
+# install). Pass the path explicitly.
+#
+# Both the home dir and its .cache/ subdirectory must already exist;
+# we don't create them (creating root-owned dirs in a user's home is
+# a footgun).
 #
 # Idempotent by design. If a container named ``qwen36`` already exists,
 # this script STOPS AND REMOVES it, then recreates from the pinned image.
@@ -69,12 +67,10 @@ Usage:
 Suggested:
     sudo bash install.sh /home/user
 
-The directory must already exist. It is bind-mounted at /root inside
-the container, so everything under <home-dir>/.cache/ (HuggingFace
-model weights, vLLM Triton cache, FlashInfer JIT cache, pip cache)
-becomes persistent across container restarts. Without this bind,
-QuantTrio/Qwen3.6-27B-AWQ (~14 GiB) re-downloads every fresh install
-and Triton kernels recompile on every cold start (~10-30 s).
+Only the <home-dir>/.cache/ subdirectory is bind-mounted into the
+container; the rest of the home (dotfiles, .ssh, .gnupg, .aws, .docker,
+Documents, projects, etc.) stays sealed off. Both <home-dir> and
+<home-dir>/.cache/ must already exist.
 EOF
     exit 1
 fi
@@ -84,9 +80,17 @@ HOME_DIR="$1"
 if [ ! -d "${HOME_DIR}" ]; then
     cat >&2 <<EOF
 install.sh: home directory does not exist: ${HOME_DIR}
+EOF
+    exit 1
+fi
 
-Create it first (or pass the correct path):
-    mkdir -p ${HOME_DIR}
+if [ ! -d "${HOME_DIR}/.cache" ]; then
+    cat >&2 <<EOF
+install.sh: cache directory does not exist: ${HOME_DIR}/.cache
+
+Create it first (as the invoking user, not as root, so the cache is
+owned by the right user):
+    mkdir -p ${HOME_DIR}/.cache
 EOF
     exit 1
 fi
@@ -197,16 +201,16 @@ DOCKER_RUN_ARGS=(
     --health-cmd 'curl -fsS http://127.0.0.1:8001/health || exit 1'
     --health-interval=30s --health-timeout=5s --health-retries=3
 
-    # --- User home directory (persistent caches under .cache/) -------
-    # Bind-mounts the explicitly-passed HOME_DIR (CLI arg) at /root
-    # inside the container. Inside, vLLM and friends look at
-    # /root/.cache/{huggingface,vllm,flashinfer,pip}; mapping the
-    # whole home means every cache hits the host filesystem at
-    # <home-dir>/.cache/* and survives container teardown — no
-    # re-download (~14 GiB), no Triton recompile (~10-30 s).
-    # Required-arg-not-defaulted because sudo clobbers HOME=/root
-    # which would silently bind /root and lose all caches.
-    -v "${HOME_DIR}:/root"
+    # --- Persistent caches (only .cache/, NOT the whole home) -------
+    # Bind-mounts ONLY <home-dir>/.cache/ at /root/.cache/ inside the
+    # container. vLLM and friends write to /root/.cache/{huggingface,
+    # vllm,flashinfer,pip}; with this bind those land at
+    # <home-dir>/.cache/* on the host and survive container teardown —
+    # no re-download (~14 GiB), no Triton recompile (~10-30 s).
+    # The container CANNOT see anything outside <home-dir>/.cache/ on
+    # the host: no .ssh, .gnupg, .aws, .docker, Dockerfiles, .env,
+    # .git-credentials, dotfiles, Documents, projects — nothing else.
+    -v "${HOME_DIR}/.cache:/root/.cache"
 
     # --- sitecustomize.py — load-bearing for patches 3 and 8 --------
     # CPython auto-imports sitecustomize at every interpreter startup
