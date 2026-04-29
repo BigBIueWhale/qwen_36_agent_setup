@@ -6,7 +6,18 @@
 # deep-liveness probe).
 #
 # Usage (from anywhere; the script resolves its own path):
-#     sudo bash install.sh
+#     sudo bash install.sh <hf-cache-dir>
+#
+# Example:
+#     sudo bash install.sh /home/user/.cache/huggingface
+#
+# The <hf-cache-dir> argument is REQUIRED — it is the host directory that
+# will be bind-mounted at /root/.cache/huggingface inside the container,
+# which is where vLLM caches downloaded model weights. There is NO default
+# and NO inference (sudo resets HOME=/root, which would silently bind the
+# wrong directory and force a ~14 GiB re-download every time). Pass the
+# correct path explicitly. The directory must already exist; we don't
+# create it (creating root-owned dirs in a user's home is a footgun).
 #
 # Idempotent by design. If a container named ``qwen36`` already exists,
 # this script STOPS AND REMOVES it, then recreates from the pinned image.
@@ -34,6 +45,40 @@ set -Eeuo pipefail
 # -o pipefail: pipeline fails if any stage fails (catches `cmd1 | cmd2` masking)
 
 # ---------------------------------------------------------------------
+# Argument: HF cache directory (required, no default, no inference).
+# ---------------------------------------------------------------------
+
+if [ $# -ne 1 ]; then
+    cat >&2 <<EOF
+install.sh: missing required argument: <hf-cache-dir>
+
+Usage:
+    sudo bash install.sh <hf-cache-dir>
+
+Suggested:
+    sudo bash install.sh /home/user/.cache/huggingface
+
+The directory must already exist. It is bind-mounted at
+/root/.cache/huggingface inside the container, which is where vLLM
+caches downloaded model weights (~14 GiB for QuantTrio/Qwen3.6-27B-AWQ).
+EOF
+    exit 1
+fi
+
+HF_CACHE_DIR="$1"
+
+if [ ! -d "${HF_CACHE_DIR}" ]; then
+    cat >&2 <<EOF
+install.sh: HF cache directory does not exist: ${HF_CACHE_DIR}
+
+Create it first (as the invoking user, not as root, so the cache is
+owned by the right user):
+    mkdir -p ${HF_CACHE_DIR}
+EOF
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
 # Sudo gate. The systemd installer needs to write under /etc/systemd/system
 # and /usr/local/bin; the docker daemon may also require root depending on
 # the host's docker-group config. We require sudo unconditionally so the
@@ -42,32 +87,15 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------
 
 if [ "${EUID}" -ne 0 ]; then
-    echo "install.sh: must run as root (try: sudo bash install.sh)" >&2
+    echo "install.sh: must run as root (try: sudo bash install.sh ${HF_CACHE_DIR})" >&2
     exit 1
 fi
 
 # ---------------------------------------------------------------------
-# Resolve canonical paths.
+# REPO_DIR: directory holding this script + the bind-mount sources.
+# Robust against being invoked via symlink or from a different $PWD.
 # ---------------------------------------------------------------------
-#
-# REPO_DIR: directory holding this script + the bind-mount sources. Robust
-# against being invoked via symlink or from a different $PWD.
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# INVOKING_USER_HOME: ``sudo`` resets HOME=/root by default, but the
-# HuggingFace cache lives at the invoking user's $HOME/.cache/huggingface.
-# Bind-mounting /root/.cache would force a full re-download on every
-# fresh install. Resolve the real invoking user's home via $SUDO_USER;
-# fall back to $HOME if running as actual root (not via sudo).
-if [ -n "${SUDO_USER:-}" ]; then
-    INVOKING_USER_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
-    [ -n "${INVOKING_USER_HOME}" ] || {
-        echo "install.sh: cannot resolve home directory for SUDO_USER='${SUDO_USER}'" >&2
-        exit 1
-    }
-else
-    INVOKING_USER_HOME="${HOME}"
-fi
 
 # ---------------------------------------------------------------------
 # Pinned upstream image (single source of truth).
@@ -157,11 +185,11 @@ DOCKER_RUN_ARGS=(
     --health-interval=30s --health-timeout=5s --health-retries=3
 
     # --- HuggingFace model cache (persistent across container life) -
-    # Bind-mounts the INVOKING USER's HF cache; INVOKING_USER_HOME is
-    # resolved above to handle the sudo-clobbers-HOME case. Forgetting
-    # this would force a full QuantTrio/Qwen3.6-27B-AWQ re-download
-    # (~14 GiB) on every fresh container.
-    -v "${INVOKING_USER_HOME}/.cache/huggingface:/root/.cache/huggingface"
+    # Bind-mounts the explicitly-passed HF_CACHE_DIR (CLI arg) at the
+    # in-container HF cache path. Required-arg-not-defaulted because
+    # sudo clobbers HOME=/root which would silently bind the wrong dir
+    # and force a ~14 GiB re-download.
+    -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
 
     # --- sitecustomize.py — load-bearing for patches 3 and 8 --------
     # CPython auto-imports sitecustomize at every interpreter startup
