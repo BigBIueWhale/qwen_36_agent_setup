@@ -417,13 +417,18 @@ CPython's `site.py` auto-imports `sitecustomize` from `sys.path` at every interp
 
 ## 8. Deployment commands
 
-End-to-end production sequence. Follow §8.1 → §8.5 in order from a fresh clone of this repo. The single canonical `docker run` block lives in §8.2 and is the only `docker run` in this README.
+End-to-end production sequence from a fresh clone:
 
-**One-command convenience**: [`install.sh`](install.sh) at the repo root does §8.1 + §8.2 + §8.4 in one go (`sudo bash install.sh`) and is idempotent — re-running stops + removes any existing `qwen36` container and recreates from the pinned digest. [`uninstall.sh`](uninstall.sh) is the inverse: it validates the running `qwen36` container's image against the pinned digest, **refuses to act on a digest mismatch**, then stops + removes the container (preserving the docker image) and runs [`host_ops/uninstall.sh`](host_ops/uninstall.sh). The §8.1 → §8.4 walkthrough below is the same canonical commands the scripts run, kept here for the per-flag rationale.
+```bash
+sudo bash install.sh                               # §8.1 + §8.2 + §8.4
+# wait for healthy, then verify per §8.3, then sign off §8.5
+```
 
-### 8.1 Pull the Docker image (one-time)
+[`install.sh`](install.sh) is the canonical, executable form of §8.1 + §8.2 + §8.4. It pulls the pinned digest, stops+removes any existing `qwen36` container (override-by-design), `docker run`s the canonical config with all bind-mounts, then runs [`host_ops/install.sh`](host_ops/install.sh). [`uninstall.sh`](uninstall.sh) is the inverse: it **validates** the running container's image RepoDigests against the pinned digest, **refuses to act on a digest mismatch** (exits non-zero, leaves everything intact), and otherwise stops + removes the container (preserving the docker image) and runs [`host_ops/uninstall.sh`](host_ops/uninstall.sh). The sections below explain *why* each piece is the way it is; the *what* lives in the scripts.
 
-**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the ten patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in §8.2. The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
+### 8.1 Pull the Docker image (no Dockerfile, no rebuild)
+
+**There is no `Dockerfile` and no `docker build` step in this repo.** The deployment runs the upstream `vllm/vllm-openai` image **unmodified**, and the ten patches (plus `sitecustomize.py` and `launch_with_patches.py`) are bind-mounted into the container at `docker run` time via the `-v` flags in [`install.sh`](install.sh). The container's default `["vllm", "serve"]` entrypoint is replaced with `python3 /opt/patches/launch.py serve ...` so the launcher imports every patch — fail-loud on any landmark mismatch — *before* handing off to vLLM's CLI via `runpy`.
 
 This is deliberate. Three properties fall out of it:
 
@@ -431,67 +436,13 @@ This is deliberate. Three properties fall out of it:
 2. **The patches stay reviewable as text.** Each `monkey_patch_*.py` is a plain file in this repo; `git diff` shows exactly what's running. There is no opaque image layer carrying them.
 3. **Removing a patch is one line.** Drop its `-v` mount and its entry in `_PATCH_MODULES`; the next launch comes up without it. (Per §12, every patch has an explicit removal trigger.)
 
-Pull the digest now (one-time per host):
-
-```bash
-sudo docker pull vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba
-
-sudo docker inspect vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
-  --format '{{.Id}} {{.Architecture}}'
-```
-
 The published `vllm/vllm-openai` images are built by vLLM CI from each commit; we don't republish or modify them. If you ever need to rebuild from source — e.g. to bisect upstream — vLLM's own `docker/Dockerfile` is the canonical path; that's an upstream concern and out of scope here.
 
-### 8.2 Launch vLLM
+### 8.2 Launch vLLM — flag rationale
 
-Run from the root of this repo (so `$PWD` resolves to the directory holding the patch files). The launcher refuses to come up if `sitecustomize.py` or any registered patch is missing from `/opt/patches/`, so a missed bind-mount fails loud at boot rather than silently at request time.
+The canonical `docker run` lives in [`install.sh`](install.sh); each flag's load-bearing reason lives below. The launcher refuses to come up if `sitecustomize.py` or any registered patch is missing from `/opt/patches/`, so a missed bind-mount fails loud at boot rather than silently at request time.
 
-```bash
-sudo docker run -d --name qwen36 --gpus all \
-  --restart unless-stopped \
-  -p 127.0.0.1:8001:8001 \
-  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
-  --log-opt max-size=100m --log-opt max-file=5 \
-  --health-cmd 'curl -fsS http://127.0.0.1:8001/health || exit 1' \
-  --health-interval=30s --health-timeout=5s --health-retries=3 \
-  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  -v "$PWD/sitecustomize.py:/opt/patches/sitecustomize.py:ro" \
-  -v "$PWD/monkey_patch_reasoning_field_ingest.py:/opt/patches/monkey_patch_reasoning_field_ingest.py:ro" \
-  -v "$PWD/monkey_patch_qwen3_coder.py:/opt/patches/monkey_patch_qwen3_coder.py:ro" \
-  -v "$PWD/monkey_patch_hybrid_kv_allocator.py:/opt/patches/monkey_patch_hybrid_kv_allocator.py:ro" \
-  -v "$PWD/monkey_patch_reasoning_field_egress.py:/opt/patches/monkey_patch_reasoning_field_egress.py:ro" \
-  -v "$PWD/monkey_patch_tool_call_in_think_detector.py:/opt/patches/monkey_patch_tool_call_in_think_detector.py:ro" \
-  -v "$PWD/monkey_patch_default_sampling_params.py:/opt/patches/monkey_patch_default_sampling_params.py:ro" \
-  -v "$PWD/monkey_patch_qwen3_coder_grammar.py:/opt/patches/monkey_patch_qwen3_coder_grammar.py:ro" \
-  -v "$PWD/monkey_patch_request_memory_snapshot.py:/opt/patches/monkey_patch_request_memory_snapshot.py:ro" \
-  -v "$PWD/monkey_patch_tool_role_media_preserve.py:/opt/patches/monkey_patch_tool_role_media_preserve.py:ro" \
-  -v "$PWD/monkey_patch_mm_cache_validator_eviction.py:/opt/patches/monkey_patch_mm_cache_validator_eviction.py:ro" \
-  -v "$PWD/launch_with_patches.py:/opt/patches/launch.py:ro" \
-  -e HF_HUB_ENABLE_HF_TRANSFER=1 \
-  -e PYTHONPATH=/opt/patches \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  --entrypoint python3 \
-  vllm/vllm-openai@sha256:6885d59fbe9827be20f8b4a1cda7178579055df29443c0194f92e1332eb8bdba \
-  /opt/patches/launch.py serve \
-  --model QuantTrio/Qwen3.6-27B-AWQ \
-  --revision 9b507bdc9afafb87b7898700cc2a591aa6639461 \
-  --served-model-name Qwen3.6-27B-AWQ \
-  --host 0.0.0.0 --port 8001 \
-  --max-model-len 152000 \
-  --gpu-memory-utilization 0.97 \
-  --max-num-seqs 4 \
-  --max-num-batched-tokens 4096 \
-  --reasoning-parser qwen3 \
-  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --enable-prefix-caching \
-  --skip-mm-profiling \
-  --mm-processor-kwargs '{"max_pixels": 4194304}' \
-  --default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}' \
-  --limit-mm-per-prompt '{"image": 20, "video": 1, "audio": 0}' \
-  -cc '{"cudagraph_capture_sizes":[1,2,4,8]}'
-```
-
-Each flag's rationale lives in §5. Load-bearing items: `--max-model-len 152000` and `--gpu-memory-utilization 0.97` (byte budget, §5.2 — patch §7.8 makes gmu>0.984 reachable; we land at 0.97 deliberately to leave the PyTorch caching allocator ~300 MiB of cold-path coalesce headroom, otherwise the first 4-MP image-bearing request after boot OOMs the LM-prefill MLP buffer despite total free memory being adequate; §5.2 / §11 B12); `--skip-mm-profiling` paired with `--mm-processor-kwargs '{"max_pixels": 4194304}'` (§5.8 — the cap bounds the runtime encoder peak, which is otherwise unmeasured and unsafe with `--skip-mm-profiling`); `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (necessary but not sufficient on the cold path — permits segment growth but doesn't pre-grow on cold start; gmu=0.97 closes that gap by keeping ~300 MiB unreserved at boot); `--limit-mm-per-prompt` (default crashes boot, §5.8); `--max-num-batched-tokens 4096` (halves the LM-prefill MLP intermediate buffer from ~285 MiB at mnbt=8192 to ~142 MiB; combined with gmu=0.97 the KV pool boots at 158,368 tokens which admits 152K full-context requests at 1.04× concurrency; §5.2; B9 / B12 evidence in §11); `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` (tool calling); `--reasoning-parser qwen3` (server-side `<think>` extraction); `--default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}'` (§5.7); `-cc '{"cudagraph_capture_sizes":[1,2,4,8]}'` (pins the auto-derivation that vLLM produces for `--max-num-seqs 4` at `vllm/config/vllm.py:1434-1586` — drift-immune across image bumps); `-p 127.0.0.1:8001:8001` + bridge networking (default; `--network host` removed) + `--host 0.0.0.0 --port 8001` inside the container (this is the vLLM CLI's bind, not the host bind). The container runs in its own network namespace, so vLLM's internal sockets — the OpenAI HTTP server, the EngineCore ZMQ IPC ports, NIXL, prometheus collector, distributed-init port, all of them — stay sealed inside the container and never reach a host interface. Only port 8001 crosses the boundary, and only via the explicit publish, and only on host loopback (`127.0.0.1:8001`). To re-expose publicly on another host, change the publish to `-p 8001:8001` (= 0.0.0.0:8001) and put an authenticating reverse proxy in front — vLLM has no built-in auth. **Do not use `--network host`**: that shares the host's network namespace, which makes EngineCore's ZMQ port (and any other internal RPC port vLLM opens) bind to the host's all-interfaces, which on a publicly-routable host = the public IP. `--host 127.0.0.1` only constrains the OpenAI HTTP server bind, not EngineCore's IPC bind; `sitecustomize.py` bind-mount (load-bearing for patches 3 and 8, see §7.S). Operational: `--restart unless-stopped` (auto-recover from engine crash); `--log-opt` rotation (bound docker log disk usage); `--health-cmd` (docker-native shallow liveness against `/health` — for deep wedge detection see §8.4). `--swap-space` is intentionally omitted (popped at LLM-API level and rejected by the CLI argparse in this image).
+`--max-model-len 152000` and `--gpu-memory-utilization 0.97` (byte budget, §5.2 — patch §7.8 makes gmu>0.984 reachable; we land at 0.97 deliberately to leave the PyTorch caching allocator ~300 MiB of cold-path coalesce headroom, otherwise the first 4-MP image-bearing request after boot OOMs the LM-prefill MLP buffer despite total free memory being adequate; §5.2 / §11 B12). `--skip-mm-profiling` paired with `--mm-processor-kwargs '{"max_pixels": 4194304}'` (§5.8 — the cap bounds the runtime encoder peak, which is otherwise unmeasured and unsafe with `--skip-mm-profiling`). `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (necessary but not sufficient on the cold path — permits segment growth but doesn't pre-grow on cold start; gmu=0.97 closes that gap by keeping ~300 MiB unreserved at boot). `--limit-mm-per-prompt` (default crashes boot, §5.8). `--max-num-batched-tokens 4096` (halves the LM-prefill MLP intermediate buffer from ~285 MiB at mnbt=8192 to ~142 MiB; combined with gmu=0.97 the KV pool boots at 158,368 tokens which admits 152K full-context requests at 1.04× concurrency; §5.2; B9 / B12 evidence in §11). `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` (tool calling). `--reasoning-parser qwen3` (server-side `<think>` extraction). `--default-chat-template-kwargs '{"preserve_thinking": true, "enable_thinking": true}'` (§5.7). `-cc '{"cudagraph_capture_sizes":[1,2,4,8]}'` (pins the auto-derivation that vLLM produces for `--max-num-seqs 4` at `vllm/config/vllm.py:1434-1586` — drift-immune across image bumps). `-p 127.0.0.1:8001:8001` + bridge networking (default; `--network host` removed) + `--host 0.0.0.0 --port 8001` inside the container (this is the vLLM CLI's bind, not the host bind). The container runs in its own network namespace, so vLLM's internal sockets — the OpenAI HTTP server, the EngineCore ZMQ IPC ports, NIXL, prometheus collector, distributed-init port, all of them — stay sealed inside the container and never reach a host interface. Only port 8001 crosses the boundary, and only via the explicit publish, and only on host loopback (`127.0.0.1:8001`). To re-expose publicly on another host, change the publish to `-p 8001:8001` (= 0.0.0.0:8001) and put an authenticating reverse proxy in front — vLLM has no built-in auth. **Do not use `--network host`**: that shares the host's network namespace, which makes EngineCore's ZMQ port (and any other internal RPC port vLLM opens) bind to the host's all-interfaces, which on a publicly-routable host = the public IP. `--host 127.0.0.1` only constrains the OpenAI HTTP server bind, not EngineCore's IPC bind. `sitecustomize.py` bind-mount (load-bearing for patches 3 and 8, see §7.S). Operational: `--restart unless-stopped` (auto-recover from engine crash); `--log-opt max-size=100m --log-opt max-file=5` (caps the container's combined stdout+stderr log volume at 500 MB across 5 rolled files — docker handles its own rotation); `--health-cmd` (docker-native shallow liveness against `/health` — for deep wedge detection see §8.4). `--swap-space` is intentionally omitted (popped at LLM-API level and rejected by the CLI argparse in this image).
 
 ### 8.3 Wait for healthy, run warmup, run smoke test
 
@@ -563,39 +514,15 @@ curl -s http://127.0.0.1:8001/v1/chat/completions \
 
 Operational: vLLM exports Prometheus metrics at `/metrics` — scrape for KV cache pressure, queue depth, request latency.
 
-### 8.4 Host-side ops bundle ([`host_ops/`](host_ops/))
+### 8.4 Wedge-recovery deep-liveness probe ([`host_ops/`](host_ops/))
 
-Two host-side services live in [`host_ops/`](host_ops/) and are installed together by [`host_ops/install.sh`](host_ops/install.sh):
+Files: [`host_ops/qwen36_deep_probe.sh`](host_ops/qwen36_deep_probe.sh) (the probe), [`host_ops/qwen36-deep-probe.service`](host_ops/qwen36-deep-probe.service) (one-shot, retry-and-restart logic inline in `ExecStart`), [`host_ops/qwen36-deep-probe.timer`](host_ops/qwen36-deep-probe.timer) (`OnUnitActiveSec=60s`). Installed by `install.sh` (or in isolation via `sudo bash host_ops/install.sh`); removed by `uninstall.sh` (or `sudo bash host_ops/uninstall.sh`).
 
-```bash
-sudo bash host_ops/install.sh
-```
+**WHAT** — issues a real `/v1/chat/completions` decode against the running container and asserts `(choices[0].message.content // choices[0].message.reasoning_content) != null` AND `usage.completion_tokens >= 1`. The disjunction over content lanes is load-bearing on this stack: with `--reasoning-parser qwen3` enabled (§8.2), the first generated token routes to `reasoning_content` until `</think>` is observed, so a 1-token probe lands its proof-of-decode in `reasoning_content` while `content` stays `null`. Either lane non-null is a real "engine decoded" signal.
 
-The installer copies the scripts to `/usr/local/bin/`, the units to `/etc/systemd/system/`, creates `/var/log/qwen36/` + `/var/lib/qwen36/`, runs `systemctl daemon-reload`, and enables/starts both bundles. Idempotent — re-run after editing any file in [`host_ops/`](host_ops/) to redeploy. Source-of-truth for what the installer does and how to verify lives in the script header itself; the units are documented in their own files. The two bundles below differ in runtime mode (forwarder is a long-running daemon; probe is a periodically-fired one-shot) but share the same in-repo source-of-truth pattern: a `.service` unit (plus a `.timer` for the probe), idempotent installation, journal-integrated logging.
+**WHEN** — every 60 seconds; on probe failure the unit retries once after a 5-second pause, and on a second consecutive failure issues `docker restart qwen36`. The retry-and-restart logic is encoded inline in [`qwen36-deep-probe.service`](host_ops/qwen36-deep-probe.service)'s `ExecStart` so the wedge-recovery semantics are visible in one file. Per-fire cost is one `max_tokens=1` request (~50–100 ms wall-clock; one token of GPU decode; prefix-cached after first warm-up). Each fire is `Type=oneshot` — the process exits, no state accumulates, no leak. Probe-side log volume is ~3 lines/fire to systemd journald, which auto-rotates (`SystemMaxUse` defaults to 10% of disk or 4 GB cap). Multi-month, no-restart operation is fine — there is nothing to fill.
 
-#### 8.4.1 Wedge-recovery deep-liveness probe
-
-Files: [`host_ops/qwen36_deep_probe.sh`](host_ops/qwen36_deep_probe.sh) (the probe), [`host_ops/qwen36-deep-probe.service`](host_ops/qwen36-deep-probe.service) (one-shot, retry-and-restart logic inline in `ExecStart`), [`host_ops/qwen36-deep-probe.timer`](host_ops/qwen36-deep-probe.timer) (`OnUnitActiveSec=60s`).
-
-WHAT — issues a real `/v1/chat/completions` decode and asserts `(choices[0].message.content // choices[0].message.reasoning_content) != null` AND `usage.completion_tokens >= 1`. The disjunction over content lanes is load-bearing on this stack: with `--reasoning-parser qwen3` enabled (§8.2), the first generated token routes to `reasoning_content` until `</think>` is observed, so a 1-token probe lands its proof-of-decode in `reasoning_content` while `content` stays `null`. Either lane non-null is a real "engine decoded" signal.
-
-WHEN — every 60 seconds; on probe failure the unit retries once after a 5-second pause, and on a second consecutive failure issues `docker restart qwen36`. The retry-and-restart logic is encoded inline in [`qwen36-deep-probe.service`](host_ops/qwen36-deep-probe.service)'s `ExecStart` so the wedge-recovery semantics are visible in one file (no shell-`||` line buried elsewhere).
-
-WHY — `--health-cmd 'curl -fsS http://127.0.0.1:8001/health'` from §8.2 detects the API-server process being dead but NOT engine wedges where the HTTP layer answers `/health` with 200 while EngineCore is stuck (CUDA hang, deadlocked allocator, livelocked scheduler — see vLLM forum thread *"V1 Engine child process dies unnoticed; check_health() is a no-op"*). This probe catches those.
-
-#### 8.4.2 §7.5 `model_emit_warning` forwarder
-
-Files: [`host_ops/qwen36_warning_forwarder.py`](host_ops/qwen36_warning_forwarder.py) (the daemon), [`host_ops/qwen36-warning-forwarder.service`](host_ops/qwen36-warning-forwarder.service) (`Type=simple`, restart-on-failure).
-
-WHAT — tails `docker logs -f qwen36`, parses each `model_emit_warning kind=tool_call_in_reasoning reasoning_len=N marker_count=M` WARNING (the §7.5 patch's exact format string at [`monkey_patch_tool_call_in_think_detector.py:84`](monkey_patch_tool_call_in_think_detector.py#L84)) with a strict regex anchored end-to-end, and appends one JSON Lines record per event to `/var/log/qwen36/warnings.jsonl`. A line that matches the marker prefix but fails the full regex is treated as a LOUD parse error: it goes to stderr/journald and increments `parse_errors` in the state file at `/var/lib/qwen36/forwarder_state.json` — silent drops would defeat the point. Schema, one object per line:
-
-```
-{"ts":"<ISO-8601 UTC>","kind":"tool_call_in_reasoning","reasoning_len":<int>,"marker_count":<int>,"raw":"<verbatim docker line>"}
-```
-
-WHEN — continuous (long-running daemon, restarted by systemd on failure). `kill -HUP` rotates the output file in place (logrotate-compatible); `kill -TERM` graceful-shuts with a `shutdown: events=N restarts=M parse_errors=K` banner to stderr.
-
-WHY — §7.5 emits one structured WARNING per request whose reasoning contains `<tool_call>` markup (community-reported rate is single-digit % under agentic workloads). Both the non-streaming and streaming reasoning parser paths are wrapped (§7.5) with byte-identical WARNING format, so the forwarder sees every event regardless of whether the client streams. Without this forwarder the WARNINGs would land in `docker logs` and stay there — no way to query "how many tool-call-in-reasoning events fired in the last hour" or alert on a rate spike.
+**WHY** — `--health-cmd 'curl -fsS http://127.0.0.1:8001/health'` from §8.2 detects the API-server process being dead but NOT engine wedges where the HTTP layer answers `/health` with 200 while EngineCore is stuck (CUDA hang, deadlocked allocator, livelocked scheduler). vLLM's `/health` chain at the pinned commit is provably flag-only: `vllm/entrypoints/serve/instrumentator/health.py:22-33` calls `check_health()` (`vllm/v1/engine/async_llm.py:868-871`) which is `if self.errored: raise`; `errored` resolves to `engine_dead OR not is_running`, and `engine_dead` flips in **exactly two places** — subprocess sentinel exit (`vllm/v1/engine/utils.py:184-204`) and explicit `ENGINE_CORE_DEAD` ZMQ frame (`vllm/v1/engine/core_client.py:447-450`). Neither fires on a CUDA kernel hang or a Python deadlock. `/health` would return 200 while no token decodes — indefinitely. This probe is the only thing on this deployment closing that gap. Log shipping for §7.5's structured `model_emit_warning kind=tool_call_in_reasoning reasoning_len=N marker_count=M` WARNINGs is **not** in scope here — those land in `docker logs`, are queryable on demand via `docker logs qwen36 | grep model_emit_warning`, and any standard log shipper (Fluentd / Vector / Promtail / journald-to-Loki) will pick them up if you wire it up.
 
 ### 8.5 Production-ready checklist
 
@@ -605,8 +532,7 @@ Sign off all of these before declaring the deployment ready:
 - [ ] `sudo docker logs qwen36 2>&1 | grep -oE 'qwen36-agent-setup-[a-z0-9-]+' | sort -u | wc -l` returns **10** (the ten distinct patch tags). Patches load in three processes — PID 1 launcher, the launcher's pre-flight subprocess install probe, and the spawned EngineCore — so the un-deduped `applied:` line count is **~30**.
 - [ ] `curl -fs http://127.0.0.1:8001/v1/models | jq '.data[0].max_model_len'` returns **152000**.
 - [ ] `curl -fs -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8001/metrics` returns **200**.
-- [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0**.
-- [ ] `systemctl is-active qwen36-warning-forwarder.service` returns **active** and `cat /var/lib/qwen36/forwarder_state.json | jq .parse_errors` returns **0** (a non-zero parse_errors means the §7.5 format string drifted upstream — re-audit before declaring ready).
+- [ ] `/usr/local/bin/qwen36_deep_probe.sh` returns **0** and `systemctl is-active qwen36-deep-probe.timer` returns **active**.
 - [ ] §8.3 step 6 smoke test returns `finish_reason == "tool_calls"` with `tool_calls[0].function.name == "calculator"` (patch §7.7 pins the function name to a registered tool — name hallucination cannot reach the wire). Argument-body schema is **not** xgrammar-enforced (see §7.7 "What this does NOT close"); validate `tool_calls[0].function.arguments` against your schema client-side if the agent needs strict shape.
 
 ---
@@ -706,17 +632,14 @@ Each is tracked; none urgent.
 ├── monkey_patch_request_memory_snapshot.py                # §7.8 — startup snapshot check stops double-counting vLLM's own init footprint
 ├── monkey_patch_tool_role_media_preserve.py               # §7.9 — preserve list-shaped tool-role content with media so the chat template renders <|vision_start|><|image_pad|><|vision_end|> inside <tool_response>
 ├── monkey_patch_mm_cache_validator_eviction.py            # §7.10 — clear renderer sender mm-cache on validator throw; closes #31404 retry-poison HTTP-500
-├── host_ops/                                              # §8.4 — host-side ops bundle; install via `sudo bash host_ops/install.sh`
-│   ├── qwen36_deep_probe.sh                               # §8.4.1 — wedge-recovery probe (one-shot; engine-decoded-a-token check)
-│   ├── qwen36-deep-probe.service                          # §8.4.1 — systemd unit (Type=oneshot; retry+`docker restart` inline in ExecStart)
-│   ├── qwen36-deep-probe.timer                            # §8.4.1 — fires the .service every 60s (OnUnitActiveSec=60s)
-│   ├── qwen36_warning_forwarder.py                        # §8.4.2 — long-running daemon; tails docker logs, parses §7.5 WARNINGs into JSONL
-│   ├── qwen36-warning-forwarder.service                   # §8.4.2 — systemd unit (Type=simple, restart-on-failure)
-│   ├── install.sh                                         # §8.4 — idempotent installer for both bundles
+├── host_ops/                                              # §8.4 — host-side wedge-recovery bundle; install via `sudo bash host_ops/install.sh`
+│   ├── qwen36_deep_probe.sh                               # §8.4 — one-shot probe: real /v1/chat/completions decode, exit 0/1 on engine-decoded-a-token check
+│   ├── qwen36-deep-probe.service                          # §8.4 — systemd unit (Type=oneshot; retry+`docker restart` inline in ExecStart)
+│   ├── qwen36-deep-probe.timer                            # §8.4 — fires the .service every 60s (OnUnitActiveSec=60s)
+│   ├── install.sh                                         # §8.4 — idempotent installer for the deep-probe bundle
 │   └── uninstall.sh                                       # §8.4 — idempotent uninstaller (mirrors install.sh in reverse)
 └── tests/
-    ├── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
-    └── test_warning_forwarder.py                          # §8.4.2 forwarder unit tests (no docker; pure Python)
+    └── test_patches_against_master.py                     # static + structural-mirror suite (runs without torch/CUDA)
 ```
 
-Twelve Python files (10 patches + launcher + sitecustomize) plus the host-side probe shell script, the host-side warning forwarder bundle (`host_logs/`), and two test files.
+Twelve Python files (10 patches + launcher + sitecustomize), two top-level shell scripts (`install.sh` / `uninstall.sh`), the `host_ops/` deep-probe bundle (one shell script + two systemd unit files + one installer + one uninstaller), and one test file.

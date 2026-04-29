@@ -1147,132 +1147,117 @@ def section_10_sitecustomize_and_readme() -> None:
 
     readme_src = readme_path.read_text()
 
-    # README §8.2 must contain the sitecustomize bind-mount and the
-    # network-namespace boundary that keeps EngineCore's ZMQ IPC ports
-    # off the host's interfaces. Find the docker run command (between
-    # ```bash ... ```), then check it contains the expected flags.
-    docker_run_re = re.compile(
-        r"```bash\s*\n((?:sudo\s+)?docker run.*?)```", re.DOTALL
-    )
-    docker_run_matches = docker_run_re.findall(readme_src)
+    # The canonical `docker run` lives in install.sh (not README §8.2 prose).
+    # All flag-presence and bind-mount checks read install.sh.
+    install_path = PATCH_DIR / "install.sh"
+    install_src = install_path.read_text()
+
+    # install.sh contains exactly one `docker run` invocation (and only
+    # one). A regression that adds a second invocation would mean two
+    # containers stomping each other.
+    docker_run_count = install_src.count("docker run ")
     run.expect_eq(
-        "README contains EXACTLY ONE `docker run` bash code block",
-        len(docker_run_matches),
+        "install.sh contains exactly one `docker run` invocation",
+        docker_run_count,
         1,
     )
-    docker_run = docker_run_matches[0] if docker_run_matches else ""
-    if docker_run:
-        run.expect_in(
-            "README §8.2 docker run includes sitecustomize bind-mount",
-            "sitecustomize.py:/opt/patches/sitecustomize.py:ro",
-            docker_run,
-        )
-        # 2026-04-28: switched from `--network host` to bridge networking
-        # with an explicit host-loopback publish. With --network host, the
-        # EngineCore subprocess's ZMQ IPC port (and any other internal RPC
-        # vLLM opens) binds to the host's all-interfaces, which on a
-        # publicly-routable machine = the public IP. Bridge networking
-        # gives the container its own network namespace; only the explicit
-        # publish crosses to the host, and only on 127.0.0.1.
-        run.expect_in(
-            "README §8.2 docker run publishes only on host loopback",
-            "-p 127.0.0.1:8001:8001",
-            docker_run,
-        )
-        run.expect_not_in(
-            "README §8.2 docker run does NOT use --network host",
-            "--network host",
-            docker_run,
-        )
-        # The vLLM CLI must bind on 0.0.0.0 *inside the container's*
-        # network namespace so the publish DNAT can reach it. This is the
-        # container's own private interface, not a host interface.
-        run.expect_in(
-            "README §8.2 docker run binds vLLM CLI to 0.0.0.0 INSIDE the container",
-            "--host 0.0.0.0",
-            docker_run,
-        )
 
-        # PYTHONPATH=/opt/patches is load-bearing: without it, CPython's
-        # site.py never finds /opt/patches/sitecustomize.py, and patch 3
-        # (hybrid_kv_allocator) is silently dead in the spawned EngineCore.
-        # Catch the regression of a maintainer dropping the env var.
-        run.expect_in(
-            "README §8.2 docker run includes -e PYTHONPATH=/opt/patches",
-            "PYTHONPATH=/opt/patches",
-            docker_run,
-        )
+    # sitecustomize bind-mount — load-bearing for patches 3 and 8 reaching
+    # the EngineCore subprocess.
+    run.expect_in(
+        "install.sh docker run includes sitecustomize bind-mount",
+        "sitecustomize.py:/opt/patches/sitecustomize.py:ro",
+        install_src,
+    )
+    # 2026-04-28: bridge networking with --network host explicitly avoided.
+    # With --network host, the EngineCore subprocess's ZMQ IPC port (and
+    # any other internal RPC vLLM opens) binds to the host's all-interfaces,
+    # which on a publicly-routable machine = the public IP.
+    run.expect_in(
+        "install.sh docker run publishes only on host loopback",
+        "-p 127.0.0.1:8001:8001",
+        install_src,
+    )
+    run.expect_not_in(
+        "install.sh docker run does NOT use --network host",
+        "--network host",
+        install_src,
+    )
+    # The vLLM CLI must bind on 0.0.0.0 *inside the container's* network
+    # namespace so the publish DNAT can reach it. This is the container's
+    # own private interface, not a host interface.
+    run.expect_in(
+        "install.sh docker run binds vLLM CLI to 0.0.0.0 INSIDE the container",
+        "--host 0.0.0.0",
+        install_src,
+    )
 
-        # --entrypoint python3 is load-bearing: without it, the image's
-        # default ENTRYPOINT [vllm, serve] runs and the launcher is
-        # never executed at all (no patches install).
-        run.expect_in(
-            "README §8.2 docker run includes --entrypoint python3",
-            "--entrypoint python3",
-            docker_run,
-        )
+    # PYTHONPATH=/opt/patches is load-bearing: without it, CPython's
+    # site.py never finds /opt/patches/sitecustomize.py, and patch 3
+    # (hybrid_kv_allocator) is silently dead in the spawned EngineCore.
+    run.expect_in(
+        "install.sh docker run includes -e PYTHONPATH=/opt/patches",
+        "PYTHONPATH=/opt/patches",
+        install_src,
+    )
 
-        # The launcher itself must be bind-mounted into /opt/patches/launch.py
-        # (the path the docker command then invokes). The launcher source
-        # file's name in the repo is launch_with_patches.py; the in-container
-        # path is /opt/patches/launch.py.
-        run.expect_in(
-            "README §8.2 docker run bind-mounts launch_with_patches.py "
-            "at /opt/patches/launch.py",
-            "launch_with_patches.py:/opt/patches/launch.py:ro",
-            docker_run,
-        )
+    # --entrypoint python3 is load-bearing: without it, the image's
+    # default ENTRYPOINT [vllm, serve] runs and the launcher is
+    # never executed at all (no patches install).
+    run.expect_in(
+        "install.sh docker run includes --entrypoint python3",
+        "--entrypoint python3",
+        install_src,
+    )
 
-        # 2026-04-28: mnbt=4096 (down from the H100-bucket default 16384,
-        # via the intermediate sweet-spot 8192) after the Pillars-of-Creation
-        # 20×4MP test exposed an LM-prefill MLP buffer OOM at the larger
-        # chunk sizes. The smaller chunk halves the (s≈mnbt, intermediate
-        # =17408) fp16 MLP buffer from ~285 MiB at mnbt=8192 to ~142 MiB
-        # at mnbt=4096; the freed activation budget at boot reroutes into
-        # the KV pool, lifting it to 158,368 tokens at the production
-        # gmu=0.97, which enables --max-model-len 131072→152000 with ~6.4K
-        # slack. README §5.2 / §11 rows B9 / B10 / B12.
-        run.expect_in(
-            "README §8.2 docker run uses --max-num-batched-tokens 4096",
-            "--max-num-batched-tokens 4096",
-            docker_run,
-        )
-        run.expect_not_in(
-            "README §8.2 docker run does NOT still use --max-num-batched-tokens 8192",
-            "--max-num-batched-tokens 8192",
-            docker_run,
-        )
+    # The launcher itself must be bind-mounted into /opt/patches/launch.py
+    # (the path the docker command then invokes). Source name in repo is
+    # launch_with_patches.py; in-container path is /opt/patches/launch.py.
+    run.expect_in(
+        "install.sh docker run bind-mounts launch_with_patches.py at /opt/patches/launch.py",
+        "launch_with_patches.py:/opt/patches/launch.py:ro",
+        install_src,
+    )
 
-        # 2026-04-28: -cc pin for cudagraph capture sizes — drift-immune
-        # against future image bumps (vLLM auto-derives [1,2,4,8] for
-        # max_num_seqs=4 today but the heuristic could change).
-        run.expect_in(
-            "README §8.2 docker run includes -cc cudagraph_capture_sizes pin",
-            "cudagraph_capture_sizes",
-            docker_run,
-        )
-        run.expect_in(
-            "README §8.2 docker run pins cudagraph capture sizes to [1,2,4,8]",
-            "[1,2,4,8]",
-            docker_run,
-        )
+    # mnbt=4096 (post-Pillars-of-Creation OOM tuning, §11 B9/B12).
+    run.expect_in(
+        "install.sh docker run uses --max-num-batched-tokens 4096",
+        "--max-num-batched-tokens 4096",
+        install_src,
+    )
+    run.expect_not_in(
+        "install.sh docker run does NOT still use --max-num-batched-tokens 8192",
+        "--max-num-batched-tokens 8192",
+        install_src,
+    )
 
-        # Every entry in _PATCH_MODULES must have a corresponding bind-mount
-        # line in the docker run command. Catches the regression where a
-        # patch is added to the launcher tuple but the operator forgets
-        # to add the bind-mount; without the mount the patch import
-        # raises ImportError at PID 1 startup, but without the static check
-        # the maintainer would only learn at deployment time.
-        if isinstance(sitecustomize_modules, tuple):
-            for module_name in sitecustomize_modules:
-                expected_mount = (
-                    f"{module_name}.py:/opt/patches/{module_name}.py:ro"
-                )
-                run.expect_in(
-                    f"README §8.2 docker run bind-mounts {module_name}",
-                    expected_mount,
-                    docker_run,
-                )
+    # -cc pin for cudagraph capture sizes — drift-immune against future
+    # image bumps.
+    run.expect_in(
+        "install.sh docker run includes -cc cudagraph_capture_sizes pin",
+        "cudagraph_capture_sizes",
+        install_src,
+    )
+    run.expect_in(
+        "install.sh docker run pins cudagraph capture sizes to [1,2,4,8]",
+        "[1,2,4,8]",
+        install_src,
+    )
+
+    # Every entry in _PATCH_MODULES must have a corresponding bind-mount
+    # line in install.sh's docker run. Catches the regression where a
+    # patch is added to the launcher tuple but the maintainer forgets
+    # the bind-mount.
+    if isinstance(sitecustomize_modules, tuple):
+        for module_name in sitecustomize_modules:
+            expected_mount = (
+                f"{module_name}.py:/opt/patches/{module_name}.py:ro"
+            )
+            run.expect_in(
+                f"install.sh docker run bind-mounts {module_name}",
+                expected_mount,
+                install_src,
+            )
 
     # 2026-04-28: §8.3 now contains the 2-concurrent warmup shape (loose
     # assertions on the load-bearing markers — exact JSON varies).
@@ -1333,9 +1318,10 @@ def section_10_sitecustomize_and_readme() -> None:
             readme_src,
         )
 
-    # The §8.2 docker run block and install.sh's docker run must use the
-    # same container name — if these drift, uninstall.sh's validator
-    # looks for the wrong container.
+    # install.sh and uninstall.sh must use the same container name —
+    # if they drift, uninstall.sh's validator looks for the wrong
+    # container. install.sh's docker run uses `--name "${CONTAINER_NAME}"`
+    # which is the variable's expanded form.
     run.expect_in(
         "install.sh declares CONTAINER_NAME=qwen36",
         'CONTAINER_NAME="qwen36"',
@@ -1347,9 +1333,9 @@ def section_10_sitecustomize_and_readme() -> None:
         uninstall_src,
     )
     run.expect_in(
-        "README §8.2 docker run uses --name qwen36",
-        "--name qwen36",
-        readme_src,
+        'install.sh docker run uses --name "${CONTAINER_NAME}"',
+        '--name "${CONTAINER_NAME}"',
+        install_src,
     )
 
 

@@ -13,9 +13,10 @@ contract; the model is misbehaving.** This patch wraps both surfaces,
 emits a single structured WARNING per request when the OOD markup is
 detected, and passes the upstream return value through unchanged so
 the agent's retry policy decides what to do — no rescue, no state
-machine. Both wrappers emit the *byte-identical* format string so a
-single log forwarder regex covers both code paths
-(``host_ops/qwen36_warning_forwarder.py``).
+machine. Both wrappers emit the *byte-identical* format string so an
+operator can ``grep model_emit_warning`` (or wire up any standard log
+shipper) to count events; the structured suffix carries
+``reasoning_len=N marker_count=M`` for histogramming.
 
 Streaming wrapper state model
 -----------------------------
