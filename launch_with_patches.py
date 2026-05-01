@@ -719,6 +719,64 @@ def _verify_tool_role_media_preserve(patch_module: ModuleType) -> None:
     )
 
 
+def _verify_qwen3_coder_streaming_truncation(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_qwen3_coder_streaming_truncation`` wrapped
+    BOTH ``Qwen3CoderToolParser.extract_tool_calls_streaming`` AND
+    ``OpenAIServingChat._should_check_for_unstreamed_tool_arg_tokens``.
+
+    Tag-only check at the launcher: the patch's own Phase 10 carries
+    behavioural verification — case A drives a 5-chunk truncation
+    sequence through the patched parser end-to-end and asserts that
+    ``prev_tool_call_arr[-1]["arguments"]`` contains the file_path AND
+    the partial content value bytes (``"import os"`` / ``"import sys"``)
+    with no spurious closing brace; case B re-runs the same chunk
+    sequence through the captured original (bypassing the wrap) and
+    asserts the unpatched parser leaves the partial value out of
+    prev_tool_call_arr — proving the bug landmark still fires; case C
+    drives the predicate wrap through four sub-cases (original True
+    passthrough, truncation rescue with synthetic-skeleton mutation,
+    other parser class extension does NOT fire, no-finish_reason
+    extension does NOT fire); case D verifies the end-to-end rescue
+    math (``expected.replace(actual, "", 1)``) yields exactly the
+    missing-tail bytes the wire is supposed to receive. Re-doing that
+    here would duplicate the patch's load-bearing verification — the
+    launcher need only confirm the install propagated to BOTH targets
+    via attribute lookup and ``inspect.getattr_static``.
+
+    A half-installed truncation rescue is strictly worse than the
+    unpatched bug (parser updates state but serving-side predicate
+    not extended → state goes stale; or vice versa → predicate fires
+    on stale state and the rescue computes a nonsense final delta).
+    The patch refuses install on any landmark mismatch; this verifier
+    additionally cross-checks both wraps from outside.
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import streaming-truncation "
+            f"patch's two target classes for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        Qwen3CoderToolParser,
+        "extract_tool_calls_streaming",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="Qwen3CoderToolParser",
+    )
+    _verify_target_carries_tag(
+        OpenAIServingChat,
+        "_should_check_for_unstreamed_tool_arg_tokens",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="OpenAIServingChat",
+    )
+
+
 def _verify_mm_cache_validator_eviction(patch_module: ModuleType) -> None:
     """Verify ``monkey_patch_mm_cache_validator_eviction`` wrapped
     ``OpenAIServingChat.create_chat_completion``.
@@ -798,6 +856,18 @@ _PATCH_MODULES: tuple[str, ...] = (
     # call frame in the chat-completions request path, so installing it
     # last keeps the boot-log sequence reading "inner→outer" on
     # request-flow targets.
+    # qwen3_coder_streaming_truncation wraps TWO surfaces:
+    # Qwen3CoderToolParser.extract_tool_calls_streaming and
+    # OpenAIServingChat._should_check_for_unstreamed_tool_arg_tokens.
+    # Must come AFTER qwen3_coder (patch 2 — different method on the
+    # same class — disjoint attribute, but ordering is defensive) and
+    # AFTER mm_cache_validator_eviction (which wraps a DIFFERENT
+    # method — create_chat_completion vs _should_check_... — on the
+    # same class; the _should_check predicate is read from inside
+    # chat_completion_stream_generator, not create_chat_completion,
+    # so the two wraps do not compose at the same address — but
+    # listing this patch last keeps the sequence "request-flow
+    # targets last" reading consistent).
     "monkey_patch_qwen3_coder",
     "monkey_patch_hybrid_kv_allocator",
     "monkey_patch_reasoning_field_egress",
@@ -808,6 +878,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_request_memory_snapshot",
     "monkey_patch_tool_role_media_preserve",
     "monkey_patch_mm_cache_validator_eviction",
+    "monkey_patch_qwen3_coder_streaming_truncation",
 )
 
 _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
@@ -821,6 +892,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_request_memory_snapshot": _verify_request_memory_snapshot,
     "monkey_patch_tool_role_media_preserve": _verify_tool_role_media_preserve,
     "monkey_patch_mm_cache_validator_eviction": _verify_mm_cache_validator_eviction,
+    "monkey_patch_qwen3_coder_streaming_truncation": _verify_qwen3_coder_streaming_truncation,
 }
 
 
@@ -951,6 +1023,14 @@ _TARGETS = [
      "vllm.tool_parsers.qwen3coder_tool_parser",
      "Qwen3CoderToolParser",
      "adjust_request"),
+    ("monkey_patch_qwen3_coder_streaming_truncation",
+     "vllm.tool_parsers.qwen3coder_tool_parser",
+     "Qwen3CoderToolParser",
+     "extract_tool_calls_streaming"),
+    ("monkey_patch_qwen3_coder_streaming_truncation",
+     "vllm.entrypoints.openai.chat_completion.serving",
+     "OpenAIServingChat",
+     "_should_check_for_unstreamed_tool_arg_tokens"),
 ]
 
 # sitecustomize already ran (CPython's site.py auto-loaded it before

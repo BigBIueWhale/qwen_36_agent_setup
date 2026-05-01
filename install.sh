@@ -34,7 +34,7 @@
 #
 # Philosophy:
 #   - vLLM is one tool; we ship the upstream image UNMODIFIED, digest-pinned.
-#   - All ten patches plus sitecustomize.py and launch_with_patches.py are
+#   - All eleven patches plus sitecustomize.py and launch_with_patches.py are
 #     bind-mounted into /opt/patches/ at run-time; the launcher imports
 #     every one fail-loud BEFORE handing off to vLLM's CLI via runpy. No
 #     local Dockerfile, no rebuild on patch change.
@@ -289,7 +289,7 @@ DOCKER_RUN_ARGS=(
     # does NOT inherit sys.modules from PID 1. See §7.S.
     -v "${REPO_DIR}/sitecustomize.py:/opt/patches/sitecustomize.py:ro"
 
-    # --- The 10 monkey-patches (§7.1 → §7.10) -----------------------
+    # --- The 11 monkey-patches (§7.1 → §7.11) -----------------------
     # All bind-mounted read-only. The launcher's pre-flight import
     # validates each patch's landmark check before vLLM CLI runs.
     # See §7 for per-patch rationale + removal triggers.
@@ -303,6 +303,7 @@ DOCKER_RUN_ARGS=(
     -v "${REPO_DIR}/monkey_patch_request_memory_snapshot.py:/opt/patches/monkey_patch_request_memory_snapshot.py:ro"
     -v "${REPO_DIR}/monkey_patch_tool_role_media_preserve.py:/opt/patches/monkey_patch_tool_role_media_preserve.py:ro"
     -v "${REPO_DIR}/monkey_patch_mm_cache_validator_eviction.py:/opt/patches/monkey_patch_mm_cache_validator_eviction.py:ro"
+    -v "${REPO_DIR}/monkey_patch_qwen3_coder_streaming_truncation.py:/opt/patches/monkey_patch_qwen3_coder_streaming_truncation.py:ro"
 
     # --- Launcher (replaces vLLM's default ENTRYPOINT) --------------
     # launch_with_patches.py imports every registered patch (fail-loud

@@ -888,7 +888,7 @@ def section_6_launcher() -> None:
     run.section("6. launch_with_patches.py — registry consistency")
     launcher_src = (PATCH_DIR / "launch_with_patches.py").read_text()
 
-    # Every patch module is registered in _PATCH_MODULES (the 10 surviving).
+    # Every patch module is registered in _PATCH_MODULES (the 11 surviving).
     expected_modules = (
         "monkey_patch_qwen3_coder",
         "monkey_patch_hybrid_kv_allocator",
@@ -900,6 +900,7 @@ def section_6_launcher() -> None:
         "monkey_patch_request_memory_snapshot",
         "monkey_patch_tool_role_media_preserve",
         "monkey_patch_mm_cache_validator_eviction",
+        "monkey_patch_qwen3_coder_streaming_truncation",
     )
     for name in expected_modules:
         run.expect_in(

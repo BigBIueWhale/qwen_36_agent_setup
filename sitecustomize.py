@@ -55,6 +55,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_request_memory_snapshot",
     "monkey_patch_tool_role_media_preserve",
     "monkey_patch_mm_cache_validator_eviction",
+    "monkey_patch_qwen3_coder_streaming_truncation",
 )
 
 
