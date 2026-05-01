@@ -8,9 +8,48 @@
 # retry-and-restart fallback.
 set -Eeuo pipefail
 
+CONTAINER="${QWEN36_PROBE_CONTAINER:-qwen36}"
 URL="${QWEN36_PROBE_URL:-http://127.0.0.1:8001/v1/chat/completions}"
 DEADLINE_SECONDS="${QWEN36_PROBE_DEADLINE:-10}"
 MODEL="${QWEN36_PROBE_MODEL:-Qwen3.6-27B-AWQ}"
+
+# Cold-start guard: defer to Docker's own healthcheck while the container
+# is in its `--health-start-period` window. The container ships with
+# `--health-start-period=180s` (install.sh §"Shallow HTTP healthcheck"),
+# during which `.State.Health.Status` reports `starting`. vLLM model
+# load + cudagraph capture takes ~95–150 s on this stack, so `starting`
+# is the genuine state, not a wedge. Restarting in this window
+# guarantees an infinite cold-start loop.
+#
+# Once the start-period expires (or the first /health probe succeeds
+# earlier), Docker flips the state to `healthy` (vLLM serving) or, after
+# `--health-retries` consecutive failures, to `unhealthy`. We engage the
+# deep probe in both of those terminal states — `healthy` to catch the
+# HTTP-up-but-engine-wedged case, `unhealthy` to also confirm-then-restart.
+HEALTH=$(docker inspect "${CONTAINER}" --format '{{.State.Health.Status}}' 2>/dev/null || true)
+case "${HEALTH}" in
+    starting)
+        # Container is intentionally still loading. Skip — Docker's own
+        # healthcheck owns this window. If vLLM never comes up, the
+        # start-period eventually expires, retries accumulate, state
+        # flips to `unhealthy`, and the next firing of THIS script will
+        # run the chat-completions probe and restart on failure.
+        exit 0
+        ;;
+    healthy|unhealthy|"")
+        # `healthy`/`unhealthy`: post-start-period, deep probe takes over.
+        # `""` (no healthcheck configured, or container missing): fall
+        # through to the deep probe, which will fail loudly if the
+        # container is gone — that's the right behaviour, the systemd
+        # unit's `docker restart qwen36` will then either restart it or
+        # error if it doesn't exist.
+        ;;
+    *)
+        # Defensive: any future Docker health-status value we haven't
+        # seen — log and run the deep probe rather than assume.
+        echo "probe: unknown health status '${HEALTH}'; running deep probe" >&2
+        ;;
+esac
 
 # enable_thinking:false avoids §5.6 thinking-mode loop pathology on probes.
 # temperature=0 + max_tokens=1 makes the response deterministic and short.

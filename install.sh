@@ -254,8 +254,21 @@ DOCKER_RUN_ARGS=(
     # wedges (vLLM's /health is provably flag-only at the pinned
     # commit; see vllm/v1/engine/async_llm.py:868-871). Engine-wedge
     # detection is the host_ops/§8.4 probe's job.
+    #
+    # `--health-start-period=180s` keeps `.State.Health.Status` at
+    # `starting` for the first 180 s while vLLM cold-starts (model load
+    # + cudagraph capture takes ~95–150 s on this stack). During the
+    # start-period, failed /health probes do NOT count toward the
+    # `--health-retries` budget, so the container does not flip to
+    # `unhealthy` mid-load. The host_ops/§8.4 deep probe also checks
+    # `.State.Health.Status` and skips when `starting`, so the systemd
+    # timer's `docker restart qwen36` cannot kill vLLM during cold
+    # start. After 180 s, the start-period ends and normal retry
+    # accounting kicks in (3 failures × 30 s interval = ~95 s before
+    # `unhealthy`); the deep probe then takes over.
     --health-cmd 'curl -fsS http://127.0.0.1:8001/health || exit 1'
     --health-interval=30s --health-timeout=5s --health-retries=3
+    --health-start-period=180s
 
     # --- Persistent caches (only .cache/, NOT the whole home) -------
     # Bind-mounts ONLY <home-dir>/.cache/ at /root/.cache/ inside the
