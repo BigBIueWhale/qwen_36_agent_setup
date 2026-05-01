@@ -23,6 +23,23 @@ actually emit — the hook is a no-op. The model emits XML tool calls
 * The ``supports_required_and_named`` latent bug is fixed in the same
   override (see below).
 
+**What this patch deliberately does NOT do: set
+``request._grammar_from_tool_parser = True``.** Despite the field's
+docstring at ``protocol.py:401-402`` reading parser-agnostic, its actual
+contract is Mistral-format-specific — established in PR #39217 by a
+Mistral engineer in the same commit that introduced the flag and its
+readers. Setting it from a non-Mistral parser routes the request into
+Mistral-only dispatch sites at
+``vllm/entrypoints/openai/chat_completion/serving.py:823`` (streaming;
+asserts ``isinstance(tool_parser, MistralToolParser)``) and ``:1407``
+(non-streaming; calls ``MistralToolParser.build_non_streaming_tool_calls``
+without an ``isinstance`` guard) — neither method exists on
+``Qwen3CoderToolParser``. xgrammar enforcement is decoupled from the
+flag: ``vllm/v1/structured_output/backend_xgrammar.py:92-106`` consumes
+``request.structured_outputs.structural_tag`` directly. So our
+function-name pinning and framing integrity properties are delivered
+without setting the flag.
+
 **What the constraint does NOT enforce: parameter-body shape.**
 Qwen3.6 emits XML (``<parameter=KEY>VALUE</parameter>``) *inside* the
 ``<function=NAME>...</function>`` framing, and ``structural_tag.schema``
@@ -69,6 +86,22 @@ Removal triggers
   community recommendation per PR #25028).
 
 Either makes this patch redundant; delete the file and its mount.
+
+Independent latent upstream bug — NOT this patch's job to fix
+-------------------------------------------------------------
+
+``vllm/entrypoints/openai/chat_completion/serving.py:1407`` reads
+``use_mistral_tool_parser = request._grammar_from_tool_parser`` and
+dispatches into ``MistralToolParser.build_non_streaming_tool_calls``
+without an ``isinstance`` guard. The streaming-side dispatch at line 823
+HAS the guard (the ``assert``); the non-streaming path does not. This is
+upstream's own internal inconsistency — an analogous correct check
+already lives at ``vllm/entrypoints/openai/engine/serving.py:619``
+(``is_mistral_tool_parser(tool_parser_cls) AND
+request._grammar_from_tool_parser``). With our patch's "do not set the
+flag" stance, line 1407 is never entered for our requests, so the bug
+is unweaponized in this deployment. Worth filing upstream as a separate
+PR; not blocking this patch.
 """
 
 from __future__ import annotations
@@ -251,8 +284,10 @@ for _required in (
 _require(
     "_grammar_from_tool_parser" in getattr(ChatCompletionRequest, "__private_attributes__", {}),
     "ChatCompletionRequest._grammar_from_tool_parser PrivateAttr is "
-    "missing; the existing flag we re-use to mark 'grammar already "
-    "installed by tool parser' has been removed.",
+    "missing; the Mistral-grammar dispatch plumbing has been redesigned "
+    "upstream and our 'do not set it from a non-Mistral parser' invariant "
+    "may no longer be the right choice. Re-audit before bumping the "
+    "pinned commit.",
 )
 
 
@@ -323,11 +358,35 @@ def _adjust_request_qwen3_grammar(
     Skipped if the client already supplied a structured-outputs
     constraint or a response_format; never trampling explicit client
     intent. Skipped on ResponsesRequest (the surface uses ``request.text``
-    rather than ``request.structured_outputs``) and on already-installed
-    requests (defensive — ``adjust_request`` is invoked once per request
-    upstream, but the ``_grammar_from_tool_parser`` flag mirrors the
-    Mistral pattern at ``mistral_tool_parser.py:286`` and the GLM4
-    pattern at ``glm4_moe_tool_parser.py:159-188``).
+    rather than ``request.structured_outputs``).
+
+    **We do NOT set ``request._grammar_from_tool_parser = True``.** Despite
+    the field's docstring at ``protocol.py:401-402`` reading parser-agnostic
+    ("CAUTION: Should only be set by ``ToolParser.adjust_request``"), its
+    actual contract — established in PR #39217 by a Mistral engineer in the
+    same commit that introduced the flag and its readers — is
+    Mistral-format-specific. Setting it routes the request through
+    Mistral-only dispatch sites at
+    ``vllm/entrypoints/openai/chat_completion/serving.py:823, 1407`` that
+    call ``MistralToolParser.extract_maybe_reasoning_and_tool_streaming``
+    and ``MistralToolParser.build_non_streaming_tool_calls`` — neither
+    method exists on ``Qwen3CoderToolParser``. The streaming dispatch's
+    ``assert isinstance(tool_parser, MistralToolParser)`` is the authored
+    contract, not a defensive scaffold; the non-streaming dispatch lacks
+    even that assertion (a separate latent upstream bug, see README §6.10
+    and §12 item 16).
+
+    The ``structural_tag`` enforcement is **independent of the flag**:
+    ``vllm/v1/structured_output/backend_xgrammar.py:92-106`` consumes
+    ``request.structured_outputs.structural_tag`` directly, with no
+    consultation of ``_grammar_from_tool_parser``. So omitting the flag
+    write loses none of the function-name pinning or framing-integrity
+    enforcement this patch promises in §7.7.
+
+    The ``_grammar_from_tool_parser`` PrivateAttr's existence is still
+    validated at Phase 5 above as a landmark — its removal upstream
+    would mean the Mistral-grammar plumbing changed, and our "do not
+    set it" invariant must be re-audited.
     """
     if not request.tools:
         return request
@@ -340,13 +399,10 @@ def _adjust_request_qwen3_grammar(
         return request
     if request.response_format is not None:
         return request
-    if getattr(request, "_grammar_from_tool_parser", False):
-        return request
 
     request.structured_outputs = StructuredOutputsParams(
         structural_tag=_build_structural_tag(request.tools)
     )
-    request._grammar_from_tool_parser = True
     return request
 
 
@@ -478,9 +534,16 @@ _require(
     f"Phase 9 case 1: triggers list is {_tag_obj['triggers']!r}; "
     f"expected ['<tool_call>'].",
 )
+# Confirm the inverse — we deliberately do NOT set the Mistral-only
+# ``_grammar_from_tool_parser`` flag. See the wrapper docstring for why.
 _require(
-    getattr(_req_auto, "_grammar_from_tool_parser", None) is True,
-    "Phase 9 case 1: _grammar_from_tool_parser flag was not set.",
+    getattr(_req_auto, "_grammar_from_tool_parser", None) is False,
+    "Phase 9 case 1: _grammar_from_tool_parser flag was set unexpectedly. "
+    "This is a Mistral-only flag (PR #39217); setting it from a "
+    "non-Mistral parser routes the request into Mistral-specific dispatch "
+    "sites at chat_completion/serving.py:823 and :1407 that call methods "
+    "Qwen3CoderToolParser does not implement. The patch was changed to "
+    "stop setting this flag; if you re-introduced the write, undo it.",
 )
 
 # Round-trip through xgrammar — load-bearing. Either compile_structural_tag
