@@ -20,6 +20,26 @@ actually emit — the hook is a no-op. The model emits XML tool calls
 * **Tool-call framing integrity.** The ``<tool_call>`` / ``</tool_call>``
   and ``<function=…>`` / ``</function>`` markers are part of the
   structural_tag, so they cannot be elided or duplicated.
+* **Parameter-body shape (Qwen3 hybrid XML+JSON).** Each tool's body is
+  enforced to the trained-shape ``<parameter=KEY>VALUE</parameter>`` XML
+  framing, with VALUE encoded per-type per Qwen3-Coder's chat template:
+  raw text (no quoting) for ``type:"string"`` properties, JSON literals
+  (numbers, ``true``/``false``, arrays, objects) for everything else.
+  This hybrid is what the chat template at ``chat_template.jinja:122``
+  renders for historical assistant tool calls
+  (``args_value | string if args_value is string else args_value | tojson``)
+  and what the post-hoc ``Qwen3CoderToolParser._parse_xml_function_call``
+  reads back. xgrammar's ``JSONSchemaFormat(style="qwen_xml")``
+  (``xgrammar/structural_tag.py:35-67``; shipped in xgrammar 0.1.32, the
+  lower bound of vLLM's ``>=0.1.32,<1.0.0`` pin in
+  ``vllm/requirements/common.txt``) implements both halves: literal
+  ``<parameter=`` / ``</parameter>`` framing is mandatory, and the body
+  content type-checks against the schema (``"42"`` is rejected for
+  ``type:integer``, ``42`` is accepted; for ``type:string`` both raw and
+  JSON-quoted text are accepted because both are valid string content).
+  The FSM rejects an empty body, rejects JSON-object-shaped bodies
+  (``{}`` after the ``<function=NAME>`` opener), rejects missing
+  ``required`` parameters, and rejects type-mismatched non-string values.
 * The ``supports_required_and_named`` latent bug is fixed in the same
   override (see below).
 
@@ -37,21 +57,28 @@ without an ``isinstance`` guard) — neither method exists on
 ``Qwen3CoderToolParser``. xgrammar enforcement is decoupled from the
 flag: ``vllm/v1/structured_output/backend_xgrammar.py:92-106`` consumes
 ``request.structured_outputs.structural_tag`` directly. So our
-function-name pinning and framing integrity properties are delivered
-without setting the flag.
+function-name pinning, framing integrity, and qwen_xml body
+enforcement are delivered without setting the flag.
 
-**What the constraint does NOT enforce: parameter-body shape.**
-Qwen3.6 emits XML (``<parameter=KEY>VALUE</parameter>``) *inside* the
-``<function=NAME>...</function>`` framing, and ``structural_tag.schema``
-is JSON-oriented at xgrammar ``≥ 0.1.32, < 1.0.0`` — it does not
-validate JSON Schemas against XML body text. We include the per-tool
-``schema`` in the structural_tag payload regardless: it round-trips
-cleanly through ``xgr.Grammar.from_structural_tag`` (Phase 6 verifier),
-and a future xgrammar release that enforces XML bodies against JSON
-Schema activates it without changing this patch. Until that lands, the
-§7.5 detector and the post-hoc qwen3_coder parser remain responsible
-for argument-shape correctness, and clients with strict-shape
-requirements validate ``tool_calls[i].function.arguments`` themselves.
+**v2 history (May 2026): the body-style fix.** Earlier (v1) versions of
+this patch built the structural_tag using xgrammar's deprecated
+``structures``+``triggers`` JSON shape. That shape silently routed
+through ``xgrammar/structural_tag.py:506-535``'s
+``StructuralTag.from_legacy_structural_tag`` converter, which hardcodes
+``JSONSchemaFormat(style="json")`` — the legacy API has no way to
+express XML body enforcement. xgrammar consequently forced the model
+into standard JSON output between ``<function=NAME>`` and
+``</function>``, contradicting Qwen3-Coder's training-shape XML and
+the post-hoc ``Qwen3CoderToolParser._parse_xml_function_call`` regex
+which scans for ``<parameter=KEY>VALUE</parameter>``. The parser
+matched zero ``<parameter=`` markers in JSON output, set
+``param_dict={}``, and emitted ``arguments="{}"`` for every single tool
+call. Self-aware re-prompting could not escape — the FSM masked every
+non-``{`` token. v2 emits the modern
+``StructuralTag``+``triggered_tags`` shape with explicit
+``style="qwen_xml"``, recovered the body enforcement, and added a
+Phase 9 byte-walk regression guard that asserts the matcher rejects
+``{`` at body-open and accepts ``<parameter=…>…</parameter>``.
 
 xgrammar's bitmask FSM stays dormant during
 ``<think>...</think>`` (``vllm/config/structured_outputs.py:41``
@@ -126,7 +153,7 @@ from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
 
 _PINNED_VLLM_COMMIT: str = "8cd174fa358326d5cc4195446be2ebcd65c481ce"
-_PATCH_TAG: str = "qwen36-agent-setup-qwen3-coder-grammar-v1"
+_PATCH_TAG: str = "qwen36-agent-setup-qwen3-coder-grammar-v2"
 
 # Source landmark — substring required in the BASE class's adjust_request
 # body. Catches an upstream refactor of the extension point's contract
@@ -294,14 +321,18 @@ _require(
 # --------------------------------------------------------------------
 # Phase 6: Verify xgrammar exposes the load-bearing entry points.
 # --------------------------------------------------------------------
-# Two surfaces matter: vLLM's own backend at
-# vllm/v1/structured_output/backend_xgrammar.py uses
-# xgr.StructuralTagItem(...) + xgr.Grammar.from_structural_tag(tags,
-# triggers) for validation, and compile_structural_tag(tags, triggers)
-# for compile. If either surface vanishes our request-time payload
-# becomes uncompile-able.
+# We compile the modern StructuralTag JSON-string shape via
+# xgr.Grammar.from_structural_tag(spec_str) and exercise it through
+# xgr.GrammarCompiler + xgr.GrammarMatcher in Phase 9. If any of these
+# surfaces vanish (xgrammar major version bump, name rename) our
+# request-time payload becomes uncompile-able and we refuse to install.
+#
+# `xgr.StructuralTagItem` is the legacy-shape factory we no longer use,
+# but its presence is the xgrammar-version landmark for "structural-tag
+# entry points are stable" — its disappearance correlates strongly with
+# a renamed/redesigned modern surface and is still worth refusal-checking.
 
-for _name in ("StructuralTagItem", "Grammar"):
+for _name in ("StructuralTagItem", "Grammar", "GrammarCompiler", "GrammarMatcher", "TokenizerInfo"):
     _require(
         hasattr(xgr, _name),
         f"xgrammar does not expose {_name!r}; xgrammar version drift.",
@@ -311,6 +342,12 @@ _require(
     "xgrammar.Grammar.from_structural_tag is missing or not callable; "
     "xgrammar version drift.",
 )
+_require(
+    callable(getattr(xgr.GrammarCompiler, "compile_structural_tag", None)),
+    "xgrammar.GrammarCompiler.compile_structural_tag is missing or not "
+    "callable; xgrammar version drift. The Phase 9 byte-walk regression "
+    "guard depends on this method.",
+)
 
 
 # --------------------------------------------------------------------
@@ -319,32 +356,63 @@ _require(
 
 
 def _build_structural_tag(tools: list[Any]) -> str:
-    """Render the tools list to xgrammar's deprecated-but-still-supported
-    ``structures``+``triggers`` JSON shape.
+    """Render the tools list to xgrammar's modern ``StructuralTag`` +
+    ``triggered_tags`` shape with ``JSONSchemaFormat(style="qwen_xml")``.
 
-    The legacy shape is what
-    ``vllm/v1/structured_output/backend_xgrammar.py:92-106`` accepts and
-    routes into ``xgr.StructuralTagItem`` (with ``schema=json.dumps(...)``
-    pre-applied at backend time). Per-tool ``begin``/``end`` strings
-    bracket the JSON-schema body so xgrammar enforces the literal
-    ``<tool_call>\\n<function=NAME>\\n...\\n</function>\\n</tool_call>``
-    framing Qwen3.6 emits.
+    Per-tool ``begin``/``end`` strings bracket the body so xgrammar
+    enforces the literal
+    ``<tool_call>\\n<function=NAME>\\n…\\n</function>\\n</tool_call>``
+    framing. Inside that framing, ``style="qwen_xml"`` compiles the
+    JSON Schema into a body grammar that requires
+    ``<parameter=KEY>VALUE</parameter>`` for each property, with type
+    and ``required`` enforcement. This is exactly the shape Qwen3-Coder
+    is trained to emit and the shape ``Qwen3CoderToolParser._parse_xml_function_call``
+    (``vllm/tool_parsers/qwen3coder_tool_parser.py:225-253``) reads.
 
-    A tool whose ``parameters`` is None contributes an empty-object
-    schema; xgrammar accepts ``{}`` as "any JSON object".
+    Why the modern shape, not the legacy ``structures``+``triggers``
+    one: the legacy converter at
+    ``xgrammar/structural_tag.py:506-535`` (``from_legacy_structural_tag``)
+    hardcodes ``JSONSchemaFormat(style="json")``, with no way to override.
+    A legacy payload silently forces the model into JSON body output —
+    valid JSON, but the qwen3_coder XML parser then matches zero
+    ``<parameter=`` markers in it and emits ``arguments="{}"`` for every
+    tool call. v1 of this patch hit that pothole; v2 sidesteps it by
+    using the modern shape, which routes through
+    ``vllm/v1/structured_output/backend_xgrammar.py:106``'s
+    ``compiler.compile_structural_tag(grammar_spec)`` directly.
+
+    A tool whose ``parameters`` is ``None`` contributes an empty-object
+    schema; xgrammar accepts an empty body (no ``<parameter=…>``
+    markers) for it.
     """
-    structures: list[dict[str, Any]] = []
+    tags: list[dict[str, Any]] = []
     for t in tools:
         fn = t.function
         params = fn.parameters if fn.parameters is not None else {}
-        structures.append(
+        tags.append(
             {
+                "type": "tag",
                 "begin": f"<tool_call>\n<function={fn.name}>\n",
-                "schema": params,
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": params,
+                    "style": "qwen_xml",
+                },
                 "end": "\n</function>\n</tool_call>",
             }
         )
-    return json.dumps({"structures": structures, "triggers": ["<tool_call>"]})
+    return json.dumps(
+        {
+            "type": "structural_tag",
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<tool_call>"],
+                "tags": tags,
+                "at_least_one": False,
+                "stop_after_first": False,
+            },
+        }
+    )
 
 
 def _adjust_request_qwen3_grammar(
@@ -380,8 +448,8 @@ def _adjust_request_qwen3_grammar(
     ``vllm/v1/structured_output/backend_xgrammar.py:92-106`` consumes
     ``request.structured_outputs.structural_tag`` directly, with no
     consultation of ``_grammar_from_tool_parser``. So omitting the flag
-    write loses none of the function-name pinning or framing-integrity
-    enforcement this patch promises in §7.7.
+    write loses none of the function-name pinning, framing integrity,
+    or qwen_xml body enforcement this patch promises in §7.7.
 
     The ``_grammar_from_tool_parser`` PrivateAttr's existence is still
     validated at Phase 5 above as a landmark — its removal upstream
@@ -511,29 +579,70 @@ _require(
     f"Phase 9 case 1: structural_tag is {_tag_str!r}; expected non-empty str.",
 )
 _tag_obj = json.loads(_tag_str)
+
+# Refuse the legacy shape outright. The legacy 'structures'+'triggers'
+# payload silently routes through xgrammar's from_legacy_structural_tag
+# (xgrammar/structural_tag.py:506-535) which hardcodes
+# JSONSchemaFormat(style='json') — forcing the model into JSON body
+# output that vLLM's qwen3_coder XML parser cannot read, producing
+# arguments='{}' for every tool call. v1 of this patch hit that pothole.
+_require(
+    "structures" not in _tag_obj,
+    "Phase 9 case 1: structural_tag carries the legacy 'structures' key. "
+    "The legacy shape forces JSON body enforcement via "
+    "from_legacy_structural_tag → JSONSchemaFormat(style='json'), and "
+    "Qwen3-Coder emits XML — the mismatch produces arguments='{}' for "
+    "every tool call. _build_structural_tag must emit the modern "
+    "{'type':'structural_tag','format':{'type':'triggered_tags',...}} "
+    "shape with style='qwen_xml' on each tag's content.",
+)
+
+# Top-level shape: modern StructuralTag.
 _require(
     isinstance(_tag_obj, dict)
-    and "structures" in _tag_obj
-    and "triggers" in _tag_obj,
-    f"Phase 9 case 1: structural_tag JSON shape is {_tag_obj!r}; "
-    f"expected {{'structures': [...], 'triggers': [...]}}.",
+    and _tag_obj.get("type") == "structural_tag"
+    and isinstance(_tag_obj.get("format"), dict),
+    f"Phase 9 case 1: structural_tag JSON shape is {_tag_obj!r}; expected "
+    f"{{'type':'structural_tag','format':{{'type':'triggered_tags',...}}}}.",
+)
+_fmt = _tag_obj["format"]
+_require(
+    _fmt.get("type") == "triggered_tags",
+    f"Phase 9 case 1: format.type is {_fmt.get('type')!r}; "
+    f"expected 'triggered_tags'.",
 )
 _require(
-    isinstance(_tag_obj["structures"], list) and len(_tag_obj["structures"]) == 1,
-    f"Phase 9 case 1: structures list length is "
-    f"{len(_tag_obj['structures'])!r}; expected 1.",
-)
-_first = _tag_obj["structures"][0]
-_require(
-    _first["begin"] == "<tool_call>\n<function=calculator>\n"
-    and _first["end"] == "\n</function>\n</tool_call>",
-    f"Phase 9 case 1: structure begin/end tags drifted: {_first!r}.",
-)
-_require(
-    _tag_obj["triggers"] == ["<tool_call>"],
-    f"Phase 9 case 1: triggers list is {_tag_obj['triggers']!r}; "
+    _fmt.get("triggers") == ["<tool_call>"],
+    f"Phase 9 case 1: triggers list is {_fmt.get('triggers')!r}; "
     f"expected ['<tool_call>'].",
 )
+_tags = _fmt.get("tags")
+_require(
+    isinstance(_tags, list) and len(_tags) == 1,
+    f"Phase 9 case 1: format.tags length is "
+    f"{len(_tags) if isinstance(_tags, list) else None!r}; expected 1.",
+)
+_first = _tags[0]
+_require(
+    _first.get("type") == "tag"
+    and _first.get("begin") == "<tool_call>\n<function=calculator>\n"
+    and _first.get("end") == "\n</function>\n</tool_call>",
+    f"Phase 9 case 1: tag begin/end framing drifted: {_first!r}.",
+)
+_content = _first.get("content")
+_require(
+    isinstance(_content, dict)
+    and _content.get("type") == "json_schema"
+    and _content.get("style") == "qwen_xml",
+    f"Phase 9 case 1: tag content is {_content!r}; expected "
+    f"{{'type':'json_schema','json_schema':...,'style':'qwen_xml'}}. "
+    f"style='json' (the JSONSchemaFormat default at "
+    f"xgrammar/structural_tag.py:35) compiles to a JSON-body grammar "
+    f"that Qwen3-Coder's XML parser cannot read; only 'qwen_xml' "
+    f"compiles to the <parameter=KEY>VALUE</parameter> body grammar "
+    f"the parser is built for.",
+)
+
 # Confirm the inverse — we deliberately do NOT set the Mistral-only
 # ``_grammar_from_tool_parser`` flag. See the wrapper docstring for why.
 _require(
@@ -546,15 +655,68 @@ _require(
     "stop setting this flag; if you re-introduced the write, undo it.",
 )
 
-# Round-trip through xgrammar — load-bearing. Either compile_structural_tag
-# entry point (vLLM's own backend uses both) must accept what we produced.
-_xgr_tags = [
-    xgr.StructuralTagItem(
-        begin=s["begin"], schema=json.dumps(s["schema"]), end=s["end"]
+# Round-trip through xgrammar — load-bearing.
+# vLLM's backend at backend_xgrammar.py:106 calls compiler.compile_structural_tag(grammar_spec)
+# on the modern-shape JSON string directly. Grammar.from_structural_tag is
+# the equivalent surface for build-time validation.
+xgr.Grammar.from_structural_tag(_tag_str)
+
+# Functional regression guard — the load-bearing functional check.
+# v1 of this patch's payload also compiled cleanly through
+# Grammar.from_structural_tag; only this byte-walk catches "compiles, but
+# enforces the wrong body shape." We construct a synthetic TokenizerInfo
+# with a 256-byte vocab so the matcher accepts any UTF-8 byte at the
+# tokenizer level — leaving the grammar as the sole gate.
+_synthetic_tokenizer_info = xgr.TokenizerInfo(
+    encoded_vocab=[bytes([_i]) for _i in range(256)],
+)
+_synthetic_compiler = xgr.GrammarCompiler(_synthetic_tokenizer_info)
+_compiled_ctx = _synthetic_compiler.compile_structural_tag(_tag_str)
+
+# Positive: a canonical XML body for the calculator tool MUST be accepted
+# byte-by-byte. If the matcher rejects any byte, qwen_xml style isn't
+# actually enforced — most likely an xgrammar version drop or a payload
+# malformation we missed in the shape checks above.
+_canonical_xml = (
+    "<tool_call>\n<function=calculator>\n"
+    "<parameter=expr>\n2+2\n</parameter>\n"
+    "</function>\n</tool_call>"
+)
+_matcher = xgr.GrammarMatcher(_compiled_ctx)
+for _i, _ch in enumerate(_canonical_xml):
+    _require(
+        _matcher.accept_string(_ch),
+        f"Phase 9 regression guard: FSM rejected canonical Qwen XML body "
+        f"byte at index {_i} (char {_ch!r}) of "
+        f"{_canonical_xml!r}. The compiled grammar does not accept the "
+        f"training-shape body Qwen3-Coder emits — "
+        f"JSONSchemaFormat(style='qwen_xml') is not in effect. Either "
+        f"xgrammar dropped/renamed the qwen_xml style or "
+        f"_build_structural_tag is producing a malformed payload.",
     )
-    for s in _tag_obj["structures"]
-]
-xgr.Grammar.from_structural_tag(_xgr_tags, _tag_obj["triggers"])
+
+# Negative: a body that opens with '{' (the JSON path the v1 bug forced)
+# MUST be rejected. We walk up to the body-open boundary and confirm that
+# '{' is masked.
+_matcher = xgr.GrammarMatcher(_compiled_ctx)
+_pre_open = "<tool_call>\n<function=calculator>\n"
+for _ch in _pre_open:
+    _require(
+        _matcher.accept_string(_ch),
+        f"Phase 9 regression guard: FSM unexpectedly rejected the "
+        f"pre-body framing byte {_ch!r}. The grammar's tool-call envelope "
+        f"is malformed; this should never happen if the canonical-XML "
+        f"walk above passed.",
+    )
+_require(
+    not _matcher.accept_string("{"),
+    "Phase 9 regression guard: FSM accepted '{' immediately after "
+    "<function=calculator>\\n — JSON body shape is allowed by the grammar, "
+    "meaning JSONSchemaFormat(style='qwen_xml') is NOT in effect. The "
+    "qwen3_coder parser reads only XML; with JSON body it produces "
+    "arguments='{}' for every tool call. This is the exact bug v2 was "
+    "written to fix; refusing to install.",
+)
 
 # Case 2: empty tools list — precondition gate must fire BEFORE we touch
 # structured_outputs (negative control: proves the patch is not a
@@ -605,8 +767,12 @@ _require(
 _logger.info(
     "[%s] applied: overrode %s.adjust_request and flipped "
     "supports_required_and_named=False for vLLM commit %s "
-    "(per-request xgrammar structural_tag installs on tool_choice='auto'; "
-    "thinking-mode FSM dormant by enable_in_reasoning=False default).",
+    "(per-request xgrammar structural_tag with JSONSchemaFormat(style='qwen_xml') "
+    "installs on tool_choice='auto', enforcing function-name pinning, framing, "
+    "and Qwen XML parameter-body shape; thinking-mode FSM dormant by "
+    "enable_in_reasoning=False default; Phase 9 byte-walks the matcher to "
+    "prove '{' body-open is rejected and canonical <parameter=...>...</parameter> "
+    "is accepted).",
     _PATCH_TAG,
     _ParserCls.__qualname__,
     _PINNED_VLLM_COMMIT,
