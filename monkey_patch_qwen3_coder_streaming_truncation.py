@@ -409,17 +409,36 @@ _require(
 # instances. These are read by the helper and the wrap; without them
 # the wrap would AttributeError at request time.
 # --------------------------------------------------------------------
+# Some attrs (e.g. `prev_tool_call_arr`, `streamed_args_for_tool`,
+# `is_tool_call_started`, the sentinel-token strings) are assigned
+# directly in `Qwen3CoderToolParser.__init__` (or its base
+# `ToolParser.__init__`); others (e.g. `in_function`, `json_started`,
+# `json_closed`, `param_count`, `current_function_name`,
+# `current_tool_index`) are assigned in `_reset_streaming_state`,
+# which `__init__` calls at construction time. We search the entire
+# class source for the assignment landmark — `__init__`-only is
+# insufficient because the lazy reset method is invoked OUT of the
+# `__init__` body's own bytes.
 
-_combined_init_src = ""
+try:
+    _parser_class_src = inspect.getsource(_ParserCls)
+except (OSError, TypeError) as _exc:
+    raise StreamingTruncationPatchRefusedError(
+        f"[{_PATCH_TAG}] cannot read {_ParserCls.__qualname__} source: {_exc!r}"
+    ) from _exc
+_parser_base_init_src = ""
 for _ancestor in _ParserCls.__mro__:
-    if _ancestor is object or "__init__" not in _ancestor.__dict__:
+    if _ancestor is _ParserCls or _ancestor is object:
+        continue
+    if "__init__" not in _ancestor.__dict__:
         continue
     try:
-        _combined_init_src += "\n" + inspect.getsource(_ancestor.__init__)
+        _parser_base_init_src += "\n" + inspect.getsource(_ancestor.__init__)
     except (OSError, TypeError) as _exc:
         raise StreamingTruncationPatchRefusedError(
             f"[{_PATCH_TAG}] cannot read {_ancestor.__qualname__}.__init__: {_exc!r}"
         ) from _exc
+_parser_combined_src = _parser_class_src + "\n" + _parser_base_init_src
 
 # These are state attributes the wrap and helper read.
 _REQUIRED_PARSER_ATTRS: list[str] = [
@@ -442,9 +461,9 @@ _REQUIRED_PARSER_ATTRS: list[str] = [
 ]
 for _attr in _REQUIRED_PARSER_ATTRS:
     _require(
-        f"self.{_attr}" in _combined_init_src,
-        f"Qwen3CoderToolParser.__init__ (MRO walk) does not assign "
-        f"self.{_attr}; the wrap and helper depend on it.",
+        f"self.{_attr}" in _parser_combined_src,
+        f"Qwen3CoderToolParser (class body + base __init__ MRO walk) does "
+        f"not assign self.{_attr}; the wrap and helper depend on it.",
     )
 
 
