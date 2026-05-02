@@ -40,12 +40,13 @@ sampling Best-Practices fields. The values:
 
   * ``max_pattern_size=8``    — catches loops up to 8-token cycles
   * ``min_pattern_size=1``    — catches the single-token wall-of-zeros
-  * ``min_count=24``          — lets legitimate ≤23-digit decimal
-                                literals complete (int64 boundaries
-                                near 9.2×10¹⁸ are 19 digits) while
-                                bounding the worst-case degenerate
-                                burst to ~24 wasted tokens instead
-                                of ``max_tokens``
+  * ``min_count=96``          — lets legitimate ≤95-digit decimal
+                                literals complete (int64 ≈19 digits,
+                                int128 ≈39 digits, 256-bit integers
+                                up to 78 digits) while bounding the
+                                worst-case degenerate burst to ~96
+                                wasted tokens (~0.3 % of a 32 768-token
+                                response)
 
 This is intentionally a SEPARATE patch from
 ``monkey_patch_default_sampling_params``: that patch enforces
@@ -95,7 +96,7 @@ _PATCH_TAG: str = "qwen36-agent-setup-repetition-detection-default-v1"
 # The defense values. See module docstring for rationale of each.
 _RD_MAX_PATTERN_SIZE: int = 8
 _RD_MIN_PATTERN_SIZE: int = 1
-_RD_MIN_COUNT: int = 24
+_RD_MIN_COUNT: int = 96
 
 
 _logger = init_logger(f"vllm.qwen36_patches.{__name__}")
