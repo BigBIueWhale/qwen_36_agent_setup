@@ -299,6 +299,7 @@ DOCKER_RUN_ARGS=(
     -v "${REPO_DIR}/monkey_patch_reasoning_field_egress.py:/opt/patches/monkey_patch_reasoning_field_egress.py:ro"
     -v "${REPO_DIR}/monkey_patch_tool_call_in_think_detector.py:/opt/patches/monkey_patch_tool_call_in_think_detector.py:ro"
     -v "${REPO_DIR}/monkey_patch_default_sampling_params.py:/opt/patches/monkey_patch_default_sampling_params.py:ro"
+    -v "${REPO_DIR}/monkey_patch_repetition_detection_default.py:/opt/patches/monkey_patch_repetition_detection_default.py:ro"
     -v "${REPO_DIR}/monkey_patch_qwen3_coder_grammar.py:/opt/patches/monkey_patch_qwen3_coder_grammar.py:ro"
     -v "${REPO_DIR}/monkey_patch_request_memory_snapshot.py:/opt/patches/monkey_patch_request_memory_snapshot.py:ro"
     -v "${REPO_DIR}/monkey_patch_tool_role_media_preserve.py:/opt/patches/monkey_patch_tool_role_media_preserve.py:ro"

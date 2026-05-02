@@ -608,6 +608,39 @@ def _verify_default_sampling_params(patch_module: ModuleType) -> None:
     )
 
 
+def _verify_repetition_detection_default(patch_module: ModuleType) -> None:
+    """Verify ``monkey_patch_repetition_detection_default`` wrapped
+    ``ChatCompletionRequest.to_sampling_params``.
+
+    Same target as ``_verify_default_sampling_params`` (both patches
+    compose on the SAME method via the ``__wrapped_original__`` chain,
+    each stamping its own ``__qwen36_patch__`` tag). The chain walker
+    in :func:`_verify_target_carries_tag` finds the right wrapper by
+    tag value, so ordering between the two does not affect verifier
+    correctness. The patch's own Phase 8 self-verification covers the
+    behavioural cases (default applies on unset, explicit value
+    preserved, no instance aliasing across requests).
+    """
+    expected_tag = _expected_tag_from(patch_module)
+    try:
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+    except ImportError as exc:
+        raise PatchVerificationError(
+            f"[{_LAUNCHER_TAG}] cannot import "
+            f"vllm.entrypoints.openai.chat_completion.protocol."
+            f"ChatCompletionRequest for verification: {exc!r}"
+        ) from exc
+    _verify_target_carries_tag(
+        ChatCompletionRequest,
+        "to_sampling_params",
+        expected_tag,
+        patch_module_name=patch_module.__name__,
+        target_description="ChatCompletionRequest",
+    )
+
+
 def _verify_qwen3_coder_grammar(patch_module: ModuleType) -> None:
     """Verify ``monkey_patch_qwen3_coder_grammar`` overrode
     ``Qwen3CoderToolParser.adjust_request`` and flipped
@@ -874,6 +907,7 @@ _PATCH_MODULES: tuple[str, ...] = (
     "monkey_patch_reasoning_field_ingest",
     "monkey_patch_tool_call_in_think_detector",
     "monkey_patch_default_sampling_params",
+    "monkey_patch_repetition_detection_default",
     "monkey_patch_qwen3_coder_grammar",
     "monkey_patch_request_memory_snapshot",
     "monkey_patch_tool_role_media_preserve",
@@ -888,6 +922,7 @@ _PATCH_VERIFICATION: dict[str, _PatchVerifier] = {
     "monkey_patch_reasoning_field_ingest": _verify_reasoning_field_ingest,
     "monkey_patch_tool_call_in_think_detector": _verify_tool_call_in_think_detector,
     "monkey_patch_default_sampling_params": _verify_default_sampling_params,
+    "monkey_patch_repetition_detection_default": _verify_repetition_detection_default,
     "monkey_patch_qwen3_coder_grammar": _verify_qwen3_coder_grammar,
     "monkey_patch_request_memory_snapshot": _verify_request_memory_snapshot,
     "monkey_patch_tool_role_media_preserve": _verify_tool_role_media_preserve,
