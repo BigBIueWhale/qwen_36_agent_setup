@@ -16,29 +16,30 @@
   html,body{margin:0;background:var(--bg);color:var(--ink)}
   body{
     font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans Hebrew","Arial Hebrew",Arial,sans-serif;
-    max-width:940px;margin:0 auto;padding:18px 16px 48px;
+    max-width:960px;margin:0 auto;padding:18px 16px 48px;
   }
   header{margin:6px 2px 18px}
   h1{font-size:21px;line-height:1.3;margin:0 0 8px;letter-spacing:-.01em}
   .lede{color:var(--muted);font-size:13.5px;margin:0}
   .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
   .chip{background:var(--chip);color:var(--chip-ink);font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;white-space:nowrap}
-  .rec{background:linear-gradient(135deg,#f0f5ff,#eaf7f0);border:1px solid #d6e4ff;border-radius:16px;padding:16px 18px;margin:18px 0 6px;box-shadow:var(--shadow)}
-  .rec .tag{display:inline-block;background:var(--good);color:#fff;font-size:11px;font-weight:800;padding:3px 11px;border-radius:999px;letter-spacing:.03em}
-  .rec h2{font-size:18px;margin:10px 0 6px;letter-spacing:-.01em}
+  .rec{background:linear-gradient(135deg,#eef4ff,#eaf7f0);border:1px solid #d6e4ff;border-radius:16px;padding:16px 18px;margin:18px 0 6px;box-shadow:var(--shadow)}
+  .rec .tag{display:inline-block;background:var(--accent);color:#fff;font-size:11px;font-weight:800;padding:3px 11px;border-radius:999px;letter-spacing:.03em}
+  .rec h2{font-size:18px;margin:10px 0 8px;letter-spacing:-.01em;line-height:1.35}
   .rec p{margin:0;color:#2a3240;font-size:14px}
-  .rec .big{color:var(--good);font-weight:800}
+  .rec .big{color:var(--accent-ink);font-weight:800}
+  .rec .lead{color:var(--good);font-weight:800}
   .cards{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
   .icard{flex:1 1 240px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;box-shadow:var(--shadow)}
-  .icard .k{font-size:20px;font-weight:800;color:var(--accent-ink);line-height:1.1;direction:ltr;text-align:right;unicode-bidi:plaintext}
-  .icard .t{font-size:12.5px;color:var(--muted);margin-top:4px}
+  .icard .k{font-size:19px;font-weight:800;color:var(--accent-ink);line-height:1.15;direction:ltr;text-align:right;unicode-bidi:plaintext}
+  .icard .t{font-size:12.5px;color:var(--muted);margin-top:5px}
   section{margin-top:28px}
   h2.sec{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}
   .spec{color:var(--accent-ink);font-size:12.5px;font-weight:600;margin:0 0 12px}
   .tbl{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
   table{width:100%;border-collapse:collapse}
-  thead th{background:#fafbfd;color:var(--faint);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;text-align:right;padding:11px 14px;border-bottom:1px solid var(--line)}
-  td{padding:12px 14px;border-bottom:1px solid var(--line2);vertical-align:top;text-align:right}
+  thead th{background:#fafbfd;color:var(--faint);font-size:11px;font-weight:700;letter-spacing:.02em;text-align:right;padding:11px 12px;border-bottom:1px solid var(--line)}
+  td{padding:12px 12px;border-bottom:1px solid var(--line2);vertical-align:top;text-align:right}
   tbody tr:last-child td{border-bottom:none}
   .plat{font-weight:700;line-height:1.35}
   .plat bdi{display:inline-block}
@@ -47,9 +48,8 @@
   .price{font-weight:700}
   .pmain{display:block;font-weight:800;direction:ltr;text-align:right;unicode-bidi:plaintext;font-variant-numeric:tabular-nums}
   .best{color:var(--good);font-weight:800}
-  .best-pill{display:inline-block;background:var(--good-bg);color:var(--good);font-size:10.5px;font-weight:800;padding:1px 8px;border-radius:999px;margin-inline-start:6px}
+  .best-pill{display:inline-block;background:var(--good-bg);color:var(--good);font-size:10px;font-weight:800;padding:1px 7px;border-radius:999px;margin-inline-start:6px}
   .cant{color:var(--bad);font-weight:700}
-  .spec2{color:var(--faint);font-size:12px;margin-top:5px;line-height:1.5}
   .buy{font-size:12.5px;color:var(--muted);line-height:1.6}
   .buy b{color:var(--ink)}
   bdi,.ltr{direction:ltr;unicode-bidi:isolate}
@@ -62,7 +62,8 @@
   .why li{color:var(--muted);font-size:13px;margin-bottom:7px}
   .why li b{color:var(--ink)}
   .why .ok{color:var(--good);font-weight:800}
-  .why.warn{background:#fffdf5;border-color:#f0e4bd}
+  .why.hi{background:#eef5ff;border-color:#cfe0ff}
+  .why.hi h3{color:var(--accent-ink)}
   .legend{margin-top:26px;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px 18px 6px}
   .legend h3{font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--faint);margin:0 0 10px}
   .legend dt{font-weight:700;font-size:13px;margin-top:10px}
@@ -77,7 +78,7 @@
     tbody tr:last-child{border-bottom:none}
     td{display:flex;justify-content:space-between;gap:14px;align-items:baseline;border-bottom:1px solid var(--line2);padding:10px 14px}
     tr td:last-child{border-bottom:none}
-    td::before{content:attr(data-label);color:var(--faint);font-size:11px;font-weight:700;flex:0 0 42%}
+    td::before{content:attr(data-label);color:var(--faint);font-size:11px;font-weight:700;flex:0 0 46%}
     td.plat{display:block;background:#fafbfd;padding:12px 14px;border-bottom:1px solid var(--line)}
     td.plat::before{display:none}
     td.buy,td.stack{display:block}
@@ -101,13 +102,14 @@
 
 <!-- RECOMMENDATION -->
 <div class="rec">
-  <span class="tag">שורה תחתונה — המלצה</span>
-  <h2>קנו מחשבי RTX PRO 6000 — לא DGX (אלא אם צריך את מודל הדגל)</h2>
-  <p>עבור <b>Google Gemma 4 31B</b> ו‑<b>Ornith‑1.0‑35B‑A3B</b>: מחשב <b>Dell Precision 7960</b> עם <b>4× NVIDIA RTX PRO 6000 Blackwell Max‑Q</b> נותן את <span class="big">העלות הנמוכה ביותר לכל סוכן</span> — כ‑3,700–3,900 ₪ למשתמש חי, <span class="big">חיסכון של ~65%</span> לעומת DGX B200 ופי ~2 זול מ‑H200, באותה קיבולת. את ה‑DGX B200 (כ‑1.6 מיליון ₪) צריך <b>רק</b> עבור מודל הדגל <b>Ornith‑1.0‑397B</b> — המערכת היחידה שמסוגלת בכלל להריץ אותו.</p>
+  <span class="tag">ההחלטה — שני מסלולים</span>
+  <h2>הזול ביותר הוא <bdi>RTX PRO 6000</bdi> — אבל לאיכות, התשובה היא <bdi>DGX B200</bdi></h2>
+  <p><b>המסלול החסכוני:</b> מחשב <b>Dell Precision 7960 + 4× RTX PRO 6000 Max‑Q</b> (190,000 ₪) הוא <span class="lead">ללא ספק המשתלם ביותר</span> — כ‑<b>3,725 ₪ למשתמש חי</b> ו‑23,750 ₪ למשתמש חם. 8 סוכנים חמים ו‑~49–51 חיים ליחידה, באורך שיחה מקסימלי (Gemma 4 31B ב‑256K או Ornith‑1.0‑35B‑A3B ב‑1M).<br><br>
+  <b>המסלול לאיכות (ההמלצה):</b> <b>NVIDIA DGX 8×B200</b> (1,600,000 ₪) — מעט יקר יותר לכל משתמש (10,596 ₪ חי / 26,229 ₪ חם עם המודל הבינוני), אבל <span class="big">וזה הקטע הקריטי:</span> זו המכונה <b>היחידה</b> שמסוגלת להריץ את מודל הדגל <b>DeepReinforce Ornith‑1.0‑397B @ 1M</b>, באיכות מתקרבת ל‑<b>Sonnet של Anthropic</b>. <span class="lead">אם רוצים איכות — זו התשובה היחידה.</span></p>
   <div class="cards">
-    <div class="icard"><div class="k">~65% חיסכון</div><div class="t">בעלות לכל סוכן חי לעומת DGX B200 (Ornith‑1.0‑35B‑A3B)</div></div>
-    <div class="icard"><div class="k">190,000 ₪</div><div class="t">מחיר מחשב RTX PRO 6000, לעומת ~1,600,000 ₪ ל‑DGX B200</div></div>
-    <div class="icard"><div class="k">מדרגיות</div><div class="t">מוסיפים מחשבים לפי גידול הביקוש — לא הוצאה הונית ענקית מראש</div></div>
+    <div class="icard"><div class="k">3,725 ₪ / חי</div><div class="t">RTX PRO 6000 — המחיר הנמוך ביותר לכל סוכן</div></div>
+    <div class="icard"><div class="k">397B ≈ Sonnet</div><div class="t">רק DGX 8×B200 מריץ את מודל הדגל — איכות ברמת Sonnet של Anthropic</div></div>
+    <div class="icard"><div class="k">28 / 88 · 61 / 151</div><div class="t">משתמשים חמים / חיים ל‑DGX: מודל מפלצתי (397B) · מודל בינוני (35B)</div></div>
   </div>
 </div>
 
@@ -153,15 +155,15 @@
 
 <!-- TABLE 1 -->
 <section>
-  <h2 class="sec">טבלה 1 — <bdi>Google Gemma 4 31B</bdi> (מודל צפוף)</h2>
+  <h2 class="sec">טבלה 1 — <bdi>Google Gemma 4 31B</bdi> (מודל צפוף · בינוני)</h2>
   <p class="spec">משקלים 8‑ביט FP8 (~31 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר מקורי 262,144 טוקנים (256K) · 20.78 ג׳יגה‑בייט KV למשתמש</p>
   <div class="tbl">
   <table>
-    <thead><tr><th style="width:40%">מערכת (יחידה אחת)</th><th>משתמשים חמים</th><th>משתמשים חיים</th><th>מחיר ₪ כולל מע״מ</th><th>עלות למשתמש חי</th></tr></thead>
+    <thead><tr><th style="width:33%">מערכת (יחידה אחת)</th><th>חמים</th><th>חיים</th><th>מחיר כולל מע״מ</th><th>עלות למשתמש חם</th><th>עלות למשתמש חי</th></tr></thead>
     <tbody>
-      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="משתמשים חמים">≈ 59</td><td class="num" data-label="משתמשים חיים">≈ 146</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 11,000 ₪</td></tr>
-      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="num" data-label="משתמשים חמים">≈ 8</td><td class="num" data-label="משתמשים חיים">≈ 49</td><td class="num price" data-label="מחיר">390,000 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 8,000 ₪</td></tr>
-      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="num" data-label="משתמשים חמים">≈ 8</td><td class="num" data-label="משתמשים חיים">≈ 49</td><td class="num price" data-label="מחיר">190,000 ₪</td><td class="num best" data-label="עלות למשתמש חי">≈ 3,900 ₪ <span class="best-pill">הזול ביותר</span></td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="חמים">≈ 59</td><td class="num" data-label="חיים">≈ 146</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="עלות למשתמש חם">≈ 27,100 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 10,960 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 49</td><td class="num price" data-label="מחיר">390,000 ₪</td><td class="num" data-label="עלות למשתמש חם">≈ 48,750 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 7,960 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 49</td><td class="num price" data-label="מחיר">190,000 ₪</td><td class="num best" data-label="עלות למשתמש חם">≈ 23,750 ₪</td><td class="num best" data-label="עלות למשתמש חי">≈ 3,880 ₪ <span class="best-pill">הזול ביותר</span></td></tr>
     </tbody>
   </table>
   </div>
@@ -169,15 +171,15 @@
 
 <!-- TABLE 2 -->
 <section>
-  <h2 class="sec">טבלה 2 — <bdi>DeepReinforce Ornith-1.0-35B-A3B</bdi> (תערובת מומחים, ~3B פעילים)</h2>
+  <h2 class="sec">טבלה 2 — <bdi>DeepReinforce Ornith-1.0-35B-A3B</bdi> (תערובת מומחים · בינוני, ~3B פעילים)</h2>
   <p class="spec">משקלים 8‑ביט FP8 (~36 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר 1,048,576 טוקנים (1M) · 20.0 ג׳יגה‑בייט KV למשתמש</p>
   <div class="tbl">
   <table>
-    <thead><tr><th style="width:40%">מערכת (יחידה אחת)</th><th>משתמשים חמים</th><th>משתמשים חיים</th><th>מחיר ₪ כולל מע״מ</th><th>עלות למשתמש חי</th></tr></thead>
+    <thead><tr><th style="width:33%">מערכת (יחידה אחת)</th><th>חמים</th><th>חיים</th><th>מחיר כולל מע״מ</th><th>עלות למשתמש חם</th><th>עלות למשתמש חי</th></tr></thead>
     <tbody>
-      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="משתמשים חמים">≈ 61</td><td class="num" data-label="משתמשים חיים">≈ 151</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 10,600 ₪</td></tr>
-      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="num" data-label="משתמשים חמים">≈ 8</td><td class="num" data-label="משתמשים חיים">≈ 51</td><td class="num price" data-label="מחיר">390,000 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 7,600 ₪</td></tr>
-      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="num" data-label="משתמשים חמים">≈ 8</td><td class="num" data-label="משתמשים חיים">≈ 51</td><td class="num price" data-label="מחיר">190,000 ₪</td><td class="num best" data-label="עלות למשתמש חי">≈ 3,700 ₪ <span class="best-pill">הזול ביותר</span></td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="חמים">≈ 61</td><td class="num" data-label="חיים">≈ 151</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="עלות למשתמש חם">≈ 26,229 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 10,596 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 51</td><td class="num price" data-label="מחיר">390,000 ₪</td><td class="num" data-label="עלות למשתמש חם">≈ 48,750 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 7,650 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 51</td><td class="num price" data-label="מחיר">190,000 ₪</td><td class="num best" data-label="עלות למשתמש חם">≈ 23,750 ₪</td><td class="num best" data-label="עלות למשתמש חי">≈ 3,725 ₪ <span class="best-pill">הזול ביותר</span></td></tr>
     </tbody>
   </table>
   </div>
@@ -185,34 +187,38 @@
 
 <!-- TABLE 3 -->
 <section>
-  <h2 class="sec">טבלה 3 — <bdi>DeepReinforce Ornith-1.0-397B</bdi> (תערובת מומחים, ~17B פעילים)</h2>
-  <p class="spec">משקלים 8‑ביט FP8 (~397 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר 1,048,576 טוקנים (1M) · 30.0 ג׳יגה‑בייט KV למשתמש · רץ על <bdi>NVIDIA B200</bdi> בלבד</p>
+  <h2 class="sec">טבלה 3 — <bdi>DeepReinforce Ornith-1.0-397B</bdi> (תערובת מומחים · מודל הדגל, ~17B פעילים)</h2>
+  <p class="spec">משקלים 8‑ביט FP8 (~397 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר 1,048,576 טוקנים (1M) · 30.0 ג׳יגה‑בייט KV למשתמש · <b>איכות מתקרבת ל‑Sonnet של Anthropic</b> · רץ על <bdi>NVIDIA B200</bdi> בלבד</p>
   <div class="tbl">
   <table>
-    <thead><tr><th style="width:40%">מערכת (יחידה אחת)</th><th>משתמשים חמים</th><th>משתמשים חיים</th><th>מחיר ₪ כולל מע״מ</th><th>עלות למשתמש חי</th></tr></thead>
+    <thead><tr><th style="width:33%">מערכת (יחידה אחת)</th><th>חמים</th><th>חיים</th><th>מחיר כולל מע״מ</th><th>עלות למשתמש חם</th><th>עלות למשתמש חי</th></tr></thead>
     <tbody>
-      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="משתמשים חמים">≈ 28</td><td class="num" data-label="משתמשים חיים">≈ 88</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 18,200 ₪</td></tr>
-      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="cant" data-label="משתמשים חמים">לא ניתן להריץ</td><td class="num" data-label="משתמשים חיים">—</td><td class="num" data-label="מחיר">—</td><td class="buy" data-label="סיבה">397 ג״ב משקלים חורגים מ‑141 ג״ב של כרטיס H200 בודד, והכרטיסים אינם מאוחדים</td></tr>
-      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="cant" data-label="משתמשים חמים">לא ניתן להריץ</td><td class="num" data-label="משתמשים חיים">—</td><td class="num" data-label="מחיר">—</td><td class="buy" data-label="סיבה">397 ג״ב משקלים חורגים מ‑96 ג״ב של כרטיס RTX PRO 6000 בודד; אין איחוד NVLink</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="חמים">≈ 28</td><td class="num" data-label="חיים">≈ 88</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="עלות למשתמש חם">≈ 57,142 ₪</td><td class="num" data-label="עלות למשתמש חי">≈ 18,181 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="cant" data-label="חמים">לא ניתן להריץ</td><td class="num" data-label="חיים">—</td><td class="num" data-label="מחיר">—</td><td class="num" data-label="עלות למשתמש חם">—</td><td class="buy" data-label="סיבה">397 ג״ב משקלים חורגים מ‑141 ג״ב של כרטיס H200 בודד, והכרטיסים אינם מאוחדים</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="cant" data-label="חמים">לא ניתן להריץ</td><td class="num" data-label="חיים">—</td><td class="num" data-label="מחיר">—</td><td class="num" data-label="עלות למשתמש חם">—</td><td class="buy" data-label="סיבה">397 ג״ב משקלים חורגים מ‑96 ג״ב של כרטיס RTX PRO 6000 בודד; אין איחוד NVLink</td></tr>
     </tbody>
   </table>
   </div>
 </section>
 
-<!-- WHY -->
+<!-- WHY: BUDGET PATH -->
 <div class="why">
-  <h3>למה <bdi>RTX PRO 6000</bdi> היא הבחירה הנכונה לשני המודלים הקטנים</h3>
+  <h3>המסלול החסכוני — <bdi>RTX PRO 6000</bdi> (הזול ביותר)</h3>
   <ul>
-    <li><b class="ok">עלות:</b> הזול ביותר לכל סוכן — כ‑3,700–3,900 ₪ למשתמש חי, פי ~2 מ‑H200 ופי ~3 מ‑DGX B200.</li>
-    <li><b>התאמה מלאה:</b> Gemma 4 31B ו‑Ornith‑1.0‑35B‑A3B רצים בצורה מושלמת על כרטיס בודד — אין צורך ב‑NVLink או במארג יקר.</li>
-    <li><b>מדרגיות וחוסן:</b> מוסיפים מחשב לפי גידול הביקוש במקום הוצאה הונית ענקית מראש; כשל של מחשב אחד מוריד ~50 סוכנים, לא ~150.</li>
+    <li><b class="ok">עלות מינימלית:</b> כ‑3,725 ₪ למשתמש חי ו‑23,750 ₪ למשתמש חם — פי ~2 זול מ‑H200 ופי ~3 זול מ‑DGX B200.</li>
+    <li><b>קיבולת ליחידה:</b> 8 סוכנים חמים ו‑~49–51 חיים (KV cache שמור ב‑RAM, מוכן לטעינה ל‑GPU), באורך שיחה מקסימלי — עם Gemma 4 31B (256K) או Ornith‑1.0‑35B‑A3B (1M).</li>
+    <li><b>מדרגיות וחוסן:</b> מוסיפים מחשב לפי גידול הביקוש; כשל של מחשב אחד מוריד ~50 סוכנים, לא ~150. אין צורך ב‑NVLink או במארג יקר — המודלים נכנסים לכרטיס בודד.</li>
   </ul>
 </div>
-<div class="why warn">
-  <h3>מתי <bdi>DGX B200</bdi> באמת הכרחי</h3>
+
+<!-- WHY: QUALITY PATH (recommended) -->
+<div class="why hi">
+  <h3>המסלול לאיכות — <bdi>NVIDIA DGX 8×B200</bdi> (ההמלצה)</h3>
   <ul>
-    <li><b>רק עבור <bdi>Ornith‑1.0‑397B</bdi>:</b> 397 ג״ב של משקלים לא נכנסים לכרטיס בודד (141/96 ג״ב) ואין איחוד זיכרון — צריך את מארג ה‑NVSwitch של ה‑DGX. ~28 חמים / ~88 חיים ליחידה.</li>
-    <li><b>שקיפות:</b> ל‑RTX PRO 6000 רוחב פס זיכרון נמוך יותר (~1.8 מול 4.8/8.0 טרה‑בייט לשנייה) — מצוין לסוכנים אוטונומיים שרוב הזמן מריצים כלים, פחות לעומסי ייצור טוקנים מהירים ורציפים.</li>
+    <li><b class="ok">מודל הדגל, רק כאן:</b> ה‑DGX הוא המחשב <b>היחיד</b> שמריץ את <bdi>Ornith‑1.0‑397B @ 1M</bdi> — 397 ג״ב משקלים שדורשים את מארג ה‑NVSwitch המאחד. איכות מתקרבת ל‑<b>Sonnet של Anthropic</b> (‏82.4 ב‑SWE‑bench Verified). <b>זו התשובה היחידה אם רוצים איכות.</b></li>
+    <li><b>קיבולת עם מודל הדגל (397B @ 1M):</b> 28 משתמשים חמים ו‑88 חיים ליחידה — 57,142 ₪ לחם, 18,181 ₪ לחי.</li>
+    <li><b>קיבולת עם המודל הבינוני (35B @ 1M):</b> 61 חמים ו‑151 חיים ליחידה — 26,229 ₪ לחם, 10,596 ₪ לחי.</li>
+    <li><b>מסלול שדרוג:</b> קונים DGX היום ומריצים את המודל הבינוני; משדרגים למודל הדגל 397B בעתיד <b>ללא חומרה חדשה</b>. בנוסף, רוחב פס הזיכרון של ה‑B200 (8.0 מול 1.8 טרה‑בייט לשנייה ב‑RTX) נותן תפוקת טוקנים גבוהה בהרבה.</li>
   </ul>
 </div>
 
@@ -221,9 +227,11 @@
   <h3>הגדרות והנחות</h3>
   <dl>
     <dt>משתמשים חמים</dt>
-    <dd>שיחות שמטמון ה‑KV שלהן שוכן בזיכרון ה‑GPU (‏HBM/GDDR7) ויכולות לייצר טוקנים כעת.</dd>
+    <dd>שיחות שמטמון ה‑KV שלהן שוכן בזיכרון ה‑GPU (‏HBM/GDDR7) ויכולות לייצר טוקנים כעת (אקטיביות ברגע זה).</dd>
     <dt>משתמשים חיים</dt>
-    <dd>משתמשים חמים בתוספת שיחות ששמורות בזיכרון המערכת (‏RAM) ונטענות בחזרה ל‑GPU כשתורן להריץ. מניח ששרת ההרצה (‏vLLM) תומך בהעברת KV ל‑RAM עבור מודלי קשב היברידיים.</dd>
+    <dd>משתמשים חמים בתוספת שיחות ששמורות בזיכרון המערכת (‏RAM) כ‑KV cache, ונטענות בחזרה ל‑GPU כשתורן להריץ — קריטי עבור סוכנים. מניח ששרת ההרצה (‏vLLM) תומך בהעברת KV ל‑RAM עבור מודלי קשב היברידיים.</dd>
+    <dt>מודל בינוני מול מודל דגל</dt>
+    <dd>"בינוני" = Gemma 4 31B / Ornith‑1.0‑35B‑A3B (רצים על כל מערכת). "דגל" = Ornith‑1.0‑397B, באיכות מתקרבת ל‑Sonnet של Anthropic — רץ על DGX 8×B200 בלבד.</dd>
     <dt>משקלים 8‑ביט / KV באיכות מלאה</dt>
     <dd>משקלי המודל בדחיסת FP8 (~בייט אחד לפרמטר). מטמון ה‑KV נשמר ב‑16 סיביות BF16 (2 בייט לאיבר) — ללא דחיסת KV כלל.</dd>
     <dt>אורך הקשר</dt>
