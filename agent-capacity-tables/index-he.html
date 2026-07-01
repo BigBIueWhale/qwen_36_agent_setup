@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>פריסת מודלי שפה לסוכנים — קיבולת ועלות (ישראל, 2026)</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --card:#ffffff; --ink:#141821; --muted:#5c6675; --faint:#8a93a3;
+    --line:#e6e9ef; --line2:#eef1f6; --accent:#1e5eff; --accent-ink:#0b3fbf;
+    --good:#0a8f5b; --good-bg:#e7f6ee; --bad:#c62828; --bad-bg:#fceceb;
+    --chip:#eef2ff; --chip-ink:#274690; --gold:#8a6d1f; --gold-bg:#fbf3d9;
+    --shadow:0 1px 2px rgba(20,24,33,.05),0 6px 20px rgba(20,24,33,.06);
+  }
+  *{box-sizing:border-box;-webkit-text-size-adjust:100%}
+  html,body{margin:0;background:var(--bg);color:var(--ink)}
+  body{
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans Hebrew","Arial Hebrew",Arial,sans-serif;
+    max-width:940px;margin:0 auto;padding:18px 16px 48px;
+  }
+  header{margin:6px 2px 18px}
+  h1{font-size:21px;line-height:1.3;margin:0 0 8px;letter-spacing:-.01em}
+  .lede{color:var(--muted);font-size:13.5px;margin:0}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+  .chip{background:var(--chip);color:var(--chip-ink);font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px;white-space:nowrap}
+  .rec{background:linear-gradient(135deg,#f0f5ff,#eaf7f0);border:1px solid #d6e4ff;border-radius:16px;padding:16px 18px;margin:18px 0 6px;box-shadow:var(--shadow)}
+  .rec .tag{display:inline-block;background:var(--good);color:#fff;font-size:11px;font-weight:800;padding:3px 11px;border-radius:999px;letter-spacing:.03em}
+  .rec h2{font-size:18px;margin:10px 0 6px;letter-spacing:-.01em}
+  .rec p{margin:0;color:#2a3240;font-size:14px}
+  .rec .big{color:var(--good);font-weight:800}
+  .cards{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+  .icard{flex:1 1 240px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;box-shadow:var(--shadow)}
+  .icard .k{font-size:20px;font-weight:800;color:var(--accent-ink);line-height:1.1}
+  .icard .t{font-size:12.5px;color:var(--muted);margin-top:4px}
+  section{margin-top:28px}
+  h2.sec{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}
+  .spec{color:var(--accent-ink);font-size:12.5px;font-weight:600;margin:0 0 12px}
+  .tbl{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
+  table{width:100%;border-collapse:collapse}
+  thead th{background:#fafbfd;color:var(--faint);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;text-align:right;padding:11px 14px;border-bottom:1px solid var(--line)}
+  td{padding:12px 14px;border-bottom:1px solid var(--line2);vertical-align:top;text-align:right}
+  tbody tr:last-child td{border-bottom:none}
+  .plat{font-weight:700;line-height:1.35}
+  .plat small{display:block;font-weight:500;color:var(--muted);font-size:12px;margin-top:2px}
+  .num{font-variant-numeric:tabular-nums;white-space:nowrap;direction:ltr;text-align:left;unicode-bidi:plaintext}
+  .price{font-weight:700}
+  .best{color:var(--good);font-weight:800}
+  .best-pill{display:inline-block;background:var(--good-bg);color:var(--good);font-size:10.5px;font-weight:800;padding:1px 8px;border-radius:999px;margin-inline-start:6px}
+  .cant{color:var(--bad);font-weight:700}
+  .buy{font-size:12.5px;color:var(--muted);line-height:1.6}
+  .buy b{color:var(--ink)}
+  bdi,.ltr{direction:ltr;unicode-bidi:isolate}
+  a{color:var(--accent);text-decoration:none;font-weight:600;overflow-wrap:anywhere}
+  .links{margin-top:6px;display:flex;flex-direction:column;gap:3px;direction:ltr;text-align:left}
+  .links a::before{content:"↗ ";color:var(--faint)}
+  .why{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px 18px;margin-top:14px}
+  .why h3{font-size:14px;margin:0 0 8px}
+  .why ul{margin:0 0 4px;padding-inline-start:20px}
+  .why li{color:var(--muted);font-size:13px;margin-bottom:7px}
+  .why li b{color:var(--ink)}
+  .why .ok{color:var(--good);font-weight:800}
+  .why.warn{background:#fffdf5;border-color:#f0e4bd}
+  .legend{margin-top:26px;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:16px 18px 6px}
+  .legend h3{font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--faint);margin:0 0 10px}
+  .legend dt{font-weight:700;font-size:13px;margin-top:10px}
+  .legend dd{margin:2px 0 0;color:var(--muted);font-size:12.5px}
+  .legend .foot{margin:16px 0 12px;color:var(--faint);font-size:11.5px;border-top:1px solid var(--line2);padding-top:12px}
+  @media (max-width:660px){
+    body{padding:14px 12px 40px}
+    h1{font-size:19px}
+    thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+    table,tbody,tr,td{display:block}
+    tr{border-bottom:1px solid var(--line)}
+    tbody tr:last-child{border-bottom:none}
+    td{display:flex;justify-content:space-between;gap:14px;align-items:baseline;border-bottom:1px solid var(--line2);padding:10px 14px}
+    tr td:last-child{border-bottom:none}
+    td::before{content:attr(data-label);color:var(--faint);font-size:11px;font-weight:700;flex:0 0 44%}
+    td.plat{display:block;background:#fafbfd;padding:12px 14px;border-bottom:1px solid var(--line)}
+    td.plat::before,td.buy::before{content:none}
+    td.plat::before{display:none}
+    td.buy{display:block}
+    td.buy::before{content:attr(data-label);display:block;color:var(--faint);font-size:11px;font-weight:700;margin-bottom:4px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>פריסת מודלי שפה לסוכנים אוטונומיים — קיבולת ועלות בישראל, 2026</h1>
+  <p class="lede">כמה שיחות במלוא ההקשר כל מערכת שניתן לרכוש מסוגלת לשרת, לפי מודל. כל המודלים רצים עם <b>משקלים ב‑8 סיביות (FP8)</b> ועם <b>מטמון KV באיכות מלאה של 16 סיביות (BF16)</b> — ללא דחיסת KV.</p>
+  <div class="chips">
+    <span class="chip">מחירים ב‑₪, כולל מע״מ 18%</span>
+    <span class="chip">שער דולר‑שקל = 3.0</span>
+    <span class="chip">ניצול זיכרון GPU 0.90</span>
+    <span class="chip">דיוק ±10–15%</span>
+  </div>
+</header>
+
+<!-- RECOMMENDATION -->
+<div class="rec">
+  <span class="tag">שורה תחתונה — המלצה</span>
+  <h2>קנו מחשבי RTX PRO 6000 — לא DGX (אלא אם צריך את מודל הדגל)</h2>
+  <p>עבור <b>Google Gemma 4 31B</b> ו‑<b>Ornith‑1.0‑35B‑A3B</b>: מחשב <b>Dell Precision 7960</b> עם <b>4× NVIDIA RTX PRO 6000 Blackwell Max‑Q</b> נותן את <span class="big">העלות הנמוכה ביותר לכל סוכן</span> — כ‑3,700–3,900 ₪ למשתמש חי, <span class="big">חיסכון של ~65%</span> לעומת DGX B200 ופי ~2 זול מ‑H200, באותה קיבולת. את ה‑DGX B200 (כ‑1.6 מיליון ₪) צריך <b>רק</b> עבור מודל הדגל <b>Ornith‑1.0‑397B</b> — המערכת היחידה שמסוגלת בכלל להריץ אותו.</p>
+  <div class="cards">
+    <div class="icard"><div class="k">~65% חיסכון</div><div class="t">בעלות לכל סוכן חי לעומת DGX B200 (Ornith‑1.0‑35B‑A3B)</div></div>
+    <div class="icard"><div class="k">190,000 ₪</div><div class="t">מחיר מחשב RTX PRO 6000 לעומת ~1,600,000 ₪ ל‑DGX B200</div></div>
+    <div class="icard"><div class="k">מדרגיות</div><div class="t">מוסיפים מחשבים לפי גידול הביקוש — לא הוצאה הונית ענקית מראש</div></div>
+  </div>
+</div>
+
+<!-- TABLE 0 — PRODUCTS -->
+<section>
+  <h2 class="sec">טבלה 0 — המערכות המומלצות ואיפה לקנות אותן בישראל</h2>
+  <p class="spec">יחידה אחת לרכישה · דגם מדויק · מחיר מסופק בישראל כולל מע״מ 18%</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th style="width:31%">מערכת (דגם מדויק)</th><th>מעבדים גרפיים וזיכרון GPU</th><th>זיכרון מערכת (RAM)</th><th>מחיר, ₪ כולל מע״מ</th><th>אפשרויות רכישה (ישראל)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi><small>מכשיר משולב 10U (זיכרון מאוחד ב‑NVSwitch, מקבילות טנזורים)</small></td>
+        <td data-label="זיכרון GPU"><bdi>8× NVIDIA B200 SXM</bdi> · 1,440 ג״ב HBM3e סה״כ (180 ג״ב לכרטיס)</td>
+        <td data-label="זיכרון מערכת">2 טרה‑בייט DDR5 (ניתן להרחבה ל‑4 טרה‑בייט)</td>
+        <td class="num price" data-label="מחיר">≈ 1,600,000 ₪<br><span class="buy">(≈ $450,000; 2 ט״ב. 4 ט״ב ≈ 1,820,000 ₪)</span></td>
+        <td class="buy" data-label="רכישה (ישראל)"><b>בהצעת מחיר בלבד</b> דרך שותפי NVIDIA DGX: <b>בינת (Bynet)</b>, <b>Matrix IT</b>, <b>הראל טכנולוגיות מידע</b>. מופיע גם ב‑<b>PC‑Online</b> (מק״ט 140974; <bdi>Motti@pc-online.co.il</bdi> · <bdi>03-6005007</bdi>). פטור ממכס לפי הסכם הסחר החופשי ארה״ב–ישראל (רק מע״מ 18%). זמן אספקה ≈ 8–20 שבועות.
+          <span class="links"><a href="https://pc-online.co.il/product/nvidia-dgx-b200/" target="_blank" rel="noopener">pc-online.co.il/product/nvidia-dgx-b200</a><a href="https://www.bynet.co.il/partners/nvidia/" target="_blank" rel="noopener">bynet.co.il/partners/nvidia</a></span>
+        </td>
+      </tr>
+      <tr>
+        <td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT</bdi> + <bdi>2× NVIDIA H200 NVL 141GB</bdi><small>שרת 5U מקורר‑אוויר · כרטיסים עצמאיים (ללא איחוד זיכרון)</small></td>
+        <td data-label="זיכרון GPU"><bdi>2× NVIDIA H200 NVL 141GB PCIe</bdi> (מק״ט <bdi>900-21010-0040-000</bdi>) · 282 ג״ב HBM3e סה״כ</td>
+        <td data-label="זיכרון מערכת">1 טרה‑בייט DDR5‑5600 ECC (מקסימום 8 ט״ב)</td>
+        <td class="num price" data-label="מחיר">≈ 390,000 ₪<br><span class="buy">(≈ $110,000; 1 ט״ב. 512 ג״ב ≈ 348,000 ₪)</span></td>
+        <td class="buy" data-label="רכישה (ישראל)">הרכבה ותמיכה דרך <b>EIM E.S.C</b> (המפיץ הבלעדי של Supermicro בישראל · <bdi>+972-3-9208200</bdi> · <bdi>info@eimesc.com</bdi>) או <b>בינת</b>. כרטיסי H200 NVL מ‑<b>Senetic ישראל</b> ב‑<b>96,245 ₪ ללא מע״מ (≈ 113,569 ₪ כולל) ליחידה</b>, או PC‑Online / Goldtop.
+          <span class="links"><a href="https://www.supermicro.com/en/products/system/gpu/5u/sys-521ge-tnrt" target="_blank" rel="noopener">supermicro.com/…/sys-521ge-tnrt</a><a href="https://www.senetic.co.il/product/900-21010-0040-000" target="_blank" rel="noopener">senetic.co.il/product/900-21010-0040-000</a></span>
+        </td>
+      </tr>
+      <tr>
+        <td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 Tower</bdi> + <bdi>4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi><small>תחנת עבודה מגדל · כרטיסים עצמאיים (ללא NVLink)</small></td>
+        <td data-label="זיכרון GPU"><bdi>4× NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition 96GB</bdi> (מק״ט <bdi>900-5G153-2200-000</bdi>) · 384 ג״ב GDDR7 סה״כ</td>
+        <td data-label="זיכרון מערכת">1 טרה‑בייט DDR5‑4800 ECC בהתקנה עצמית (מקסימום 4 ט״ב)</td>
+        <td class="num price" data-label="מחיר">≈ 190,000 ₪<br><span class="buy">(≈ $54,000; 1 ט״ב)</span></td>
+        <td class="buy" data-label="רכישה (ישראל)">מארח + <b>חבילת GPU של Dell (4× Max‑Q, ≈ $7,245 לכרטיס)</b> דרך <b>Dell ישראל</b> או <b>Espir</b>. או כרטיסי Max‑Q בודדים: <b>Cubeex ‏39,990 ₪</b>, <b>Novotech ‏41,045 ₪</b>, PC‑Online. זיכרון: התקנה עצמית של 8× 128 ג״ב צד ג׳ ≈ 52,000 ₪ (מול ≈ 106,000 ₪ מ‑Dell).
+          <span class="links"><a href="https://www.dell.com/en-us/shop/desktop-computers/precision-7960-tower-workstation/spd/precision-t7960-workstation/xctopt7960us_vp" target="_blank" rel="noopener">dell.com/…/precision-7960-tower</a><a href="https://pc-online.co.il/product/pny-nvidia-rtx-pro-6000-blackwell-max-q-workstation-edition/" target="_blank" rel="noopener">pc-online.co.il/…/rtx-pro-6000-max-q</a></span>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- TABLE 1 -->
+<section>
+  <h2 class="sec">טבלה 1 — <bdi>Google Gemma 4 31B</bdi> (מודל צפוף)</h2>
+  <p class="spec">משקלים 8‑ביט FP8 (~31 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר מקורי 262,144 טוקנים (256K) · 20.78 ג׳יגה‑בייט KV למשתמש</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th style="width:40%">מערכת (יחידה אחת)</th><th>משתמשים חמים</th><th>משתמשים חיים</th><th>מחיר ₪ כולל מע״מ</th><th>₪ למשתמש חי</th></tr></thead>
+    <tbody>
+      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="חמים">≈ 59</td><td class="num" data-label="חיים">≈ 146</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="₪ למשתמש חי">≈ 11,000 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 49</td><td class="num price" data-label="מחיר">390,000 ₪</td><td class="num" data-label="₪ למשתמש חי">≈ 8,000 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 49</td><td class="num price" data-label="מחיר">190,000 ₪</td><td class="num best" data-label="₪ למשתמש חי">≈ 3,900 ₪ <span class="best-pill">הזול ביותר</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- TABLE 2 -->
+<section>
+  <h2 class="sec">טבלה 2 — <bdi>DeepReinforce Ornith-1.0-35B-A3B</bdi> (תערובת מומחים, ~3B פעילים)</h2>
+  <p class="spec">משקלים 8‑ביט FP8 (~36 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר 1,048,576 טוקנים (1M) · 20.0 ג׳יגה‑בייט KV למשתמש</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th style="width:40%">מערכת (יחידה אחת)</th><th>משתמשים חמים</th><th>משתמשים חיים</th><th>מחיר ₪ כולל מע״מ</th><th>₪ למשתמש חי</th></tr></thead>
+    <tbody>
+      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="חמים">≈ 61</td><td class="num" data-label="חיים">≈ 151</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="₪ למשתמש חי">≈ 10,600 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 51</td><td class="num price" data-label="מחיר">390,000 ₪</td><td class="num" data-label="₪ למשתמש חי">≈ 7,600 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="num" data-label="חמים">≈ 8</td><td class="num" data-label="חיים">≈ 51</td><td class="num price" data-label="מחיר">190,000 ₪</td><td class="num best" data-label="₪ למשתמש חי">≈ 3,700 ₪ <span class="best-pill">הזול ביותר</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- TABLE 3 -->
+<section>
+  <h2 class="sec">טבלה 3 — <bdi>DeepReinforce Ornith-1.0-397B</bdi> (תערובת מומחים, ~17B פעילים)</h2>
+  <p class="spec">משקלים 8‑ביט FP8 (~397 ג״ב) · מטמון KV מלא 16‑ביט BF16 · הקשר 1,048,576 טוקנים (1M) · 30.0 ג׳יגה‑בייט KV למשתמש · רץ על <bdi>NVIDIA B200</bdi> בלבד</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th style="width:40%">מערכת (יחידה אחת)</th><th>משתמשים חמים</th><th>משתמשים חיים</th><th>מחיר ₪ כולל מע״מ</th><th>₪ למשתמש חי</th></tr></thead>
+    <tbody>
+      <tr><td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi></td><td class="num" data-label="חמים">≈ 28</td><td class="num" data-label="חיים">≈ 88</td><td class="num price" data-label="מחיר">1,600,000 ₪</td><td class="num" data-label="₪ למשתמש חי">≈ 18,200 ₪</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Supermicro SYS-521GE-TNRT + 2× NVIDIA H200 NVL 141GB</bdi></td><td class="cant" data-label="חמים">לא ניתן להריץ</td><td class="num" data-label="חיים">—</td><td class="num" data-label="מחיר">—</td><td class="buy" data-label="סיבה">397 ג״ב משקלים חורגים מ‑141 ג״ב של כרטיס H200 בודד, והכרטיסים אינם מאוחדים</td></tr>
+      <tr><td class="plat" data-label="מערכת"><bdi>Dell Precision 7960 + 4× NVIDIA RTX PRO 6000 Blackwell Max-Q</bdi></td><td class="cant" data-label="חמים">לא ניתן להריץ</td><td class="num" data-label="חיים">—</td><td class="num" data-label="מחיר">—</td><td class="buy" data-label="סיבה">397 ג״ב משקלים חורגים מ‑96 ג״ב של כרטיס RTX PRO 6000 בודד; אין איחוד NVLink</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- WHY -->
+<div class="why">
+  <h3>למה <bdi>RTX PRO 6000</bdi> היא הבחירה הנכונה לשני המודלים הקטנים</h3>
+  <ul>
+    <li><b class="ok">עלות:</b> הזול ביותר לכל סוכן — כ‑3,700–3,900 ₪ למשתמש חי, פי ~2 מ‑H200 ופי ~3 מ‑DGX B200.</li>
+    <li><b>התאמה מלאה:</b> Gemma 4 31B ו‑Ornith‑1.0‑35B‑A3B רצים בצורה מושלמת על כרטיס בודד — אין צורך ב‑NVLink או במארג יקר.</li>
+    <li><b>מדרגיות וחוסן:</b> מוסיפים מחשב לפי גידול הביקוש במקום הוצאה הונית ענקית מראש; כשל של מחשב אחד מוריד ~50 סוכנים, לא ~150.</li>
+  </ul>
+</div>
+<div class="why warn">
+  <h3>מתי <bdi>DGX B200</bdi> באמת הכרחי</h3>
+  <ul>
+    <li><b>רק עבור <bdi>Ornith‑1.0‑397B</bdi>:</b> 397 ג״ב של משקלים לא נכנסים לכרטיס בודד (141/96 ג״ב) ואין איחוד זיכרון — צריך את מארג ה‑NVSwitch של ה‑DGX. ~28 חמים / ~88 חיים ליחידה.</li>
+    <li><b>שקיפות:</b> ל‑RTX PRO 6000 רוחב פס זיכרון נמוך יותר (~1.8 מול 4.8/8.0 טרה‑בייט/שנייה) — מצוין לסוכנים אוטונומיים שרוב הזמן מריצים כלים, פחות לעומסי ייצור טוקנים מהירים ורציפים.</li>
+  </ul>
+</div>
+
+<!-- LEGEND -->
+<div class="legend">
+  <h3>הגדרות והנחות</h3>
+  <dl>
+    <dt>משתמשים חמים</dt>
+    <dd>שיחות שמטמון ה‑KV שלהן שוכן בזיכרון ה‑GPU (‏HBM/GDDR7) ויכולות לייצר טוקנים כעת.</dd>
+    <dt>משתמשים חיים</dt>
+    <dd>משתמשים חמים בתוספת שיחות ששמורות בזיכרון המערכת (‏RAM) ונטענות בחזרה ל‑GPU כשתורן להריץ. מניח ששרת ההרצה (‏vLLM) תומך בהעברת KV ל‑RAM עבור מודלי קשב היברידיים.</dd>
+    <dt>משקלים 8‑ביט / KV באיכות מלאה</dt>
+    <dd>משקלי המודל בדחיסת FP8 (~בייט אחד לפרמטר). מטמון ה‑KV נשמר ב‑16 סיביות BF16 (2 בייט לאיבר) — ללא דחיסת KV כלל.</dd>
+    <dt>אורך הקשר</dt>
+    <dd>256K = 262,144 טוקנים; 1M = 1,048,576 טוקנים. Ornith‑1.0‑35B‑A3B ו‑Ornith‑1.0‑397B רצים ב‑1M; Google Gemma 4 31B רץ בהקשר המקורי שלו 256K (אינו תומך ב‑1M). הנתון של Gemma מניח ש‑vLLM מנצל את חלון הקשב הנע (‏1,024 טוקנים) ב‑50 מתוך 60 השכבות.</dd>
+    <dt>תמחור</dt>
+    <dd>בשקלים חדשים, כולל מע״מ 18%, בשער דולר‑שקל 3.0 (ספוט ≈ 2.98, 1 ביולי 2026). מערכות ה‑Enterprise נמכרות בהצעת מחיר בלבד; המחירים הם עוגני תכנון, לא הצעות סופיות.</dd>
+  </dl>
+  <p class="foot">הקיבולת חושבה כ‑(זיכרון GPU × 0.90 − משקלי FP8 − רזרבת אקטיבציות) ÷ KV‑למשתמש עבור "חמים", בתוספת (זיכרון מערכת ÷ KV‑למשתמש) עבור שכבת ה‑RAM. כל הנתונים ±10–15% (עיגול, רזרבות, GiB מול GB, ניצול זיכרון). האומדנים נגזרים משיטת ה‑KV‑לטוקן של הפריסה, מיושמת על מחירי חומרה אמיתיים הניתנים לרכישה בישראל — לא נתונים מובטחים על‑ידי היצרן. מחירי DDR5 לשרתים תנודתיים (מחסור זיכרון AI ב‑2026); כדאי לנעול את הזיכרון מוקדם.</p>
+</div>
+</body>
+</html>
