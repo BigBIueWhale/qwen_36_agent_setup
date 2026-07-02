@@ -42,6 +42,9 @@
   .omachine b{color:var(--ink)}
   .note-warn{background:#fff6f5;border:1px solid #f3d3d0;color:#5c1f1b;border-radius:12px;padding:11px 14px;margin-top:12px;font-size:13px;line-height:1.55}
   .note-warn b{color:var(--bad)}
+  .note-info{background:#eef4ff;border:1px solid #cdddff;color:#16233a;border-radius:12px;padding:12px 14px;margin-top:14px;font-size:13px;line-height:1.62}
+  .note-info b{color:var(--accent-ink)}
+  .subnote{display:block;color:var(--muted);font-weight:500;font-size:11.5px;margin-top:3px}
 
   section{margin-top:28px}
   h2.sec{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}
@@ -213,6 +216,46 @@
   </div>
 </section>
 
+<!-- TABLE 4 — WHICH B200 UNIT -->
+<section>
+  <h2 class="sec"><bdi>2× · 4× · 8× B200</bdi> — טבלה 4 · איזו יחידה קונים</h2>
+  <p class="spec">שלוש יחידות חישוב מאוחדות — כל אחת דומיין <bdi>NVLink</bdi> קוהרנטי יחיד שבו כל המעבדים הגרפיים מריצים יחד מודל אחד. ההבדל המכריע: מי מריץ את מודל הדגל 397B.</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th style="width:27%">מערכת</th><th>זיכרון GPU</th><th>מודל קטן · חמים</th><th>מודל 397B · חמים</th><th>מחיר כולל מע״מ</th><th>עלות ל‑GPU</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="plat" data-label="מערכת"><bdi>NVIDIA GB200 NVL2</bdi><small>2× B200 · מעבד <bdi>Grace/ARM</bdi> · מקורר‑נוזל · דומיין NVLink יחיד</small></td>
+        <td class="stack" data-label="זיכרון GPU"><bdi>384 GB HBM3e — 2×192 GB</bdi><span class="subnote"><bdi>+ ~960 GB Grace LPDDR</bdi> קוהרנטי</span></td>
+        <td class="num" data-label="מודל קטן · חמים">≈ 12</td>
+        <td class="cant" data-label="מודל 397B · חמים">✗ לא נטען<span class="subnote">המשקלים 397 ג״ב גדולים מ‑384 ג״ב הזיכרון</span></td>
+        <td class="stack price" data-label="מחיר כולל מע״מ"><span class="pmain">≈ 510,000 ₪</span><span class="buy">בהצעת מחיר · טווח <bdi>425K–600K</bdi></span></td>
+        <td class="num" data-label="עלות ל‑GPU">≈ 255,000 ₪</td>
+      </tr>
+      <tr>
+        <td class="plat" data-label="מערכת"><bdi>NVIDIA GB200 NVL4</bdi><small>4× B200 · 2× מעבד <bdi>Grace/ARM</bdi> · מקורר‑נוזל · דומיין NVLink יחיד</small></td>
+        <td class="stack" data-label="זיכרון GPU"><bdi>768 GB HBM3e — 4×192 GB</bdi><span class="subnote"><bdi>+ ~960 GB Grace LPDDR</bdi> קוהרנטי</span></td>
+        <td class="num" data-label="מודל קטן · חמים">≈ 27</td>
+        <td class="num" data-label="מודל 397B · חמים">≈ 8<span class="subnote">צפוף — רוב הזיכרון משקלים</span></td>
+        <td class="stack price" data-label="מחיר כולל מע״מ"><span class="pmain">≈ 940,000 ₪</span><span class="buy">בהצעת מחיר · טווח <bdi>780K–1,130K</bdi></span></td>
+        <td class="num" data-label="עלות ל‑GPU">≈ 235,000 ₪</td>
+      </tr>
+      <tr>
+        <td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi> <span class="best-pill">מומלץ</span><small>8× B200 · מעבד x86 · מקורר‑אוויר · מארג NVSwitch מאחד</small></td>
+        <td class="stack" data-label="זיכרון GPU"><bdi>1,440 GB HBM3e — 8×180 GB</bdi><span class="subnote"><bdi>+ 4 TB DDR5</bdi> (‏PCIe, לא קוהרנטי)</span></td>
+        <td class="num best" data-label="מודל קטן · חמים">≈ 51</td>
+        <td class="num best" data-label="מודל 397B · חמים">≈ 28<span class="subnote">‏88 חיים עם offload ל‑RAM</span></td>
+        <td class="stack price" data-label="מחיר כולל מע״מ"><span class="pmain">1,600,000 ₪</span><span class="buy">עוגן מבוסס</span></td>
+        <td class="num best" data-label="עלות ל‑GPU">≈ 200,000 ₪</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="note-info">
+    <b>למה יחידת 8× שלמה:</b> למודלים הקטנים שלוש היחידות שקולות בצפיפות למשתמש (כ‑6–7 חמים לכל GPU), וה‑DGX 8× הוא אף <b>הזול ביותר לכל GPU</b> — <bdi>200K</bdi> מול <bdi>235K</bdi> ו‑<bdi>255K</bdi> — כלומר גם היעיל ביותר לשקל. אבל ההבדל המכריע הוא <b>מודל הדגל 397B</b> (איכות Sonnet): יחידת 2× <b>בכלל לא טוענת אותו</b> (‏384 ג״ב זיכרון, פחות מ‑397 ג״ב המשקלים), 4× מריצה בקושי (כ‑8 חמים), ורק 8× נותנת מרווח אמיתי (כ‑28 חמים, 88 חיים). בנוסף, <bdi>GB200 NVL2</bdi> ו‑<bdi>GB200 NVL4</bdi> הן מערכות <b><bdi>Grace/ARM</bdi> מקוררות‑נוזל, בהצעת מחיר בלבד</b> עם זמני אספקה ארוכים, בעוד <bdi>DGX B200</bdi> הוא <b>x86 סטנדרטי</b> — קל לרכישה ולתחזוקה. <b>אם קונים B200 — קונים 8. יחידת 2×/4× מוותרת בדיוק על היכולת שבגללה קונים Blackwell מלכתחילה.</b>
+  </div>
+</section>
+
 <!-- LEGEND -->
 <div class="legend">
   <h3>הגדרות והנחות</h3>
@@ -229,6 +272,8 @@
     <dd>256K = 262,144 טוקנים; 1M = 1,048,576 טוקנים. Ornith רץ ב‑1M; Gemma 4 31B בהקשר המקורי שלו 256K (אינו תומך ב‑1M). הנתון של Gemma מניח ש‑vLLM מנצל את חלון הקשב הנע (‏1,024 טוקנים) ב‑50 מתוך 60 השכבות.</dd>
     <dt>תמחור</dt>
     <dd>בשקלים חדשים, כולל מע״מ 18%, בשער דולר‑שקל 3.0 (ספוט ≈ 2.98, 1 ביולי 2026). מערכות ה‑Enterprise נמכרות בהצעת מחיר בלבד; המחירים הם עוגני תכנון, לא הצעות סופיות.</dd>
+    <dt>יחידת חישוב מאוחדת של B200 (‏2× / 4× / 8×)</dt>
+    <dd><bdi>GB200 NVL2</bdi> = 2× B200 + 2× Grace‏ (ARM), ‏384 ג״ב HBM; <bdi>GB200 NVL4</bdi> = 4× B200 + 2× Grace, ‏768 ג״ב HBM — שתיהן מקוררות‑נוזל, בהצעת מחיר בלבד, עוגני מחיר ±15%. <bdi>DGX B200</bdi> = 8× B200‏ (x86, מקורר‑אוויר), ‏1,440 ג״ב HBM. שים לב: ה‑B200 שבתוך GB200 הוא בגרסת 192 ג״ב לכרטיס, בעוד שב‑DGX/HGX B200 הוא 180 ג״ב. בכל שלוש היחידות המעבדים הגרפיים מאוחדים ב‑NVLink ומריצים יחד מודל אחד.</dd>
   </dl>
   <p class="foot">הקיבולת חושבה כ‑(זיכרון GPU × 0.90 − משקלי FP8 − רזרבת אקטיבציות) ÷ KV‑למשתמש עבור "חמים", בתוספת (זיכרון מערכת ÷ KV‑למשתמש) עבור שכבת ה‑RAM. כל הנתונים ±10–15% (עיגול, רזרבות, GiB מול GB, ניצול זיכרון). האומדנים נגזרים משיטת ה‑KV‑לטוקן של הפריסה, מיושמת על מחירי חומרה אמיתיים הניתנים לרכישה בישראל — לא נתונים מובטחים על‑ידי היצרן. מחירי DDR5 לשרתים תנודתיים (מחסור זיכרון AI ב‑2026); כדאי לנעול את הזיכרון מוקדם.</p>
 </div>
