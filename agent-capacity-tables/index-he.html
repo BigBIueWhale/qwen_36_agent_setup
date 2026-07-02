@@ -227,7 +227,7 @@
       <tr>
         <td class="plat" data-label="מערכת"><bdi>NVIDIA GB200 NVL2</bdi><small>2× B200 · מעבד <bdi>Grace/ARM</bdi> · מקורר‑נוזל · דומיין NVLink יחיד</small></td>
         <td class="stack" data-label="זיכרון GPU"><bdi>384 GB HBM3e — 2×192 GB</bdi><span class="subnote"><bdi>+ ~960 GB Grace LPDDR</bdi> קוהרנטי</span></td>
-        <td class="num" data-label="מודל קטן · חמים">≈ 12</td>
+        <td class="num" data-label="מודל קטן · חמים">≈ 15</td>
         <td class="cant" data-label="מודל 397B · חמים">✗ לא נטען<span class="subnote">המשקלים 397 ג״ב גדולים מ‑384 ג״ב הזיכרון</span></td>
         <td class="stack price" data-label="מחיר כולל מע״מ"><span class="pmain">≈ 510,000 ₪</span><span class="buy">בהצעת מחיר · טווח <bdi>425K–600K</bdi></span></td>
         <td class="num" data-label="עלות ל‑GPU">≈ 255,000 ₪</td>
@@ -235,7 +235,7 @@
       <tr>
         <td class="plat" data-label="מערכת"><bdi>NVIDIA GB200 NVL4</bdi><small>4× B200 · 2× מעבד <bdi>Grace/ARM</bdi> · מקורר‑נוזל · דומיין NVLink יחיד</small></td>
         <td class="stack" data-label="זיכרון GPU"><bdi>768 GB HBM3e — 4×192 GB</bdi><span class="subnote"><bdi>+ ~960 GB Grace LPDDR</bdi> קוהרנטי</span></td>
-        <td class="num" data-label="מודל קטן · חמים">≈ 27</td>
+        <td class="num" data-label="מודל קטן · חמים">≈ 32</td>
         <td class="num" data-label="מודל 397B · חמים">≈ 8<span class="subnote">צפוף — רוב הזיכרון משקלים</span></td>
         <td class="stack price" data-label="מחיר כולל מע״מ"><span class="pmain">≈ 940,000 ₪</span><span class="buy">בהצעת מחיר · טווח <bdi>780K–1,130K</bdi></span></td>
         <td class="num" data-label="עלות ל‑GPU">≈ 235,000 ₪</td>
@@ -243,7 +243,7 @@
       <tr>
         <td class="plat" data-label="מערכת"><bdi>NVIDIA DGX B200</bdi> <span class="best-pill">מומלץ</span><small>8× B200 · מעבד x86 · מקורר‑אוויר · מארג NVSwitch מאחד</small></td>
         <td class="stack" data-label="זיכרון GPU"><bdi>1,440 GB HBM3e — 8×180 GB</bdi><span class="subnote"><bdi>+ 4 TB DDR5</bdi> (‏PCIe, לא קוהרנטי)</span></td>
-        <td class="num best" data-label="מודל קטן · חמים">≈ 51</td>
+        <td class="num best" data-label="מודל קטן · חמים">≈ 61</td>
         <td class="num best" data-label="מודל 397B · חמים">≈ 28<span class="subnote">‏88 חיים עם offload ל‑RAM</span></td>
         <td class="stack price" data-label="מחיר כולל מע״מ"><span class="pmain">1,600,000 ₪</span><span class="buy">עוגן מבוסס</span></td>
         <td class="num best" data-label="עלות ל‑GPU">≈ 200,000 ₪</td>
@@ -252,7 +252,7 @@
   </table>
   </div>
   <div class="note-info">
-    <b>למה יחידת 8× שלמה:</b> למודלים הקטנים שלוש היחידות שקולות בצפיפות למשתמש (כ‑6–7 חמים לכל GPU), וה‑DGX 8× הוא אף <b>הזול ביותר לכל GPU</b> — <bdi>200K</bdi> מול <bdi>235K</bdi> ו‑<bdi>255K</bdi> — כלומר גם היעיל ביותר לשקל. אבל ההבדל המכריע הוא <b>מודל הדגל 397B</b> (איכות Sonnet): יחידת 2× <b>בכלל לא טוענת אותו</b> (‏384 ג״ב זיכרון, פחות מ‑397 ג״ב המשקלים), 4× מריצה בקושי (כ‑8 חמים), ורק 8× נותנת מרווח אמיתי (כ‑28 חמים, 88 חיים). בנוסף, <bdi>GB200 NVL2</bdi> ו‑<bdi>GB200 NVL4</bdi> הן מערכות <b><bdi>Grace/ARM</bdi> מקוררות‑נוזל, בהצעת מחיר בלבד</b> עם זמני אספקה ארוכים, בעוד <bdi>DGX B200</bdi> הוא <b>x86 סטנדרטי</b> — קל לרכישה ולתחזוקה. <b>אם קונים B200 — קונים 8. יחידת 2×/4× מוותרת בדיוק על היכולת שבגללה קונים Blackwell מלכתחילה.</b>
+    <b>למה יחידת 8× שלמה:</b> למודלים הקטנים שלוש היחידות שקולות בצפיפות למשתמש (כ‑8 חמים לכל GPU), וה‑DGX 8× הוא אף <b>הזול ביותר לכל GPU</b> — <bdi>200K</bdi> מול <bdi>235K</bdi> ו‑<bdi>255K</bdi> — כלומר גם היעיל ביותר לשקל. אבל ההבדל המכריע הוא <b>מודל הדגל 397B</b> (איכות Sonnet): יחידת 2× <b>בכלל לא טוענת אותו</b> (‏384 ג״ב זיכרון, פחות מ‑397 ג״ב המשקלים), 4× מריצה בקושי (כ‑8 חמים), ורק 8× נותנת מרווח אמיתי (כ‑28 חמים, 88 חיים). בנוסף, <bdi>GB200 NVL2</bdi> ו‑<bdi>GB200 NVL4</bdi> הן מערכות <b><bdi>Grace/ARM</bdi> מקוררות‑נוזל, בהצעת מחיר בלבד</b> עם זמני אספקה ארוכים, בעוד <bdi>DGX B200</bdi> הוא <b>x86 סטנדרטי</b> — קל לרכישה ולתחזוקה. <b>אם קונים B200 — קונים 8. יחידת 2×/4× מוותרת בדיוק על היכולת שבגללה קונים Blackwell מלכתחילה.</b>
   </div>
 </section>
 
